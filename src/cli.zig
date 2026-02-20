@@ -1,12 +1,27 @@
 const std = @import("std");
 
+pub const ConfigCommand = union(enum) {
+    set: struct {
+        key: []const u8,
+        value: []const u8,
+    },
+    get: []const u8,
+    unset: []const u8,
+    list,
+};
+
 pub const Command = union(enum) {
     help,
     execute: []const u8,
+    config: ConfigCommand,
 };
 
 pub const ParseCommandError = error{
     MissingExecuteArgument,
+    MissingConfigSubcommand,
+    MissingConfigKey,
+    MissingConfigValue,
+    UnknownConfigSubcommand,
     UnknownCommand,
 };
 
@@ -24,6 +39,37 @@ pub fn parseCommand(args: []const []const u8) ParseCommandError!Command {
         return .{ .execute = args[2] };
     }
 
+    if (std.mem.eql(u8, cmd, "config")) {
+        if (args.len < 3) return error.MissingConfigSubcommand;
+
+        const subcmd = args[2];
+
+        if (std.mem.eql(u8, subcmd, "set")) {
+            if (args.len < 4) return error.MissingConfigKey;
+            if (args.len < 5) return error.MissingConfigValue;
+            return .{ .config = .{ .set = .{
+                .key = args[3],
+                .value = args[4],
+            } } };
+        }
+
+        if (std.mem.eql(u8, subcmd, "get")) {
+            if (args.len < 4) return error.MissingConfigKey;
+            return .{ .config = .{ .get = args[3] } };
+        }
+
+        if (std.mem.eql(u8, subcmd, "unset")) {
+            if (args.len < 4) return error.MissingConfigKey;
+            return .{ .config = .{ .unset = args[3] } };
+        }
+
+        if (std.mem.eql(u8, subcmd, "list")) {
+            return .{ .config = .list };
+        }
+
+        return error.UnknownConfigSubcommand;
+    }
+
     return error.UnknownCommand;
 }
 
@@ -34,6 +80,18 @@ pub fn printHelp() void {
         \\
         \\zoid execute <file.lua>
         \\  Executes the Lua script at <file.lua>.
+        \\
+        \\zoid config set <key> <value>
+        \\  Creates or updates a config key.
+        \\
+        \\zoid config get <key>
+        \\  Reads a config key.
+        \\
+        \\zoid config unset <key>
+        \\  Removes a config key.
+        \\
+        \\zoid config list
+        \\  Lists all config keys.
     , .{});
 }
 
@@ -67,4 +125,86 @@ test "execute without value returns error" {
 test "unknown command returns error" {
     const args = [_][]const u8{ "zoid", "nope" };
     try std.testing.expectError(error.UnknownCommand, parseCommand(&args));
+}
+
+test "config set command" {
+    const args = [_][]const u8{ "zoid", "config", "set", "foo", "bar" };
+    const command = try parseCommand(&args);
+
+    switch (command) {
+        .config => |config_cmd| switch (config_cmd) {
+            .set => |set_cmd| {
+                try std.testing.expectEqualStrings("foo", set_cmd.key);
+                try std.testing.expectEqualStrings("bar", set_cmd.value);
+            },
+            else => return error.UnexpectedCommand,
+        },
+        else => return error.UnexpectedCommand,
+    }
+}
+
+test "config get command" {
+    const args = [_][]const u8{ "zoid", "config", "get", "foo" };
+    const command = try parseCommand(&args);
+
+    switch (command) {
+        .config => |config_cmd| switch (config_cmd) {
+            .get => |key| try std.testing.expectEqualStrings("foo", key),
+            else => return error.UnexpectedCommand,
+        },
+        else => return error.UnexpectedCommand,
+    }
+}
+
+test "config unset command" {
+    const args = [_][]const u8{ "zoid", "config", "unset", "foo" };
+    const command = try parseCommand(&args);
+
+    switch (command) {
+        .config => |config_cmd| switch (config_cmd) {
+            .unset => |key| try std.testing.expectEqualStrings("foo", key),
+            else => return error.UnexpectedCommand,
+        },
+        else => return error.UnexpectedCommand,
+    }
+}
+
+test "config list command" {
+    const args = [_][]const u8{ "zoid", "config", "list" };
+    const command = try parseCommand(&args);
+
+    switch (command) {
+        .config => |config_cmd| try std.testing.expect(config_cmd == .list),
+        else => return error.UnexpectedCommand,
+    }
+}
+
+test "config without subcommand returns error" {
+    const args = [_][]const u8{ "zoid", "config" };
+    try std.testing.expectError(error.MissingConfigSubcommand, parseCommand(&args));
+}
+
+test "config set without key returns error" {
+    const args = [_][]const u8{ "zoid", "config", "set" };
+    try std.testing.expectError(error.MissingConfigKey, parseCommand(&args));
+}
+
+test "config set without value returns error" {
+    const args = [_][]const u8{ "zoid", "config", "set", "foo" };
+    try std.testing.expectError(error.MissingConfigValue, parseCommand(&args));
+}
+
+test "config get without key returns error" {
+    const args = [_][]const u8{ "zoid", "config", "get" };
+    try std.testing.expectError(error.MissingConfigKey, parseCommand(&args));
+}
+
+test "config unset without key returns error" {
+    const args = [_][]const u8{ "zoid", "config", "unset" };
+    try std.testing.expectError(error.MissingConfigKey, parseCommand(&args));
+}
+
+test "config unknown subcommand returns error" {
+    const args = [_][]const u8{ "zoid", "config", "nope" };
+    try std.testing.expectError(error.UnknownConfigSubcommand, parseCommand(&args));
 }

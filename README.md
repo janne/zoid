@@ -15,4 +15,3 @@ A simple, lightweight, secure alternative to OpenClaw. Built on Zig and Lua.
 ## Secure
 - All chat happens with E2E encryption.
 - All keys are stored in an encrypted vault. The vault key is never stored, but added when starting the gateway.
-- The Lua code is run in a sandboxed environment.
