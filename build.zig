@@ -1,5 +1,68 @@
 const std = @import("std");
 
+fn addLuaSupport(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    const lua_dep = b.dependency("lua", .{});
+    const lua_root = lua_dep.path("");
+
+    const lua_lib = b.addLibrary(.{
+        .linkage = .static,
+        .name = "lua",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+
+    lua_lib.root_module.addIncludePath(lua_root);
+    lua_lib.root_module.addCSourceFiles(.{
+        .root = lua_root,
+        .files = &.{
+            "lapi.c",
+            "lauxlib.c",
+            "lbaselib.c",
+            "lcode.c",
+            "lcorolib.c",
+            "lctype.c",
+            "ldblib.c",
+            "ldebug.c",
+            "ldo.c",
+            "ldump.c",
+            "lfunc.c",
+            "lgc.c",
+            "linit.c",
+            "liolib.c",
+            "llex.c",
+            "lmathlib.c",
+            "lmem.c",
+            "loadlib.c",
+            "lobject.c",
+            "lopcodes.c",
+            "loslib.c",
+            "lparser.c",
+            "lstate.c",
+            "lstring.c",
+            "lstrlib.c",
+            "ltable.c",
+            "ltablib.c",
+            "ltm.c",
+            "lundump.c",
+            "lutf8lib.c",
+            "lvm.c",
+            "lzio.c",
+        },
+    });
+
+    module.addIncludePath(lua_root);
+    module.linkLibrary(lua_lib);
+    module.link_libc = true;
+
+    if (target.result.os.tag == .linux) {
+        module.linkSystemLibrary("m", .{});
+        module.linkSystemLibrary("dl", .{});
+    }
+}
+
 // Although this function looks imperative, it does not perform the build
 // directly and instead it mutates the build graph (`b`) that will be then
 // executed by an external runner. The functions in `std.Build` implement a DSL
@@ -82,6 +145,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    addLuaSupport(b, exe.root_module, target, optimize);
 
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
