@@ -13,6 +13,7 @@ pub const ConfigCommand = union(enum) {
 pub const Command = union(enum) {
     help,
     execute: []const u8,
+    chat,
     config: ConfigCommand,
 };
 
@@ -37,6 +38,10 @@ pub fn parseCommand(args: []const []const u8) ParseCommandError!Command {
     if (std.mem.eql(u8, cmd, "execute")) {
         if (args.len < 3) return error.MissingExecuteArgument;
         return .{ .execute = args[2] };
+    }
+
+    if (std.mem.eql(u8, cmd, "chat")) {
+        return .chat;
     }
 
     if (std.mem.eql(u8, cmd, "config")) {
@@ -81,6 +86,9 @@ pub fn printHelp() void {
         \\zoid execute <file.lua>
         \\  Executes the Lua script at <file.lua>.
         \\
+        \\zoid chat
+        \\  Starts an interactive chat session using OpenAI.
+        \\
         \\zoid config set <key> <value>
         \\  Creates or updates a config key.
         \\
@@ -120,6 +128,12 @@ test "execute command" {
 test "execute without value returns error" {
     const args = [_][]const u8{ "zoid", "execute" };
     try std.testing.expectError(error.MissingExecuteArgument, parseCommand(&args));
+}
+
+test "chat command" {
+    const args = [_][]const u8{ "zoid", "chat" };
+    const command = try parseCommand(&args);
+    try std.testing.expect(command == .chat);
 }
 
 test "unknown command returns error" {

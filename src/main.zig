@@ -120,5 +120,36 @@ pub fn main() !void {
                 }
             },
         },
+        .chat => {
+            const api_key_value = zoid.config_store.getValue(allocator, "OPENAI_API_KEY") catch |err| {
+                switch (err) {
+                    error.InvalidConfigFormat => std.debug.print("Config file is invalid JSON (expected key/value string object).\n", .{}),
+                    else => std.debug.print("Failed to read OPENAI_API_KEY: {s}\n", .{@errorName(err)}),
+                }
+                std.process.exit(1);
+            };
+
+            const api_key = api_key_value orelse {
+                std.debug.print("Config key OPENAI_API_KEY is missing. Use: zoid config set OPENAI_API_KEY <value>\n", .{});
+                std.process.exit(1);
+            };
+            defer allocator.free(api_key);
+
+            const model_value = zoid.config_store.getValue(allocator, "OPENAI_MODEL") catch |err| {
+                switch (err) {
+                    error.InvalidConfigFormat => std.debug.print("Config file is invalid JSON (expected key/value string object).\n", .{}),
+                    else => std.debug.print("Failed to read OPENAI_MODEL: {s}\n", .{@errorName(err)}),
+                }
+                std.process.exit(1);
+            };
+            defer if (model_value) |value| allocator.free(value);
+
+            const model = if (model_value) |value| value else "gpt-4o-mini";
+
+            zoid.chat_session.run(allocator, api_key, model) catch |err| {
+                std.debug.print("Chat session failed: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+        },
     }
 }
