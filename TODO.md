@@ -1,0 +1,1 @@
+- What is needed for adding tools, such as allowing the model to read and write to the current folder. Don't allow writes outside the current folder or to execute commands.

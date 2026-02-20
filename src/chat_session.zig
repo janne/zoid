@@ -48,17 +48,46 @@ const UiTicker = struct {
     active_flag: *std.atomic.Value(bool),
 };
 
+const ModelPickerState = struct {
+    active: bool = false,
+    selected: usize = 0,
+    models: std.ArrayList([]u8) = .empty,
+
+    fn deinit(self: *ModelPickerState, allocator: std.mem.Allocator) void {
+        self.clearModels(allocator);
+        self.models.deinit(allocator);
+    }
+
+    fn clearModels(self: *ModelPickerState, allocator: std.mem.Allocator) void {
+        for (self.models.items) |entry| allocator.free(entry);
+        self.models.clearRetainingCapacity();
+        self.selected = 0;
+    }
+};
+
+const fallbackModels = [_][]const u8{
+    "gpt-4o-mini",
+    "gpt-4.1-mini",
+    "gpt-4.1",
+    "gpt-5-mini",
+    "gpt-5",
+    "o3-mini",
+};
+
 pub fn run(allocator: std.mem.Allocator, api_key: []const u8, model: []const u8) !void {
     return runFullscreen(allocator, api_key, model);
 }
 
 fn runFullscreen(allocator: std.mem.Allocator, api_key: []const u8, model: []const u8) !void {
+    var current_model = try allocator.dupe(u8, model);
+    defer allocator.free(current_model);
+
     var tty_buffer: [4096]u8 = undefined;
     var tty = try vaxis.Tty.init(&tty_buffer);
     defer tty.deinit();
 
     var vx = try vaxis.init(allocator, .{
-        .kitty_keyboard_flags = .{ .report_events = true },
+        .kitty_keyboard_flags = .{ .report_events = false },
     });
     defer vx.deinit(allocator, tty.writer());
 
@@ -117,6 +146,8 @@ fn runFullscreen(allocator: std.mem.Allocator, api_key: []const u8, model: []con
     defer render_input_buffer.deinit(allocator);
     var wrapped_input_lines = std.ArrayList(LineRange).empty;
     defer wrapped_input_lines.deinit(allocator);
+    var model_picker: ModelPickerState = .{};
+    defer model_picker.deinit(allocator);
 
     loop: while (true) {
         if (pending and try harvestCompletedRequest(allocator, &request_state, &pending_thread, &conversation, &transcript, &pending, &status_text, &ticker_active)) {
@@ -130,52 +161,62 @@ fn runFullscreen(allocator: std.mem.Allocator, api_key: []const u8, model: []con
             },
             .key_press => |key| {
                 if (key.matches('c', .{ .ctrl = true })) break :loop;
-                if (key.matches(vaxis.Key.escape, .{})) break :loop;
                 if (key.matches('l', .{ .ctrl = true })) vx.queueRefresh();
 
-                if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true })) {
-                    if (pending) continue;
-
-                    const line_owned = try input.toOwnedSlice();
-                    defer allocator.free(line_owned);
-
-                    const prompt = std.mem.trim(u8, line_owned, " \t\r\n");
-                    if (prompt.len == 0) {
-                        status_text = "";
-                    } else if (prompt.len > max_input_len) {
-                        status_text = "Input line is too long.";
-                    } else if (isExitCommand(prompt)) {
-                        break :loop;
-                    } else {
-                        try appendConversationMessage(allocator, &conversation, .user, prompt);
-                        try appendTranscriptEntry(allocator, &transcript, .user, prompt);
-
-                        request_state.mutex.lock();
-                        request_state.done = false;
-                        request_state.reply = null;
-                        request_state.error_text = null;
-                        request_state.mutex.unlock();
-
-                        const snapshot = try cloneMessagesForWorker(conversation.items);
-                        errdefer freeWorkerMessages(snapshot);
-
-                        const args = try std.heap.c_allocator.create(RequestWorkerArgs);
-                        errdefer std.heap.c_allocator.destroy(args);
-                        args.* = .{
-                            .state = &request_state,
-                            .api_key = api_key,
-                            .model = model,
-                            .messages = snapshot,
-                        };
-
-                        pending_thread = try std.Thread.spawn(.{}, requestWorkerMain, .{args});
-                        pending = true;
-                        spinner_frame = 0;
-                        ticker_active.store(true, .unordered);
-                        status_text = "Waiting for assistant response...";
-                    }
+                if (model_picker.active) {
+                    const action = pickerActionFromKey(key);
+                    try handlePickerAction(action, allocator, &model_picker, &current_model, &status_text);
                 } else {
-                    try input.update(.{ .key_press = key });
+                    if (isEscapeKey(key)) break :loop;
+
+                    if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true })) {
+                        if (pending) continue;
+
+                        const line_owned = try input.toOwnedSlice();
+                        defer allocator.free(line_owned);
+
+                        const prompt = std.mem.trim(u8, line_owned, " \t\r\n");
+                        if (prompt.len == 0) {
+                            status_text = "";
+                        } else if (prompt.len > max_input_len) {
+                            status_text = "Input line is too long.";
+                        } else if (isExitCommand(prompt)) {
+                            break :loop;
+                        } else if (isModelCommand(prompt)) {
+                            try populateModelPicker(allocator, api_key, current_model, &model_picker);
+                            model_picker.active = true;
+                            status_text = "Select a model and press Enter.";
+                        } else {
+                            try appendConversationMessage(allocator, &conversation, .user, prompt);
+                            try appendTranscriptEntry(allocator, &transcript, .user, prompt);
+
+                            request_state.mutex.lock();
+                            request_state.done = false;
+                            request_state.reply = null;
+                            request_state.error_text = null;
+                            request_state.mutex.unlock();
+
+                            const snapshot = try cloneMessagesForWorker(conversation.items);
+                            errdefer freeWorkerMessages(snapshot);
+
+                            const args = try std.heap.c_allocator.create(RequestWorkerArgs);
+                            errdefer std.heap.c_allocator.destroy(args);
+                            args.* = .{
+                                .state = &request_state,
+                                .api_key = api_key,
+                                .model = current_model,
+                                .messages = snapshot,
+                            };
+
+                            pending_thread = try std.Thread.spawn(.{}, requestWorkerMain, .{args});
+                            pending = true;
+                            spinner_frame = 0;
+                            ticker_active.store(true, .unordered);
+                            status_text = "Waiting for assistant response...";
+                        }
+                    } else {
+                        try input.update(.{ .key_press = key });
+                    }
                 }
             },
             .tick => {
@@ -198,11 +239,12 @@ fn runFullscreen(allocator: std.mem.Allocator, api_key: []const u8, model: []con
             &vx,
             &input,
             transcript.items,
-            model,
+            current_model,
             pending,
             spinner_frame,
             status_text,
             cwd,
+            &model_picker,
         );
         try vx.render(tty.writer());
     }
@@ -395,6 +437,202 @@ fn harvestCompletedRequest(
     return true;
 }
 
+fn populateModelPicker(
+    allocator: std.mem.Allocator,
+    api_key: []const u8,
+    current_model: []const u8,
+    picker: *ModelPickerState,
+) !void {
+    picker.clearModels(allocator);
+
+    const fetched = openai_client.fetchAvailableModels(allocator, api_key) catch null;
+    if (fetched) |models| {
+        defer {
+            for (models) |model_id| allocator.free(model_id);
+            allocator.free(models);
+        }
+        for (models) |model_id| {
+            try picker.models.append(allocator, try allocator.dupe(u8, model_id));
+        }
+    }
+
+    if (picker.models.items.len == 0) {
+        for (fallbackModels) |fallback_model| {
+            try picker.models.append(allocator, try allocator.dupe(u8, fallback_model));
+        }
+    }
+
+    if (!containsModel(picker.models.items, current_model)) {
+        try picker.models.append(allocator, try allocator.dupe(u8, current_model));
+    }
+
+    picker.selected = 0;
+}
+
+fn containsModel(models: []const []u8, target: []const u8) bool {
+    for (models) |model_id| {
+        if (std.mem.eql(u8, model_id, target)) return true;
+    }
+    return false;
+}
+
+const PickerAction = enum {
+    none,
+    up,
+    down,
+    home,
+    end,
+    accept,
+    cancel,
+};
+
+fn handlePickerAction(
+    action: PickerAction,
+    allocator: std.mem.Allocator,
+    picker: *ModelPickerState,
+    current_model: *[]u8,
+    status_text: *?[]const u8,
+) !void {
+    switch (action) {
+        .none => {},
+        .up => {
+            if (picker.selected > 0) picker.selected -= 1;
+        },
+        .down => {
+            if (picker.selected + 1 < picker.models.items.len) picker.selected += 1;
+        },
+        .home => {
+            picker.selected = 0;
+        },
+        .end => {
+            if (picker.models.items.len > 0) picker.selected = picker.models.items.len - 1;
+        },
+        .accept => {
+            if (picker.models.items.len > 0) {
+                const selected_model = picker.models.items[picker.selected];
+                allocator.free(current_model.*);
+                current_model.* = try allocator.dupe(u8, selected_model);
+                status_text.* = "Model changed for this chat session.";
+            }
+            picker.active = false;
+        },
+        .cancel => {
+            picker.active = false;
+            status_text.* = "Model picker closed.";
+        },
+    }
+}
+
+fn pickerActionFromKey(key: vaxis.Key) PickerAction {
+    if (isEscapeKey(key)) return .cancel;
+    if (key.matches(vaxis.Key.enter, .{}) or key.codepoint == vaxis.Key.enter) return .accept;
+
+    if (key.matches(vaxis.Key.up, .{}) or
+        key.matches(vaxis.Key.kp_up, .{}) or
+        key.codepoint == vaxis.Key.up or
+        key.codepoint == vaxis.Key.kp_up or
+        key.matches('k', .{}) or
+        key.matches('p', .{ .ctrl = true }) or
+        isCtrlP(key))
+    {
+        return .up;
+    }
+    if (key.matches(vaxis.Key.down, .{}) or
+        key.matches(vaxis.Key.kp_down, .{}) or
+        key.codepoint == vaxis.Key.down or
+        key.codepoint == vaxis.Key.kp_down or
+        key.matches('j', .{}) or
+        key.matches('n', .{ .ctrl = true }) or
+        isCtrlN(key))
+    {
+        return .down;
+    }
+    if (key.matches(vaxis.Key.home, .{}) or
+        key.matches(vaxis.Key.kp_home, .{}) or
+        key.codepoint == vaxis.Key.home or
+        key.codepoint == vaxis.Key.kp_home)
+    {
+        return .home;
+    }
+    if (key.matches(vaxis.Key.end, .{}) or
+        key.matches(vaxis.Key.kp_end, .{}) or
+        key.codepoint == vaxis.Key.end or
+        key.codepoint == vaxis.Key.kp_end)
+    {
+        return .end;
+    }
+    if (key.matches('q', .{})) return .cancel;
+
+    if (key.text) |text| {
+        if (isEscSequence(text)) return .cancel;
+        if (isCtrlNSequence(text) or isDownSequence(text)) return .down;
+        if (isCtrlPSequence(text) or isUpSequence(text)) return .up;
+        if (isHomeSequence(text)) return .home;
+        if (isEndSequence(text)) return .end;
+        if (isEnterSequence(text)) return .accept;
+    }
+
+    return .none;
+}
+
+fn isEnterSequence(text: []const u8) bool {
+    return text.len == 1 and (text[0] == '\r' or text[0] == '\n');
+}
+
+fn isEscSequence(text: []const u8) bool {
+    return text.len == 1 and text[0] == 0x1B;
+}
+
+fn isCtrlNSequence(text: []const u8) bool {
+    return text.len == 1 and text[0] == 0x0E;
+}
+
+fn isCtrlPSequence(text: []const u8) bool {
+    return text.len == 1 and text[0] == 0x10;
+}
+
+fn isUpSequence(text: []const u8) bool {
+    if (std.mem.eql(u8, text, "\x1b[A")) return true;
+    if (std.mem.eql(u8, text, "\x1bOA")) return true;
+    if (text.len >= 4 and std.mem.startsWith(u8, text, "\x1b[") and text[text.len - 1] == 'A') return true;
+    return false;
+}
+
+fn isDownSequence(text: []const u8) bool {
+    if (std.mem.eql(u8, text, "\x1b[B")) return true;
+    if (std.mem.eql(u8, text, "\x1bOB")) return true;
+    if (text.len >= 4 and std.mem.startsWith(u8, text, "\x1b[") and text[text.len - 1] == 'B') return true;
+    return false;
+}
+
+fn isHomeSequence(text: []const u8) bool {
+    if (std.mem.eql(u8, text, "\x1b[H")) return true;
+    if (std.mem.eql(u8, text, "\x1bOH")) return true;
+    if (std.mem.eql(u8, text, "\x1b[1~")) return true;
+    return false;
+}
+
+fn isEndSequence(text: []const u8) bool {
+    if (std.mem.eql(u8, text, "\x1b[F")) return true;
+    if (std.mem.eql(u8, text, "\x1bOF")) return true;
+    if (std.mem.eql(u8, text, "\x1b[4~")) return true;
+    return false;
+}
+
+fn isEscapeKey(key: vaxis.Key) bool {
+    if (key.matches(vaxis.Key.escape, .{}) or key.codepoint == vaxis.Key.escape) return true;
+    if (key.text) |text| return isEscSequence(text);
+    return false;
+}
+
+fn isCtrlN(key: vaxis.Key) bool {
+    return key.matches('n', .{ .ctrl = true }) or key.codepoint == 0x0E;
+}
+
+fn isCtrlP(key: vaxis.Key) bool {
+    return key.matches('p', .{ .ctrl = true }) or key.codepoint == 0x10;
+}
+
 fn renderScreen(
     allocator: std.mem.Allocator,
     render_input_buffer: *std.ArrayList(u8),
@@ -407,6 +645,7 @@ fn renderScreen(
     spinner_frame: usize,
     status_text: ?[]const u8,
     cwd: ?[]const u8,
+    model_picker: *const ModelPickerState,
 ) !void {
     _ = status_text;
     const bg_main: u8 = 233;
@@ -509,16 +748,21 @@ fn renderScreen(
         input_start_row,
         bg_panel,
     );
-    const cursor = locateCursorSoftWrapped(wrapped_input_lines.items, input_text, cursor_byte);
-    if (cursor.line >= row_offset and cursor.line < row_offset + visible_input_rows) {
-        const cursor_row: u16 = input_start_row + @as(u16, @intCast(cursor.line - row_offset));
-        const cursor_col: u16 = @min(
-            2 + @as(u16, @intCast(cursor.col)),
-            input_box.width -| 1,
-        );
-        input_box.showCursor(cursor_col, cursor_row);
-    } else {
+
+    if (model_picker.active) {
         input_box.hideCursor();
+    } else {
+        const cursor = locateCursorSoftWrapped(wrapped_input_lines.items, input_text, cursor_byte);
+        if (cursor.line >= row_offset and cursor.line < row_offset + visible_input_rows) {
+            const cursor_row: u16 = input_start_row + @as(u16, @intCast(cursor.line - row_offset));
+            const cursor_col: u16 = @min(
+                2 + @as(u16, @intCast(cursor.col)),
+                input_box.width -| 1,
+            );
+            input_box.showCursor(cursor_col, cursor_row);
+        } else {
+            input_box.hideCursor();
+        }
     }
 
     if (pending) {
@@ -567,6 +811,10 @@ fn renderScreen(
         .col_offset = root.width -| 6,
         .wrap = .none,
     });
+
+    if (model_picker.active) {
+        drawModelPicker(root, model_picker, model);
+    }
 }
 
 fn collectInputBytes(
@@ -815,6 +1063,89 @@ fn drawTranscript(win: vaxis.Window, transcript: []const DisplayEntry) void {
     }
 }
 
+fn drawModelPicker(
+    root: vaxis.Window,
+    picker: *const ModelPickerState,
+    current_model: []const u8,
+) void {
+    if (!picker.active or picker.models.items.len == 0) return;
+    if (root.width < 20 or root.height < 8) return;
+
+    const panel_width: u16 = @min(root.width -| 4, 64);
+    const panel_height: u16 = @min(root.height -| 4, 16);
+    const panel_x: u16 = (root.width - panel_width) / 2;
+    const panel_y: u16 = (root.height - panel_height) / 2;
+
+    const panel = root.child(.{
+        .x_off = @intCast(panel_x),
+        .y_off = @intCast(panel_y),
+        .width = panel_width,
+        .height = panel_height,
+        .border = .{
+            .where = .all,
+            .style = .{ .fg = .{ .index = 60 } },
+        },
+    });
+    panel.fill(.{
+        .char = .{ .grapheme = " ", .width = 1 },
+        .style = .{ .bg = .{ .index = 236 } },
+    });
+    drawLeftAccent(panel, 236, 141);
+
+    const title_segments = [_]vaxis.Segment{
+        .{ .text = "Select model", .style = .{ .fg = .{ .index = 188 }, .bg = .{ .index = 236 }, .bold = true } },
+    };
+    _ = panel.print(&title_segments, .{ .row_offset = 1, .col_offset = 2, .wrap = .none });
+
+    const help_segments = [_]vaxis.Segment{
+        .{ .text = "ctrl+n/ctrl+p or up/down  enter apply  esc cancel", .style = .{ .fg = .{ .index = 146 }, .bg = .{ .index = 236 } } },
+    };
+    _ = panel.print(&help_segments, .{ .row_offset = panel.height -| 2, .col_offset = 2, .wrap = .none });
+
+    const list_row_start: u16 = 3;
+    const list_rows: u16 = if (panel.height > 6) panel.height - 6 else 1;
+    const visible_count: usize = @intCast(list_rows);
+
+    var start_idx: usize = 0;
+    if (picker.selected >= visible_count and visible_count > 0) {
+        start_idx = picker.selected - visible_count + 1;
+    }
+
+    var row: u16 = 0;
+    while (row < list_rows) : (row += 1) {
+        const idx = start_idx + row;
+        if (idx >= picker.models.items.len) break;
+
+        const selected = idx == picker.selected;
+        const label = picker.models.items[idx];
+        const prefix = if (std.mem.eql(u8, label, current_model)) "* " else "  ";
+
+        const segments = [_]vaxis.Segment{
+            .{
+                .text = prefix,
+                .style = .{
+                    .fg = .{ .index = if (selected) 255 else 146 },
+                    .bg = .{ .index = if (selected) 60 else 236 },
+                    .bold = selected,
+                },
+            },
+            .{
+                .text = label,
+                .style = .{
+                    .fg = .{ .index = if (selected) 255 else 189 },
+                    .bg = .{ .index = if (selected) 60 else 236 },
+                    .bold = selected,
+                },
+            },
+        };
+        _ = panel.print(&segments, .{
+            .row_offset = list_row_start + row,
+            .col_offset = 2,
+            .wrap = .none,
+        });
+    }
+}
+
 fn rolePrefix(role: DisplayRole) []const u8 {
     return switch (role) {
         .user => "",
@@ -887,10 +1218,19 @@ fn isExitCommand(input: []const u8) bool {
     return std.mem.eql(u8, input, "/exit") or std.mem.eql(u8, input, "/quit");
 }
 
+fn isModelCommand(input: []const u8) bool {
+    return std.mem.eql(u8, input, "/model");
+}
+
 test "isExitCommand recognizes exit commands" {
     try std.testing.expect(isExitCommand("/exit"));
     try std.testing.expect(isExitCommand("/quit"));
     try std.testing.expect(!isExitCommand("exit"));
+}
+
+test "isModelCommand recognizes model command" {
+    try std.testing.expect(isModelCommand("/model"));
+    try std.testing.expect(!isModelCommand("model"));
 }
 
 test "visibleTranscriptStart picks latest entries that fit" {
