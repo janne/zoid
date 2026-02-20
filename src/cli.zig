@@ -13,12 +13,14 @@ pub const ConfigCommand = union(enum) {
 pub const Command = union(enum) {
     help,
     execute: []const u8,
+    run: []const []const u8,
     chat,
     config: ConfigCommand,
 };
 
 pub const ParseCommandError = error{
     MissingExecuteArgument,
+    MissingRunArgument,
     MissingConfigSubcommand,
     MissingConfigKey,
     MissingConfigValue,
@@ -27,7 +29,7 @@ pub const ParseCommandError = error{
 };
 
 pub fn parseCommand(args: []const []const u8) ParseCommandError!Command {
-    if (args.len <= 1) return .help;
+    if (args.len <= 1) return .chat;
 
     const cmd = args[1];
 
@@ -38,6 +40,11 @@ pub fn parseCommand(args: []const []const u8) ParseCommandError!Command {
     if (std.mem.eql(u8, cmd, "execute")) {
         if (args.len < 3) return error.MissingExecuteArgument;
         return .{ .execute = args[2] };
+    }
+
+    if (std.mem.eql(u8, cmd, "run")) {
+        if (args.len < 3) return error.MissingRunArgument;
+        return .{ .run = args[2..] };
     }
 
     if (std.mem.eql(u8, cmd, "chat")) {
@@ -86,8 +93,11 @@ pub fn printHelp() void {
         \\zoid execute <file.lua>
         \\  Executes the Lua script at <file.lua>.
         \\
+        \\zoid run <prompt...>
+        \\  Sends a single prompt to OpenAI and writes the response to stdout.
+        \\
         \\zoid chat
-        \\  Starts an interactive chat session using OpenAI.
+        \\  Starts an interactive full-screen chat session (TTY only).
         \\
         \\zoid config set <key> <value>
         \\  Creates or updates a config key.
@@ -103,10 +113,10 @@ pub fn printHelp() void {
     , .{});
 }
 
-test "default command is help" {
+test "default command is chat" {
     const args = [_][]const u8{"zoid"};
     const command = try parseCommand(&args);
-    try std.testing.expect(command == .help);
+    try std.testing.expect(command == .chat);
 }
 
 test "help command" {
@@ -134,6 +144,25 @@ test "chat command" {
     const args = [_][]const u8{ "zoid", "chat" };
     const command = try parseCommand(&args);
     try std.testing.expect(command == .chat);
+}
+
+test "run command" {
+    const args = [_][]const u8{ "zoid", "run", "hello", "world" };
+    const command = try parseCommand(&args);
+
+    switch (command) {
+        .run => |prompt_parts| {
+            try std.testing.expectEqual(@as(usize, 2), prompt_parts.len);
+            try std.testing.expectEqualStrings("hello", prompt_parts[0]);
+            try std.testing.expectEqualStrings("world", prompt_parts[1]);
+        },
+        else => return error.UnexpectedCommand,
+    }
+}
+
+test "run without value returns error" {
+    const args = [_][]const u8{ "zoid", "run" };
+    try std.testing.expectError(error.MissingRunArgument, parseCommand(&args));
 }
 
 test "unknown command returns error" {

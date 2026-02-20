@@ -103,6 +103,11 @@ pub fn build(b: *std.Build) void {
         // which requires us to specify a target.
         .target = target,
     });
+    const vaxis_dep = b.dependency("vaxis", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    mod.addImport("vaxis", vaxis_dep.module("vaxis"));
     addLuaSupport(b, mod, target, optimize);
 
     // Here we define an executable. An executable needs to have a root module

@@ -26,6 +26,7 @@ When documentation conflicts, prefer:
 - Always write commit messages in English.
 - Keep this `AGENTS.md` file updated whenever adding code or changing behavior.
 - Add notable implementation learnings to `AGENTS.md` so future changes can reuse them.
+- For adding Zig packages/dependencies, use `https://zigistry.dev/` as an input source.
 - Keep tests updated with behavior changes.
 - After code updates:
   - Format the code.
@@ -46,6 +47,13 @@ If you change command behavior, error handling, config format, or Lua execution 
 - CLI changes:
   - Update parsing + help text in `src/cli.zig`.
   - Update execution flow and user-visible errors in `src/main.zig`.
+  - Default command is `chat` when running `zoid` with no arguments.
+- Chat interface changes:
+  - `src/chat_session.zig` now uses fullscreen `libvaxis` UI in the alternate screen when running on a TTY, with `vaxis.widgets.TextInput` handling readline-style editing (`Ctrl+A`, `Ctrl+E`, arrows, backspace/delete).
+  - `chat` is TTY-only; non-interactive one-shot usage should go through `zoid run <prompt...>` and write only the agent output to stdout.
+  - Keep the input box anchored at the bottom of the screen.
+  - Input rendering is manual soft word-wrap, and the input box grows vertically upward as lines increase.
+  - `build.zig` must import the `vaxis` module into the `zoid` module for `@import("vaxis")` usage inside `src/`.
 - Config changes:
   - Preserve valid JSON object format (string keys and string values).
   - Keep deterministic key listing behavior (`list` is currently sorted).

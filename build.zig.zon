@@ -36,6 +36,10 @@
             .url = "https://github.com/lua/lua/archive/refs/tags/v5.4.7.tar.gz",
             .hash = "N-V-__8AAA2SGQDIowqfBdNuGGJ03b-aevlPIR3TaFV3knJ9",
         },
+        .vaxis = .{
+            .url = "https://github.com/rockorager/libvaxis/archive/refs/heads/main.tar.gz",
+            .hash = "vaxis-0.5.1-BWNV_IxJCQC5OGNaXQfNnqgn9_Vku0PMgey-dplubcQK",
+        },
     },
     .paths = .{
         "build.zig",

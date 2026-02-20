@@ -16,6 +16,11 @@ pub fn main() !void {
                 zoid.cli.printHelp();
                 return;
             },
+            error.MissingRunArgument => {
+                std.debug.print("Missing argument for 'run'.\n\n", .{});
+                zoid.cli.printHelp();
+                return;
+            },
             error.MissingConfigSubcommand => {
                 std.debug.print("Missing subcommand for 'config'.\n\n", .{});
                 zoid.cli.printHelp();
@@ -120,36 +125,93 @@ pub fn main() !void {
                 }
             },
         },
+        .run => |prompt_parts| {
+            const settings = loadOpenAISettings(allocator) catch |err| {
+                switch (err) {
+                    error.InvalidConfigFormat => std.debug.print("Config file is invalid JSON (expected key/value string object).\n", .{}),
+                    error.MissingOpenAIApiKey => std.debug.print("Config key OPENAI_API_KEY is missing. Use: zoid config set OPENAI_API_KEY <value>\n", .{}),
+                    else => std.debug.print("Failed to load OpenAI settings: {s}\n", .{@errorName(err)}),
+                }
+                std.process.exit(1);
+            };
+            defer settings.deinit(allocator);
+
+            const prompt = std.mem.join(allocator, " ", prompt_parts) catch |err| {
+                std.debug.print("Failed to build prompt: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            defer allocator.free(prompt);
+
+            const trimmed_prompt = std.mem.trim(u8, prompt, " \t\r\n");
+            if (trimmed_prompt.len == 0) {
+                std.debug.print("Prompt cannot be empty.\n", .{});
+                std.process.exit(1);
+            }
+
+            const messages = [_]zoid.openai_client.Message{
+                .{ .role = .user, .content = trimmed_prompt },
+            };
+
+            const reply = zoid.openai_client.fetchAssistantReply(
+                allocator,
+                settings.api_key,
+                settings.model,
+                &messages,
+            ) catch |err| {
+                std.debug.print("OpenAI request failed: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            defer allocator.free(reply);
+
+            try std.fs.File.stdout().writeAll(reply);
+            try std.fs.File.stdout().writeAll("\n");
+        },
         .chat => {
-            const api_key_value = zoid.config_store.getValue(allocator, "OPENAI_API_KEY") catch |err| {
+            if (!std.fs.File.stdin().isTty() or !std.fs.File.stdout().isTty()) {
+                std.debug.print("The 'chat' command requires a TTY. Use: zoid run <prompt...>\n", .{});
+                std.process.exit(1);
+            }
+
+            const settings = loadOpenAISettings(allocator) catch |err| {
                 switch (err) {
                     error.InvalidConfigFormat => std.debug.print("Config file is invalid JSON (expected key/value string object).\n", .{}),
-                    else => std.debug.print("Failed to read OPENAI_API_KEY: {s}\n", .{@errorName(err)}),
+                    error.MissingOpenAIApiKey => std.debug.print("Config key OPENAI_API_KEY is missing. Use: zoid config set OPENAI_API_KEY <value>\n", .{}),
+                    else => std.debug.print("Failed to load OpenAI settings: {s}\n", .{@errorName(err)}),
                 }
                 std.process.exit(1);
             };
+            defer settings.deinit(allocator);
 
-            const api_key = api_key_value orelse {
-                std.debug.print("Config key OPENAI_API_KEY is missing. Use: zoid config set OPENAI_API_KEY <value>\n", .{});
-                std.process.exit(1);
-            };
-            defer allocator.free(api_key);
-
-            const model_value = zoid.config_store.getValue(allocator, "OPENAI_MODEL") catch |err| {
-                switch (err) {
-                    error.InvalidConfigFormat => std.debug.print("Config file is invalid JSON (expected key/value string object).\n", .{}),
-                    else => std.debug.print("Failed to read OPENAI_MODEL: {s}\n", .{@errorName(err)}),
-                }
-                std.process.exit(1);
-            };
-            defer if (model_value) |value| allocator.free(value);
-
-            const model = if (model_value) |value| value else "gpt-4o-mini";
-
-            zoid.chat_session.run(allocator, api_key, model) catch |err| {
+            zoid.chat_session.run(allocator, settings.api_key, settings.model) catch |err| {
                 std.debug.print("Chat session failed: {s}\n", .{@errorName(err)});
                 std.process.exit(1);
             };
         },
     }
+}
+
+const OpenAISettings = struct {
+    api_key: []u8,
+    model: []u8,
+
+    fn deinit(self: OpenAISettings, allocator: std.mem.Allocator) void {
+        allocator.free(self.api_key);
+        allocator.free(self.model);
+    }
+};
+
+fn loadOpenAISettings(allocator: std.mem.Allocator) !OpenAISettings {
+    const api_key_value = try zoid.config_store.getValue(allocator, "OPENAI_API_KEY");
+    const api_key = api_key_value orelse return error.MissingOpenAIApiKey;
+
+    const model_value = try zoid.config_store.getValue(allocator, "OPENAI_MODEL");
+    const model = if (model_value) |value|
+        value
+    else
+        try allocator.dupe(u8, "gpt-4o-mini");
+
+    return .{
+        .api_key = api_key,
+        .model = model,
+    };
 }
