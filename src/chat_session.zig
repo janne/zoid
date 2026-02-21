@@ -1,5 +1,7 @@
 const std = @import("std");
+const config_keys = @import("config_keys.zig");
 const config_store = @import("config_store.zig");
+const model_catalog = @import("model_catalog.zig");
 const openai_client = @import("openai_client.zig");
 const vaxis = @import("vaxis");
 
@@ -135,15 +137,6 @@ const InputHistoryState = struct {
             try setInputText(input, self.entries.items[idx]);
         }
     }
-};
-
-const fallbackModels = [_][]const u8{
-    "gpt-4o-mini",
-    "gpt-4.1-mini",
-    "gpt-4.1",
-    "gpt-5-mini",
-    "gpt-5",
-    "o3-mini",
 };
 
 pub fn run(allocator: std.mem.Allocator, api_key: []const u8, model: []const u8) !void {
@@ -542,7 +535,7 @@ fn populateModelPicker(
     }
 
     if (picker.models.items.len == 0) {
-        for (fallbackModels) |fallback_model| {
+        for (model_catalog.fallback_models) |fallback_model| {
             try picker.models.append(allocator, try allocator.dupe(u8, fallback_model));
         }
     }
@@ -597,7 +590,7 @@ fn handlePickerAction(
                 const selected_model = picker.models.items[picker.selected];
                 allocator.free(current_model.*);
                 current_model.* = try allocator.dupe(u8, selected_model);
-                config_store.setValue(allocator, "OPENAI_MODEL", selected_model) catch {
+                config_store.setValue(allocator, config_keys.openai_model, selected_model) catch {
                     status_text.* = "Model changed for this session, but failed to save config.";
                     picker.active = false;
                     return;

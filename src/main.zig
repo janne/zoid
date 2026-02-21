@@ -126,14 +126,7 @@ pub fn main() !void {
             },
         },
         .run => |prompt_parts| {
-            const settings = loadOpenAISettings(allocator) catch |err| {
-                switch (err) {
-                    error.InvalidConfigFormat => std.debug.print("Config file is invalid JSON (expected key/value string object).\n", .{}),
-                    error.MissingOpenAIApiKey => std.debug.print("Config key OPENAI_API_KEY is missing. Use: zoid config set OPENAI_API_KEY <value>\n", .{}),
-                    else => std.debug.print("Failed to load OpenAI settings: {s}\n", .{@errorName(err)}),
-                }
-                std.process.exit(1);
-            };
+            const settings = loadOpenAISettingsOrExit(allocator);
             defer settings.deinit(allocator);
 
             const prompt = std.mem.join(allocator, " ", prompt_parts) catch |err| {
@@ -172,14 +165,7 @@ pub fn main() !void {
                 std.process.exit(1);
             }
 
-            const settings = loadOpenAISettings(allocator) catch |err| {
-                switch (err) {
-                    error.InvalidConfigFormat => std.debug.print("Config file is invalid JSON (expected key/value string object).\n", .{}),
-                    error.MissingOpenAIApiKey => std.debug.print("Config key OPENAI_API_KEY is missing. Use: zoid config set OPENAI_API_KEY <value>\n", .{}),
-                    else => std.debug.print("Failed to load OpenAI settings: {s}\n", .{@errorName(err)}),
-                }
-                std.process.exit(1);
-            };
+            const settings = loadOpenAISettingsOrExit(allocator);
             defer settings.deinit(allocator);
 
             zoid.chat_session.run(allocator, settings.api_key, settings.model) catch |err| {
@@ -200,15 +186,29 @@ const OpenAISettings = struct {
     }
 };
 
+fn loadOpenAISettingsOrExit(allocator: std.mem.Allocator) OpenAISettings {
+    return loadOpenAISettings(allocator) catch |err| {
+        switch (err) {
+            error.InvalidConfigFormat => std.debug.print("Config file is invalid JSON (expected key/value string object).\n", .{}),
+            error.MissingOpenAIApiKey => std.debug.print(
+                "Config key {s} is missing. Use: zoid config set {s} <value>\n",
+                .{ zoid.config_keys.openai_api_key, zoid.config_keys.openai_api_key },
+            ),
+            else => std.debug.print("Failed to load OpenAI settings: {s}\n", .{@errorName(err)}),
+        }
+        std.process.exit(1);
+    };
+}
+
 fn loadOpenAISettings(allocator: std.mem.Allocator) !OpenAISettings {
-    const api_key_value = try zoid.config_store.getValue(allocator, "OPENAI_API_KEY");
+    const api_key_value = try zoid.config_store.getValue(allocator, zoid.config_keys.openai_api_key);
     const api_key = api_key_value orelse return error.MissingOpenAIApiKey;
 
-    const model_value = try zoid.config_store.getValue(allocator, "OPENAI_MODEL");
+    const model_value = try zoid.config_store.getValue(allocator, zoid.config_keys.openai_model);
     const model = if (model_value) |value|
         value
     else
-        try allocator.dupe(u8, "gpt-4o-mini");
+        try allocator.dupe(u8, zoid.model_catalog.default_model);
 
     return .{
         .api_key = api_key,

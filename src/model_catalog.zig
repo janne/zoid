@@ -38,3 +38,28 @@ test "isChatModelId rejects non-chat model families" {
     try std.testing.expect(!isChatModelId("whisper-1"));
     try std.testing.expect(!isChatModelId("text-embedding-3-small"));
 }
+
+test "default model is included in fallback models" {
+    var found = false;
+    for (fallback_models) |model_id| {
+        if (std.mem.eql(u8, model_id, default_model)) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "fallback models are unique" {
+    for (fallback_models, 0..) |model_id, index| {
+        for (fallback_models[index + 1 ..]) |other_model_id| {
+            try std.testing.expect(!std.mem.eql(u8, model_id, other_model_id));
+        }
+    }
+}
+
+test "fallback models are chat-capable" {
+    for (fallback_models) |model_id| {
+        try std.testing.expect(isChatModelId(model_id));
+    }
+}

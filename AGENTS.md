@@ -61,6 +61,9 @@ If you change command behavior, error handling, config format, or Lua execution 
 - OpenAI model policy changes:
   - Keep `src/model_catalog.zig` as the single source of truth for `default_model`, `fallback_models`, and `isChatModelId`.
   - `src/openai_client.zig` should use `model_catalog.isChatModelId` when filtering `/v1/models` results.
+  - `src/main.zig` should use `model_catalog.default_model` when `OPENAI_MODEL` is unset.
+  - `src/chat_session.zig` should use `model_catalog.fallback_models` for picker fallback choices.
+  - Keep model catalog invariants covered by tests (`default_model` included in `fallback_models`, fallback IDs unique, fallback IDs chat-capable).
 - Tool runtime changes:
   - `src/tool_runtime.zig` enforces `workspace-write` policy rooted at current working directory and exposes `filesystem_read`, `filesystem_write`, and `shell_command`.
   - `shell_command` runs via `/bin/sh -lc` with `cwd` set to workspace root and bounded output size.
@@ -68,6 +71,7 @@ If you change command behavior, error handling, config format, or Lua execution 
 - Config changes:
   - Preserve valid JSON object format (string keys and string values).
   - Keep deterministic key listing behavior (`list` is currently sorted).
+  - Keep OpenAI config key names centralized in `src/config_keys.zig` and reuse those constants in command/chat code paths.
 - Lua runner changes:
   - Keep clear load/runtime error reporting.
   - Preserve current error contract (`LuaStateInitFailed`, `LuaLoadFailed`, `LuaRuntimeFailed`).
