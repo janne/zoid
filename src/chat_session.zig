@@ -66,6 +66,77 @@ const ModelPickerState = struct {
     }
 };
 
+const InputHistoryAction = enum {
+    none,
+    up,
+    down,
+};
+
+const InputHistoryState = struct {
+    entries: std.ArrayList([]u8) = .empty,
+    browse_index: ?usize = null,
+    draft: ?[]u8 = null,
+
+    fn deinit(self: *InputHistoryState, allocator: std.mem.Allocator) void {
+        self.clearBrowseState(allocator);
+        for (self.entries.items) |entry| allocator.free(entry);
+        self.entries.deinit(allocator);
+    }
+
+    fn clearBrowseState(self: *InputHistoryState, allocator: std.mem.Allocator) void {
+        self.browse_index = null;
+        if (self.draft) |draft| {
+            allocator.free(draft);
+            self.draft = null;
+        }
+    }
+
+    fn append(self: *InputHistoryState, allocator: std.mem.Allocator, text: []const u8) !void {
+        const copy = try allocator.dupe(u8, text);
+        errdefer allocator.free(copy);
+        try self.entries.append(allocator, copy);
+    }
+
+    fn navigate(
+        self: *InputHistoryState,
+        allocator: std.mem.Allocator,
+        input: *vaxis.widgets.TextInput,
+        action: InputHistoryAction,
+    ) !void {
+        if (self.entries.items.len == 0) return;
+
+        switch (action) {
+            .none => return,
+            .up => {
+                if (self.browse_index == null) {
+                    if (self.draft) |draft| allocator.free(draft);
+                    self.draft = try snapshotInputText(allocator, input);
+                    self.browse_index = self.entries.items.len - 1;
+                } else if (self.browse_index.? > 0) {
+                    self.browse_index.? -= 1;
+                }
+            },
+            .down => {
+                const idx = self.browse_index orelse return;
+                if (idx + 1 < self.entries.items.len) {
+                    self.browse_index = idx + 1;
+                } else {
+                    self.browse_index = null;
+                    const draft = self.draft orelse "";
+                    try setInputText(input, draft);
+                    if (self.draft) |draft_text| allocator.free(draft_text);
+                    self.draft = null;
+                    return;
+                }
+            },
+        }
+
+        if (self.browse_index) |idx| {
+            try setInputText(input, self.entries.items[idx]);
+        }
+    }
+};
+
 const fallbackModels = [_][]const u8{
     "gpt-4o-mini",
     "gpt-4.1-mini",
@@ -149,6 +220,8 @@ fn runFullscreen(allocator: std.mem.Allocator, api_key: []const u8, model: []con
     defer wrapped_input_lines.deinit(allocator);
     var model_picker: ModelPickerState = .{};
     defer model_picker.deinit(allocator);
+    var input_history: InputHistoryState = .{};
+    defer input_history.deinit(allocator);
 
     loop: while (true) {
         if (pending and try harvestCompletedRequest(allocator, &request_state, &pending_thread, &conversation, &transcript, &pending, &status_text, &ticker_active)) {
@@ -168,55 +241,66 @@ fn runFullscreen(allocator: std.mem.Allocator, api_key: []const u8, model: []con
                     const action = pickerActionFromKey(key);
                     try handlePickerAction(action, allocator, &model_picker, &current_model, &status_text);
                 } else {
-                    if (isEscapeKey(key)) break :loop;
-
-                    if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true })) {
-                        if (pending) continue;
-
-                        const line_owned = try input.toOwnedSlice();
-                        defer allocator.free(line_owned);
-
-                        const prompt = std.mem.trim(u8, line_owned, " \t\r\n");
-                        if (prompt.len == 0) {
-                            status_text = "";
-                        } else if (prompt.len > max_input_len) {
-                            status_text = "Input line is too long.";
-                        } else if (isExitCommand(prompt)) {
-                            break :loop;
-                        } else if (isModelCommand(prompt)) {
-                            try populateModelPicker(allocator, api_key, current_model, &model_picker);
-                            model_picker.active = true;
-                            status_text = "Select a model and press Enter.";
-                        } else {
-                            try appendConversationMessage(allocator, &conversation, .user, prompt);
-                            try appendTranscriptEntry(allocator, &transcript, .user, prompt);
-
-                            request_state.mutex.lock();
-                            request_state.done = false;
-                            request_state.reply = null;
-                            request_state.error_text = null;
-                            request_state.mutex.unlock();
-
-                            const snapshot = try cloneMessagesForWorker(conversation.items);
-                            errdefer freeWorkerMessages(snapshot);
-
-                            const args = try std.heap.c_allocator.create(RequestWorkerArgs);
-                            errdefer std.heap.c_allocator.destroy(args);
-                            args.* = .{
-                                .state = &request_state,
-                                .api_key = api_key,
-                                .model = current_model,
-                                .messages = snapshot,
-                            };
-
-                            pending_thread = try std.Thread.spawn(.{}, requestWorkerMain, .{args});
-                            pending = true;
-                            spinner_frame = 0;
-                            ticker_active.store(true, .unordered);
-                            status_text = "Waiting for assistant response...";
-                        }
+                    const history_action = inputHistoryActionFromKey(key);
+                    if (history_action != .none) {
+                        try input_history.navigate(allocator, &input, history_action);
                     } else {
-                        try input.update(.{ .key_press = key });
+                        if (isEscapeKey(key)) break :loop;
+
+                        if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true })) {
+                            if (pending) continue;
+
+                            const line_owned = try input.toOwnedSlice();
+                            defer allocator.free(line_owned);
+
+                            input_history.clearBrowseState(allocator);
+                            const prompt = std.mem.trim(u8, line_owned, " \t\r\n");
+                            if (prompt.len == 0) {
+                                status_text = "";
+                            } else if (prompt.len > max_input_len) {
+                                status_text = "Input line is too long.";
+                            } else if (isExitCommand(prompt)) {
+                                break :loop;
+                            } else {
+                                try input_history.append(allocator, prompt);
+
+                                if (isModelCommand(prompt)) {
+                                    try populateModelPicker(allocator, api_key, current_model, &model_picker);
+                                    model_picker.active = true;
+                                    status_text = "Select a model and press Enter.";
+                                } else {
+                                    try appendConversationMessage(allocator, &conversation, .user, prompt);
+                                    try appendTranscriptEntry(allocator, &transcript, .user, prompt);
+
+                                    request_state.mutex.lock();
+                                    request_state.done = false;
+                                    request_state.reply = null;
+                                    request_state.error_text = null;
+                                    request_state.mutex.unlock();
+
+                                    const snapshot = try cloneMessagesForWorker(conversation.items);
+                                    errdefer freeWorkerMessages(snapshot);
+
+                                    const args = try std.heap.c_allocator.create(RequestWorkerArgs);
+                                    errdefer std.heap.c_allocator.destroy(args);
+                                    args.* = .{
+                                        .state = &request_state,
+                                        .api_key = api_key,
+                                        .model = current_model,
+                                        .messages = snapshot,
+                                    };
+
+                                    pending_thread = try std.Thread.spawn(.{}, requestWorkerMain, .{args});
+                                    pending = true;
+                                    spinner_frame = 0;
+                                    ticker_active.store(true, .unordered);
+                                    status_text = "Waiting for assistant response...";
+                                }
+                            }
+                        } else {
+                            input_history.clearBrowseState(allocator);
+                            try input.update(.{ .key_press = key });
+                        }
                     }
                 }
             },
@@ -581,6 +665,31 @@ fn pickerActionFromKey(key: vaxis.Key) PickerAction {
     return .none;
 }
 
+fn inputHistoryActionFromKey(key: vaxis.Key) InputHistoryAction {
+    if (key.matches(vaxis.Key.up, .{}) or
+        key.matches(vaxis.Key.kp_up, .{}) or
+        key.codepoint == vaxis.Key.up or
+        key.codepoint == vaxis.Key.kp_up)
+    {
+        return .up;
+    }
+
+    if (key.matches(vaxis.Key.down, .{}) or
+        key.matches(vaxis.Key.kp_down, .{}) or
+        key.codepoint == vaxis.Key.down or
+        key.codepoint == vaxis.Key.kp_down)
+    {
+        return .down;
+    }
+
+    if (key.text) |text| {
+        if (isUpSequence(text)) return .up;
+        if (isDownSequence(text)) return .down;
+    }
+
+    return .none;
+}
+
 fn isEnterSequence(text: []const u8) bool {
     return text.len == 1 and (text[0] == '\r' or text[0] == '\n');
 }
@@ -821,6 +930,23 @@ fn renderScreen(
     if (model_picker.active) {
         drawModelPicker(root, model_picker, model);
     }
+}
+
+fn snapshotInputText(
+    allocator: std.mem.Allocator,
+    input: *const vaxis.widgets.TextInput,
+) ![]u8 {
+    const first = input.buf.firstHalf();
+    const second = input.buf.secondHalf();
+    const output = try allocator.alloc(u8, first.len + second.len);
+    @memcpy(output[0..first.len], first);
+    @memcpy(output[first.len..], second);
+    return output;
+}
+
+fn setInputText(input: *vaxis.widgets.TextInput, text: []const u8) !void {
+    input.clearRetainingCapacity();
+    try input.insertSliceAtCursor(text);
 }
 
 fn collectInputBytes(
@@ -1228,6 +1354,12 @@ fn isModelCommand(input: []const u8) bool {
     return std.mem.eql(u8, input, "/model");
 }
 
+fn expectInputTextEquals(input: *const vaxis.widgets.TextInput, expected: []const u8) !void {
+    const actual = try snapshotInputText(std.testing.allocator, input);
+    defer std.testing.allocator.free(actual);
+    try std.testing.expectEqualStrings(expected, actual);
+}
+
 test "isExitCommand recognizes exit commands" {
     try std.testing.expect(isExitCommand("/exit"));
     try std.testing.expect(isExitCommand("/quit"));
@@ -1273,4 +1405,47 @@ test "locateCursorSoftWrapped returns utf8-aware cursor column" {
     const cursor = locateCursorSoftWrapped(lines.items, text, "åäö".len);
     try std.testing.expectEqual(@as(usize, 1), cursor.line);
     try std.testing.expectEqual(@as(usize, 0), cursor.col);
+}
+
+test "inputHistoryActionFromKey detects up and down keys" {
+    const up_key: vaxis.Key = .{ .codepoint = vaxis.Key.up };
+    const down_key: vaxis.Key = .{ .codepoint = vaxis.Key.down };
+    const regular_key: vaxis.Key = .{
+        .codepoint = 'x',
+        .text = "x",
+    };
+
+    try std.testing.expect(inputHistoryActionFromKey(up_key) == .up);
+    try std.testing.expect(inputHistoryActionFromKey(down_key) == .down);
+    try std.testing.expect(inputHistoryActionFromKey(regular_key) == .none);
+}
+
+test "InputHistoryState navigates and restores draft text" {
+    var history: InputHistoryState = .{};
+    defer history.deinit(std.testing.allocator);
+
+    try history.append(std.testing.allocator, "first");
+    try history.append(std.testing.allocator, "second");
+    try history.append(std.testing.allocator, "third");
+
+    var input = vaxis.widgets.TextInput.init(std.testing.allocator);
+    defer input.deinit();
+    try input.insertSliceAtCursor("draft");
+
+    try history.navigate(std.testing.allocator, &input, .up);
+    try std.testing.expectEqual(@as(?usize, 2), history.browse_index);
+    try expectInputTextEquals(&input, "third");
+
+    try history.navigate(std.testing.allocator, &input, .up);
+    try std.testing.expectEqual(@as(?usize, 1), history.browse_index);
+    try expectInputTextEquals(&input, "second");
+
+    try history.navigate(std.testing.allocator, &input, .down);
+    try std.testing.expectEqual(@as(?usize, 2), history.browse_index);
+    try expectInputTextEquals(&input, "third");
+
+    try history.navigate(std.testing.allocator, &input, .down);
+    try std.testing.expect(history.browse_index == null);
+    try std.testing.expect(history.draft == null);
+    try expectInputTextEquals(&input, "draft");
 }
