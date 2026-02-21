@@ -11,6 +11,7 @@ Today the project provides:
 - Lua script execution via `zoid execute <file.lua>` in `src/lua_runner.zig`.
 - JSON config key/value storage via `zoid config set|get|unset|list` in `src/config_store.zig`.
 - OpenAI chat + one-shot run flows in `src/openai_client.zig` and `src/chat_session.zig`, including local tools (`filesystem_read`, `filesystem_write`, `filesystem_delete`, `lua_execute`, `config`, `http_get`, `http_post`, `http_put`, `http_delete`) with workspace-root policy handling via `src/tool_runtime.zig`.
+- Service mode via `zoid serve` in `src/telegram_bot.zig` (currently Telegram long-polling), forwarding incoming text messages to OpenAI one-shot responses and replying with `sendMessage`.
 - Shared OpenAI model policy in `src/model_catalog.zig` (default model, picker fallback models, and chat-model ID filtering rules).
 - Build + test pipeline in `build.zig`, including embedded Lua (static library from dependency `lua` in `build.zig.zon`).
 
@@ -52,6 +53,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - Update execution flow and user-visible errors in `src/main.zig`.
   - `zoid execute <file.lua>` must use the same sandbox restrictions and `.lua` path policy as `lua_execute` so local script runs match tool-mode behavior.
   - Default command is `chat` when running `zoid` with no arguments.
+  - `zoid serve` is the long-running service entrypoint; currently it requires both `OPENAI_API_KEY` and `TELEGRAM_BOT_TOKEN` in config and runs a Telegram long-polling loop until interrupted.
 - Chat interface changes:
   - `src/chat_session.zig` now uses fullscreen `libvaxis` UI in the alternate screen when running on a TTY, with `vaxis.widgets.TextInput` handling readline-style editing (`Ctrl+A`, `Ctrl+E`, arrows, backspace/delete).
   - When submitting chat input, snapshot text with `snapshotInputText`/`takeInputText` and then clear the widget; avoid `TextInput.toOwnedSlice()` in the live TUI loop to prevent input buffer corruption/ghost text rendering.
@@ -91,7 +93,7 @@ If you change command behavior, error handling, config format, or Lua execution 
 - Config changes:
   - Preserve valid JSON object format (string keys and string values).
   - Keep deterministic key listing behavior (`list` is currently sorted).
-  - Keep OpenAI config key names centralized in `src/config_keys.zig` and reuse those constants in command/chat code paths.
+  - Keep OpenAI and Telegram config key names centralized in `src/config_keys.zig` and reuse those constants in command/chat code paths.
 - Lua runner changes:
   - Keep clear load/runtime error reporting.
   - Preserve current error contract (`LuaStateInitFailed`, `LuaLoadFailed`, `LuaRuntimeFailed`).

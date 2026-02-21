@@ -177,6 +177,22 @@ pub fn main() !void {
             try std.fs.File.stdout().writeAll(reply);
             try std.fs.File.stdout().writeAll("\n");
         },
+        .serve => {
+            const openai_settings = loadOpenAISettingsOrExit(allocator);
+            defer openai_settings.deinit(allocator);
+
+            const bot_token = loadTelegramBotTokenOrExit(allocator);
+            defer allocator.free(bot_token);
+
+            zoid.telegram_bot.runLongPolling(allocator, .{
+                .bot_token = bot_token,
+                .openai_api_key = openai_settings.api_key,
+                .openai_model = openai_settings.model,
+            }) catch |err| {
+                std.debug.print("Telegram bot failed: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+        },
         .chat => {
             if (!std.fs.File.stdin().isTty() or !std.fs.File.stdout().isTty()) {
                 std.debug.print("The 'chat' command requires a TTY. Use: zoid run <prompt...>\n", .{});
@@ -313,6 +329,25 @@ fn loadOpenAISettings(allocator: std.mem.Allocator) !OpenAISettings {
         .api_key = api_key,
         .model = model,
     };
+}
+
+fn loadTelegramBotTokenOrExit(allocator: std.mem.Allocator) []u8 {
+    return loadTelegramBotToken(allocator) catch |err| {
+        switch (err) {
+            error.InvalidConfigFormat => std.debug.print("Config file is invalid JSON (expected key/value string object).\n", .{}),
+            error.MissingTelegramBotToken => std.debug.print(
+                "Config key {s} is missing. Use: zoid config set {s} <value>\n",
+                .{ zoid.config_keys.telegram_bot_token, zoid.config_keys.telegram_bot_token },
+            ),
+            else => std.debug.print("Failed to load Telegram bot token: {s}\n", .{@errorName(err)}),
+        }
+        std.process.exit(1);
+    };
+}
+
+fn loadTelegramBotToken(allocator: std.mem.Allocator) ![]u8 {
+    const token_value = try zoid.config_store.getValue(allocator, zoid.config_keys.telegram_bot_token);
+    return token_value orelse error.MissingTelegramBotToken;
 }
 
 test "executeLuaAsTool runs script with lua_execute sandbox policy" {

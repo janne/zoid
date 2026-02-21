@@ -15,6 +15,7 @@ pub const Command = union(enum) {
     execute: []const u8,
     run: []const []const u8,
     chat,
+    serve,
     config: ConfigCommand,
 };
 
@@ -49,6 +50,10 @@ pub fn parseCommand(args: []const []const u8) ParseCommandError!Command {
 
     if (std.mem.eql(u8, cmd, "chat")) {
         return .chat;
+    }
+
+    if (std.mem.eql(u8, cmd, "serve")) {
+        return .serve;
     }
 
     if (std.mem.eql(u8, cmd, "config")) {
@@ -99,6 +104,9 @@ pub fn printHelp() void {
         \\zoid chat
         \\  Starts an interactive full-screen chat session (TTY only).
         \\
+        \\zoid serve
+        \\  Starts long-running service mode (currently Telegram bot long-polling).
+        \\
         \\zoid config set <key> <value>
         \\  Creates or updates a config key.
         \\
@@ -144,6 +152,12 @@ test "chat command" {
     const args = [_][]const u8{ "zoid", "chat" };
     const command = try parseCommand(&args);
     try std.testing.expect(command == .chat);
+}
+
+test "serve command" {
+    const args = [_][]const u8{ "zoid", "serve" };
+    const command = try parseCommand(&args);
+    try std.testing.expect(command == .serve);
 }
 
 test "run command" {
