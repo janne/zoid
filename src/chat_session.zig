@@ -1171,21 +1171,156 @@ fn drawTranscript(win: vaxis.Window, transcript: []const DisplayEntry) void {
             else => .{ .fg = .{ .index = 251 }, .bg = .{ .index = bg_main } },
         };
 
-        const segments = [_]vaxis.Segment{
-            .{ .text = rolePrefix(entry.role), .style = role_style },
-            .{ .text = entry.text, .style = body_style },
+        const inline_code_style: vaxis.Style = switch (entry.role) {
+            .@"error" => .{ .fg = .{ .index = 203 }, .bg = .{ .index = 236 }, .bold = true },
+            else => .{ .fg = .{ .index = 223 }, .bg = .{ .index = 236 } },
         };
 
-        const result = win.print(&segments, .{
-            .row_offset = row,
-            .col_offset = 0,
-            .wrap = .word,
-        });
+        const block_code_style: vaxis.Style = switch (entry.role) {
+            .@"error" => .{ .fg = .{ .index = 203 }, .bg = .{ .index = 236 } },
+            else => .{ .fg = .{ .index = 188 }, .bg = .{ .index = 236 } },
+        };
 
-        row = result.row;
-        if (result.col > 0) row +|= 1;
+        var cursor_row = row;
+        var cursor_col: u16 = 0;
+        appendStyledText(win, &cursor_row, &cursor_col, rolePrefix(entry.role), role_style);
+        appendMarkdownText(win, &cursor_row, &cursor_col, entry.text, body_style, inline_code_style, block_code_style);
+
+        row = cursor_row;
+        if (cursor_col > 0) row +|= 1;
         if (row < win.height) row +|= 1;
     }
+}
+
+const MarkdownSpanKind = enum {
+    body,
+    inline_code,
+    block_code,
+};
+
+const MarkdownSpan = struct {
+    kind: MarkdownSpanKind,
+    text: []const u8,
+};
+
+const MarkdownIterator = struct {
+    text: []const u8,
+    index: usize = 0,
+    in_fence: bool = false,
+
+    fn init(text: []const u8) MarkdownIterator {
+        return .{ .text = text };
+    }
+
+    fn next(self: *MarkdownIterator) ?MarkdownSpan {
+        while (self.index < self.text.len) {
+            if (!self.in_fence and hasFenceAt(self.text, self.index)) {
+                self.consumeOpeningFence();
+                continue;
+            }
+
+            if (self.in_fence and hasFenceAt(self.text, self.index)) {
+                self.index += 3;
+                self.in_fence = false;
+                continue;
+            }
+
+            if (!self.in_fence and self.text[self.index] == '`') {
+                if (findInlineCodeEnd(self.text, self.index + 1)) |end_idx| {
+                    const content_start = self.index + 1;
+                    self.index = end_idx + 1;
+                    return .{
+                        .kind = .inline_code,
+                        .text = self.text[content_start..end_idx],
+                    };
+                }
+            }
+
+            const kind: MarkdownSpanKind = if (self.in_fence) .block_code else .body;
+            const start = self.index;
+            while (self.index < self.text.len) {
+                if (self.in_fence) {
+                    if (hasFenceAt(self.text, self.index)) break;
+                } else {
+                    if (hasFenceAt(self.text, self.index)) break;
+                    if (self.text[self.index] == '`' and findInlineCodeEnd(self.text, self.index + 1) != null) break;
+                }
+                self.index += 1;
+            }
+
+            if (self.index > start) {
+                return .{
+                    .kind = kind,
+                    .text = self.text[start..self.index],
+                };
+            }
+        }
+
+        return null;
+    }
+
+    fn consumeOpeningFence(self: *MarkdownIterator) void {
+        self.index += 3;
+        if (std.mem.indexOfScalarPos(u8, self.text, self.index, '\n')) |newline_idx| {
+            self.index = newline_idx + 1;
+        }
+        self.in_fence = true;
+    }
+};
+
+fn hasFenceAt(text: []const u8, idx: usize) bool {
+    if (idx + 2 >= text.len) return false;
+    return text[idx] == '`' and text[idx + 1] == '`' and text[idx + 2] == '`';
+}
+
+fn findInlineCodeEnd(text: []const u8, start: usize) ?usize {
+    var idx = start;
+    while (idx < text.len) : (idx += 1) {
+        if (text[idx] == '\n') return null;
+        if (text[idx] == '`') return idx;
+    }
+    return null;
+}
+
+fn appendMarkdownText(
+    win: vaxis.Window,
+    row: *u16,
+    col: *u16,
+    text: []const u8,
+    body_style: vaxis.Style,
+    inline_code_style: vaxis.Style,
+    block_code_style: vaxis.Style,
+) void {
+    var iter = MarkdownIterator.init(text);
+    while (iter.next()) |span| {
+        const style = switch (span.kind) {
+            .body => body_style,
+            .inline_code => inline_code_style,
+            .block_code => block_code_style,
+        };
+        appendStyledText(win, row, col, span.text, style);
+    }
+}
+
+fn appendStyledText(
+    win: vaxis.Window,
+    row: *u16,
+    col: *u16,
+    text: []const u8,
+    style: vaxis.Style,
+) void {
+    if (text.len == 0) return;
+
+    const segments = [_]vaxis.Segment{
+        .{ .text = text, .style = style },
+    };
+    const result = win.print(&segments, .{
+        .row_offset = row.*,
+        .col_offset = col.*,
+        .wrap = .word,
+    });
+    row.* = result.row;
+    col.* = result.col;
 }
 
 fn drawModelPicker(
@@ -1305,8 +1440,24 @@ fn estimateEntryRows(entry: DisplayEntry, width: u16) u32 {
             const text_width: u16 = if (width > 3) width - 3 else 1;
             break :blk estimateRows(text_width, "", entry.text) + 2;
         },
-        else => estimateRows(width, rolePrefix(entry.role), entry.text),
+        else => estimateMarkdownRows(width, rolePrefix(entry.role), entry.text),
     };
+}
+
+fn estimateMarkdownRows(width: u16, prefix: []const u8, text: []const u8) u32 {
+    if (width == 0) return 0;
+
+    var rows: u32 = 1;
+    var col: u16 = 0;
+
+    countRowsForBytes(width, &rows, &col, prefix);
+
+    var iter = MarkdownIterator.init(text);
+    while (iter.next()) |span| {
+        countRowsForBytes(width, &rows, &col, span.text);
+    }
+
+    return rows;
 }
 
 fn estimateRows(width: u16, prefix: []const u8, text: []const u8) u32 {
@@ -1314,29 +1465,26 @@ fn estimateRows(width: u16, prefix: []const u8, text: []const u8) u32 {
 
     var rows: u32 = 1;
     var col: u16 = 0;
-
-    const countBytes = struct {
-        fn run(width_: u16, rows_: *u32, col_: *u16, bytes: []const u8) void {
-            for (bytes) |byte| {
-                if (byte == '\n') {
-                    rows_.* += 1;
-                    col_.* = 0;
-                    continue;
-                }
-
-                col_.* +|= 1;
-                if (col_.* >= width_) {
-                    rows_.* += 1;
-                    col_.* = 0;
-                }
-            }
-        }
-    };
-
-    countBytes.run(width, &rows, &col, prefix);
-    countBytes.run(width, &rows, &col, text);
+    countRowsForBytes(width, &rows, &col, prefix);
+    countRowsForBytes(width, &rows, &col, text);
 
     return rows;
+}
+
+fn countRowsForBytes(width: u16, rows: *u32, col: *u16, bytes: []const u8) void {
+    for (bytes) |byte| {
+        if (byte == '\n') {
+            rows.* += 1;
+            col.* = 0;
+            continue;
+        }
+
+        col.* +|= 1;
+        if (col.* >= width) {
+            rows.* += 1;
+            col.* = 0;
+        }
+    }
 }
 
 fn isExitCommand(input: []const u8) bool {
@@ -1374,6 +1522,62 @@ test "visibleTranscriptStart picks latest entries that fit" {
     const idx = visibleTranscriptStart(&entries, 10, 4);
     try std.testing.expect(idx >= 1);
     try std.testing.expect(idx <= 2);
+}
+
+test "MarkdownIterator strips code fences and inline backticks" {
+    const text =
+        \\before `inline` after
+        \\```sh
+        \\echo hi
+        \\```
+        \\tail
+    ;
+    var iter = MarkdownIterator.init(text);
+    const expected = [_]MarkdownSpan{
+        .{ .kind = .body, .text = "before " },
+        .{ .kind = .inline_code, .text = "inline" },
+        .{ .kind = .body, .text = " after\n" },
+        .{ .kind = .block_code, .text = "echo hi\n" },
+        .{ .kind = .body, .text = "\ntail" },
+    };
+
+    var idx: usize = 0;
+    while (iter.next()) |span| : (idx += 1) {
+        try std.testing.expect(idx < expected.len);
+        try std.testing.expect(span.kind == expected[idx].kind);
+        try std.testing.expectEqualStrings(expected[idx].text, span.text);
+    }
+    try std.testing.expectEqual(expected.len, idx);
+}
+
+test "MarkdownIterator keeps single-line fenced content" {
+    const text = "```json {\"ok\":true}```";
+    var iter = MarkdownIterator.init(text);
+
+    const maybe_first = iter.next();
+    try std.testing.expect(maybe_first != null);
+    const first = maybe_first.?;
+    try std.testing.expect(first.kind == .block_code);
+    try std.testing.expectEqualStrings("json {\"ok\":true}", first.text);
+    try std.testing.expect(iter.next() == null);
+}
+
+test "estimateMarkdownRows ignores markdown backticks" {
+    const markdown_text =
+        \\prefix
+        \\```txt
+        \\aaaa
+        \\```
+        \\`bb`
+    ;
+    const plain_text =
+        \\prefix
+        \\aaaa
+        \\bb
+    ;
+    const markdown_rows = estimateMarkdownRows(4, "", markdown_text);
+    const plain_rows = estimateRows(4, "", plain_text);
+    try std.testing.expectEqual(plain_rows, markdown_rows);
 }
 
 test "wrapSoftWords counts utf8 codepoints for width" {

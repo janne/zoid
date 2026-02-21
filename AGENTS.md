@@ -56,6 +56,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - `chat` is TTY-only; non-interactive one-shot usage should go through `zoid run <prompt...>` and write only the agent output to stdout.
   - Keep the input box anchored at the bottom of the screen.
   - Input rendering is manual soft word-wrap, and the input box grows vertically upward as lines increase.
+  - Assistant/error transcript rendering strips Markdown backtick delimiters and draws inline/fenced code with dedicated styles (no literal `` ` ``/``` fences shown).
   - `build.zig` must import the `vaxis` module into the `zoid` module for `@import("vaxis")` usage inside `src/`.
   - Model picker fallback models come from `src/model_catalog.zig` (`fallback_models`).
 - OpenAI model policy changes:
