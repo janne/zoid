@@ -1,9 +1,11 @@
 const std = @import("std");
+const lua_runner = @import("lua_runner.zig");
 
 pub const sandbox_mode: []const u8 = "workspace-write";
 pub const enabled_tools = [_][]const u8{
     "filesystem_read",
     "filesystem_write",
+    "lua_execute",
 };
 pub const disabled_tools = [_][]const u8{};
 pub const default_max_read_bytes: usize = 128 * 1024;
@@ -65,6 +67,9 @@ pub fn executeToolCall(
     }
     if (std.mem.eql(u8, tool_name, "filesystem_write")) {
         return executeFilesystemWrite(allocator, policy, arguments_json);
+    }
+    if (std.mem.eql(u8, tool_name, "lua_execute")) {
+        return executeLuaExecute(allocator, policy, arguments_json);
     }
     return error.ToolDisabled;
 }
@@ -177,6 +182,44 @@ fn executeFilesystemWrite(
     return output.toOwnedSlice();
 }
 
+fn executeLuaExecute(
+    allocator: std.mem.Allocator,
+    policy: *const Policy,
+    arguments_json: []const u8,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{});
+    defer parsed.deinit();
+
+    const root_object = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidToolArguments,
+    };
+
+    const requested_path = switch (root_object.get("path") orelse return error.InvalidToolArguments) {
+        .string => |value| value,
+        else => return error.InvalidToolArguments,
+    };
+
+    const resolved_path = try resolveAllowedReadPath(allocator, policy, requested_path);
+    defer allocator.free(resolved_path);
+
+    if (!std.mem.eql(u8, std.fs.path.extension(resolved_path), ".lua")) {
+        return error.InvalidToolArguments;
+    }
+
+    try lua_runner.executeLuaFile(allocator, resolved_path);
+
+    var output = std.Io.Writer.Allocating.init(allocator);
+    errdefer output.deinit();
+
+    const writer = &output.writer;
+    try writer.writeAll("{\"ok\":true,\"tool\":\"lua_execute\",\"path\":");
+    try writeJsonString(allocator, writer, resolved_path);
+    try writer.writeAll("}");
+
+    return output.toOwnedSlice();
+}
+
 fn resolveAllowedReadPath(
     allocator: std.mem.Allocator,
     policy: *const Policy,
@@ -279,7 +322,7 @@ test "buildPolicyJson emits required fields" {
     const root_object = parsed.value.object;
     try std.testing.expectEqualStrings("workspace-write", root_object.get("sandbox_mode").?.string);
     try std.testing.expectEqualStrings(policy.workspace_root, root_object.get("writable_roots").?.array.items[0].string);
-    try std.testing.expectEqual(@as(usize, 2), root_object.get("tools_enabled").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 3), root_object.get("tools_enabled").?.array.items.len);
 }
 
 test "filesystem write and read stay within workspace root" {
@@ -333,6 +376,67 @@ test "filesystem write rejects traversal outside workspace root" {
             &policy,
             "filesystem_write",
             "{\"path\":\"../outside.txt\",\"content\":\"blocked\"}",
+        ),
+    );
+}
+
+test "lua execute runs script inside workspace root" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("ok.lua", .{});
+    defer file.close();
+    try file.writeAll(
+        \\local x = 1 + 2
+        \\assert(x == 3)
+        \\
+    );
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+
+    const result = try executeToolCall(
+        std.testing.allocator,
+        &policy,
+        "lua_execute",
+        "{\"path\":\"ok.lua\"}",
+    );
+    defer std.testing.allocator.free(result);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+
+    const root_object = parsed.value.object;
+    try std.testing.expect(root_object.get("ok").?.bool);
+    try std.testing.expectEqualStrings("lua_execute", root_object.get("tool").?.string);
+}
+
+test "lua execute rejects traversal outside workspace root" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("workspace");
+
+    const outside_file = try tmp.dir.createFile("outside.lua", .{});
+    defer outside_file.close();
+    try outside_file.writeAll("return 1\n");
+
+    const workspace_path = try tmp.dir.realpathAlloc(std.testing.allocator, "workspace");
+    defer std.testing.allocator.free(workspace_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, workspace_path);
+    defer policy.deinit(std.testing.allocator);
+
+    try std.testing.expectError(
+        error.PathNotAllowed,
+        executeToolCall(
+            std.testing.allocator,
+            &policy,
+            "lua_execute",
+            "{\"path\":\"../outside.lua\"}",
         ),
     );
 }
