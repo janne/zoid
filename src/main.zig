@@ -53,14 +53,32 @@ pub fn main() !void {
     switch (command) {
         .help => zoid.cli.printHelp(),
         .execute => |file_path| {
-            zoid.lua_runner.executeLuaFile(allocator, file_path) catch |err| {
+            var outcome = executeLuaAsTool(allocator, file_path, null) catch |err| {
                 switch (err) {
-                    error.LuaStateInitFailed => std.debug.print("Unable to initialize Lua runtime.\n", .{}),
+                    error.PathNotAllowed => std.debug.print("Lua script path is outside the current workspace.\n", .{}),
+                    error.InvalidToolArguments => std.debug.print("Lua script path must resolve to a .lua file inside the current workspace.\n", .{}),
+                    error.FileNotFound => std.debug.print("Lua script not found: {s}\n", .{file_path}),
                     error.OutOfMemory => std.debug.print("Out of memory while preparing Lua execution.\n", .{}),
-                    error.LuaLoadFailed, error.LuaRuntimeFailed => {},
+                    else => std.debug.print("Lua execution failed: {s}\n", .{@errorName(err)}),
                 }
                 std.process.exit(1);
             };
+            defer outcome.deinit(allocator);
+
+            if (outcome.stdout.len > 0) {
+                try std.fs.File.stdout().writeAll(outcome.stdout);
+            }
+            if (outcome.stderr.len > 0) {
+                try std.fs.File.stderr().writeAll(outcome.stderr);
+            }
+            if (!outcome.ok) {
+                if (outcome.stderr.len == 0) {
+                    if (outcome.error_name) |error_name| {
+                        std.debug.print("{s}\n", .{error_name});
+                    }
+                }
+                std.process.exit(1);
+            }
         },
         .config => |config_cmd| switch (config_cmd) {
             .set => |set_cmd| {
@@ -176,6 +194,87 @@ pub fn main() !void {
     }
 }
 
+const LuaExecuteOutcome = struct {
+    ok: bool,
+    stdout: []u8,
+    stderr: []u8,
+    error_name: ?[]u8,
+
+    fn deinit(self: *LuaExecuteOutcome, allocator: std.mem.Allocator) void {
+        allocator.free(self.stdout);
+        allocator.free(self.stderr);
+        if (self.error_name) |value| allocator.free(value);
+    }
+};
+
+fn executeLuaAsTool(
+    allocator: std.mem.Allocator,
+    file_path: []const u8,
+    workspace_root_override: ?[]const u8,
+) !LuaExecuteOutcome {
+    var policy = if (workspace_root_override) |workspace_root|
+        try zoid.tool_runtime.Policy.initForWorkspaceRoot(allocator, workspace_root)
+    else
+        try zoid.tool_runtime.Policy.initForCurrentWorkspace(allocator);
+    defer policy.deinit(allocator);
+
+    const escaped_path = try std.json.Stringify.valueAlloc(allocator, file_path, .{});
+    defer allocator.free(escaped_path);
+
+    const arguments_json = try std.fmt.allocPrint(allocator, "{{\"path\":{s}}}", .{escaped_path});
+    defer allocator.free(arguments_json);
+
+    const result_json = try zoid.tool_runtime.executeToolCall(
+        allocator,
+        &policy,
+        "lua_execute",
+        arguments_json,
+    );
+    defer allocator.free(result_json);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result_json, .{});
+    defer parsed.deinit();
+
+    const root_object = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidToolResult,
+    };
+
+    const ok = switch (root_object.get("ok") orelse return error.InvalidToolResult) {
+        .bool => |value| value,
+        else => return error.InvalidToolResult,
+    };
+    const stdout_value = switch (root_object.get("stdout") orelse return error.InvalidToolResult) {
+        .string => |value| value,
+        else => return error.InvalidToolResult,
+    };
+    const stderr_value = switch (root_object.get("stderr") orelse return error.InvalidToolResult) {
+        .string => |value| value,
+        else => return error.InvalidToolResult,
+    };
+
+    const stdout = try allocator.dupe(u8, stdout_value);
+    errdefer allocator.free(stdout);
+    const stderr = try allocator.dupe(u8, stderr_value);
+    errdefer allocator.free(stderr);
+
+    const error_name = if (root_object.get("error")) |error_value|
+        switch (error_value) {
+            .string => |value| try allocator.dupe(u8, value),
+            else => return error.InvalidToolResult,
+        }
+    else
+        null;
+    errdefer if (error_name) |value| allocator.free(value);
+
+    return .{
+        .ok = ok,
+        .stdout = stdout,
+        .stderr = stderr,
+        .error_name = error_name,
+    };
+}
+
 const OpenAISettings = struct {
     api_key: []u8,
     model: []u8,
@@ -214,4 +313,69 @@ fn loadOpenAISettings(allocator: std.mem.Allocator) !OpenAISettings {
         .api_key = api_key,
         .model = model,
     };
+}
+
+test "executeLuaAsTool runs script with lua_execute sandbox policy" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script = try tmp.dir.createFile("ok.lua", .{});
+    defer script.close();
+    try script.writeAll(
+        \\local note = zoid.file("note.txt")
+        \\note:write("hello")
+        \\print(note:read())
+        \\note:delete()
+        \\
+    );
+
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    var outcome = try executeLuaAsTool(std.testing.allocator, "ok.lua", workspace_root);
+    defer outcome.deinit(std.testing.allocator);
+
+    try std.testing.expect(outcome.ok);
+    try std.testing.expectEqualStrings("hello\n", outcome.stdout);
+    try std.testing.expectEqualStrings("", outcome.stderr);
+    try std.testing.expect(outcome.error_name == null);
+
+    const note_path = try std.fs.path.join(std.testing.allocator, &.{ workspace_root, "note.txt" });
+    defer std.testing.allocator.free(note_path);
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(note_path, .{}));
+}
+
+test "executeLuaAsTool rejects traversal outside workspace root" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("workspace");
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    const outside = try tmp.dir.createFile("outside.lua", .{});
+    defer outside.close();
+    try outside.writeAll("return 1\n");
+
+    try std.testing.expectError(
+        error.PathNotAllowed,
+        executeLuaAsTool(std.testing.allocator, "../outside.lua", workspace_root),
+    );
+}
+
+test "executeLuaAsTool requires lua extension" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script = try tmp.dir.createFile("not_lua.txt", .{});
+    defer script.close();
+    try script.writeAll("print('nope')\n");
+
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    try std.testing.expectError(
+        error.InvalidToolArguments,
+        executeLuaAsTool(std.testing.allocator, "not_lua.txt", workspace_root),
+    );
 }

@@ -546,15 +546,17 @@ test "lua execute runs script inside workspace root" {
     try std.testing.expect(root_object.get("error") == null);
 }
 
-test "lua execute sandbox exposes workspace fs and blocks os" {
+test "lua execute sandbox exposes zoid fs and blocks os" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const file = try tmp.dir.createFile("sandbox.lua", .{});
     defer file.close();
     try file.writeAll(
-        \\workspace.write("sandbox.txt", "hello")
-        \\print(workspace.read("sandbox.txt"))
+        \\local file = zoid.file("sandbox.txt")
+        \\file:write("hello")
+        \\print(file:read())
+        \\file:delete()
         \\return os.getenv("HOME")
         \\
     );
@@ -581,6 +583,10 @@ test "lua execute sandbox exposes workspace fs and blocks os" {
     try std.testing.expectEqualStrings("hello\n", root_object.get("stdout").?.string);
     try std.testing.expect(std.mem.indexOf(u8, root_object.get("stderr").?.string, "os") != null);
     try std.testing.expectEqualStrings("LuaRuntimeFailed", root_object.get("error").?.string);
+
+    const deleted_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "sandbox.txt" });
+    defer std.testing.allocator.free(deleted_path);
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(deleted_path, .{}));
 }
 
 test "lua execute reports runtime failure and stderr output" {

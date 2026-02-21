@@ -27,6 +27,7 @@ When documentation conflicts, prefer:
 - Keep all code, commit messages, and user-facing copy in English.
 - Always write commit messages in English.
 - Keep this `AGENTS.md` file updated whenever adding code or changing behavior.
+- Keep `docs/lua_api.md` updated when Lua runtime behavior or Lua sandbox APIs change.
 - Add notable implementation learnings to `AGENTS.md` so future changes can reuse them.
 - For adding Zig packages/dependencies, use `https://zigistry.dev/` as an input source.
 - Keep tests updated with behavior changes.
@@ -49,6 +50,7 @@ If you change command behavior, error handling, config format, or Lua execution 
 - CLI changes:
   - Update parsing + help text in `src/cli.zig`.
   - Update execution flow and user-visible errors in `src/main.zig`.
+  - `zoid execute <file.lua>` must use the same sandbox restrictions and `.lua` path policy as `lua_execute` so local script runs match tool-mode behavior.
   - Default command is `chat` when running `zoid` with no arguments.
 - Chat interface changes:
   - `src/chat_session.zig` now uses fullscreen `libvaxis` UI in the alternate screen when running on a TTY, with `vaxis.widgets.TextInput` handling readline-style editing (`Ctrl+A`, `Ctrl+E`, arrows, backspace/delete).
@@ -75,7 +77,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - `filesystem_delete` only removes files whose canonical path resolves inside workspace root; traversal outside root must return `error.PathNotAllowed`.
   - `lua_execute` runs scripts via the embedded Lua runtime (`src/lua_runner.zig`) in-process, not via shell process execution, and only accepts `.lua` files under workspace root.
   - `lua_execute` must intercept Lua script output so it is never written to process stdout/stderr in TUI mode; instead surface captured streams in tool JSON (`stdout` and `stderr`, with truncation flags) so the agent can read outputs safely.
-  - In `lua_execute` tool-mode, remove `os`/`package`/`debug`/`require`/`dofile`/`loadfile`; expose only `workspace.read(path[, max_bytes])` and `workspace.write(path, content)` for filesystem access, both enforced to stay inside workspace root.
+  - In `lua_execute` tool-mode, remove `os`/`package`/`debug`/`require`/`dofile`/`loadfile`; expose only `zoid.file(path):read([max_bytes])`, `zoid.file(path):write(content)`, and `zoid.file(path):delete()` for filesystem access, all enforced to stay inside workspace root.
   - Tool-mode `io` must be a minimal capture-only table (`io.write` and `io.stderr:write`) so scripts can emit stdout/stderr for agent inspection without gaining general file I/O APIs.
   - `shell_command` and `exec` are intentionally disabled for OpenAI tool calls; unknown/disabled tool calls must return `error.ToolDisabled`.
   - Keep path checks strict: resolve to canonical paths and reject access outside workspace root.

@@ -275,42 +275,50 @@ fn resolveAllowedWritePath(
     return resolved;
 }
 
-fn luaWorkspaceRead(lua_state: ?*c.lua_State) callconv(.c) c_int {
+fn luaZoidFileRead(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
     const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+    const nargs = c.lua_gettop(state);
+
+    if (c.lua_type(state, 1) != c.LUA_TTABLE) {
+        return pushLuaErrorMessage(state, "zoid.file(path):read requires file handle", .{});
+    }
+
+    _ = c.lua_getfield(state, 1, "_path");
 
     var path_len: usize = 0;
-    const path_ptr = c.luaL_checklstring(state, 1, &path_len) orelse return pushLuaErrorMessage(state, "workspace.read requires path", .{});
+    const path_ptr = c.lua_tolstring(state, -1, &path_len) orelse return pushLuaErrorMessage(state, "zoid.file(path):read requires file handle", .{});
     const requested_path = path_ptr[0..path_len];
+    luaPop(state, 1);
 
     var max_bytes = env.max_read_bytes;
-    if (c.lua_gettop(state) >= 2) {
+    if (nargs >= 2 and c.lua_type(state, 2) != c.LUA_TNIL) {
         var isnum: c_int = 0;
         const requested_max = c.lua_tointegerx(state, 2, &isnum);
         if (isnum == 0 or requested_max <= 0) {
-            return pushLuaErrorMessage(state, "workspace.read max_bytes must be a positive integer", .{});
+            return pushLuaErrorMessage(state, "zoid.file(path):read max_bytes must be a positive integer", .{});
         }
         const converted = std.math.cast(usize, requested_max) orelse {
-            return pushLuaErrorMessage(state, "workspace.read max_bytes is too large", .{});
+            return pushLuaErrorMessage(state, "zoid.file(path):read max_bytes is too large", .{});
         };
         if (converted > env.max_read_bytes) {
-            return pushLuaErrorMessage(state, "workspace.read max_bytes exceeds sandbox limit ({d})", .{env.max_read_bytes});
+            return pushLuaErrorMessage(state, "zoid.file(path):read max_bytes exceeds sandbox limit ({d})", .{env.max_read_bytes});
         }
         max_bytes = converted;
     }
 
     const resolved = resolveAllowedReadPath(env.allocator, env, requested_path) catch |err| {
-        return pushLuaErrorMessage(state, "workspace.read failed: {s}", .{@errorName(err)});
+        return pushLuaErrorMessage(state, "zoid.file(path):read failed: {s}", .{@errorName(err)});
     };
     defer env.allocator.free(resolved);
 
     const file = std.fs.cwd().openFile(resolved, .{}) catch |err| {
-        return pushLuaErrorMessage(state, "workspace.read failed: {s}", .{@errorName(err)});
+        return pushLuaErrorMessage(state, "zoid.file(path):read failed: {s}", .{@errorName(err)});
     };
     defer file.close();
 
     const content = file.readToEndAlloc(env.allocator, max_bytes) catch |err| {
-        return pushLuaErrorMessage(state, "workspace.read failed: {s}", .{@errorName(err)});
+        return pushLuaErrorMessage(state, "zoid.file(path):read failed: {s}", .{@errorName(err)});
     };
     defer env.allocator.free(content);
 
@@ -318,32 +326,87 @@ fn luaWorkspaceRead(lua_state: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-fn luaWorkspaceWrite(lua_state: ?*c.lua_State) callconv(.c) c_int {
+fn luaZoidFileWrite(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
     const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
 
+    if (c.lua_type(state, 1) != c.LUA_TTABLE) {
+        return pushLuaErrorMessage(state, "zoid.file(path):write requires file handle", .{});
+    }
+
+    _ = c.lua_getfield(state, 1, "_path");
+
     var path_len: usize = 0;
-    const path_ptr = c.luaL_checklstring(state, 1, &path_len) orelse return pushLuaErrorMessage(state, "workspace.write requires path", .{});
+    const path_ptr = c.lua_tolstring(state, -1, &path_len) orelse return pushLuaErrorMessage(state, "zoid.file(path):write requires file handle", .{});
     const requested_path = path_ptr[0..path_len];
+    luaPop(state, 1);
 
     var content_len: usize = 0;
-    const content_ptr = c.luaL_checklstring(state, 2, &content_len) orelse return pushLuaErrorMessage(state, "workspace.write requires content", .{});
+    const content_ptr = c.luaL_checklstring(state, 2, &content_len) orelse return pushLuaErrorMessage(state, "zoid.file(path):write requires content", .{});
     const content = content_ptr[0..content_len];
 
     const resolved = resolveAllowedWritePath(env.allocator, env, requested_path) catch |err| {
-        return pushLuaErrorMessage(state, "workspace.write failed: {s}", .{@errorName(err)});
+        return pushLuaErrorMessage(state, "zoid.file(path):write failed: {s}", .{@errorName(err)});
     };
     defer env.allocator.free(resolved);
 
     const file = std.fs.cwd().createFile(resolved, .{ .truncate = true }) catch |err| {
-        return pushLuaErrorMessage(state, "workspace.write failed: {s}", .{@errorName(err)});
+        return pushLuaErrorMessage(state, "zoid.file(path):write failed: {s}", .{@errorName(err)});
     };
     defer file.close();
     file.writeAll(content) catch |err| {
-        return pushLuaErrorMessage(state, "workspace.write failed: {s}", .{@errorName(err)});
+        return pushLuaErrorMessage(state, "zoid.file(path):write failed: {s}", .{@errorName(err)});
     };
 
     c.lua_pushinteger(state, @intCast(content.len));
+    return 1;
+}
+
+fn luaZoidFileDelete(lua_state: ?*c.lua_State) callconv(.c) c_int {
+    const state = lua_state orelse return 0;
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+
+    if (c.lua_type(state, 1) != c.LUA_TTABLE) {
+        return pushLuaErrorMessage(state, "zoid.file(path):delete requires file handle", .{});
+    }
+
+    _ = c.lua_getfield(state, 1, "_path");
+
+    var path_len: usize = 0;
+    const path_ptr = c.lua_tolstring(state, -1, &path_len) orelse return pushLuaErrorMessage(state, "zoid.file(path):delete requires file handle", .{});
+    const requested_path = path_ptr[0..path_len];
+    luaPop(state, 1);
+
+    const resolved = resolveAllowedReadPath(env.allocator, env, requested_path) catch |err| {
+        return pushLuaErrorMessage(state, "zoid.file(path):delete failed: {s}", .{@errorName(err)});
+    };
+    defer env.allocator.free(resolved);
+
+    std.fs.cwd().deleteFile(resolved) catch |err| {
+        return pushLuaErrorMessage(state, "zoid.file(path):delete failed: {s}", .{@errorName(err)});
+    };
+
+    c.lua_pushboolean(state, 1);
+    return 1;
+}
+
+fn luaZoidFile(lua_state: ?*c.lua_State) callconv(.c) c_int {
+    const state = lua_state orelse return 0;
+
+    var path_len: usize = 0;
+    const path_ptr = c.luaL_checklstring(state, 1, &path_len) orelse return pushLuaErrorMessage(state, "zoid.file requires path", .{});
+    const path = path_ptr[0..path_len];
+
+    c.lua_newtable(state);
+    _ = c.lua_pushlstring(state, path.ptr, path.len);
+    c.lua_setfield(state, -2, "_path");
+
+    c.lua_pushcclosure(state, luaZoidFileRead, 0);
+    c.lua_setfield(state, -2, "read");
+    c.lua_pushcclosure(state, luaZoidFileWrite, 0);
+    c.lua_setfield(state, -2, "write");
+    c.lua_pushcclosure(state, luaZoidFileDelete, 0);
+    c.lua_setfield(state, -2, "delete");
     return 1;
 }
 
@@ -367,16 +430,14 @@ fn installOutputCapture(lua_state: *c.lua_State, capture: *LuaOutputCapture) voi
     _ = c.lua_setglobal(lua_state, "io");
 }
 
-fn installWorkspaceTable(lua_state: *c.lua_State, sandbox: *ToolLuaEnvironment) void {
+fn installZoidTable(lua_state: *c.lua_State, sandbox: *ToolLuaEnvironment) void {
     c.lua_pushlightuserdata(lua_state, sandbox);
     _ = c.lua_setglobal(lua_state, tool_sandbox_registry_key);
 
     c.lua_newtable(lua_state);
-    c.lua_pushcclosure(lua_state, luaWorkspaceRead, 0);
-    c.lua_setfield(lua_state, -2, "read");
-    c.lua_pushcclosure(lua_state, luaWorkspaceWrite, 0);
-    c.lua_setfield(lua_state, -2, "write");
-    _ = c.lua_setglobal(lua_state, "workspace");
+    c.lua_pushcclosure(lua_state, luaZoidFile, 0);
+    c.lua_setfield(lua_state, -2, "file");
+    _ = c.lua_setglobal(lua_state, "zoid");
 }
 
 fn setGlobalNil(lua_state: *c.lua_State, name: [:0]const u8) void {
@@ -385,9 +446,10 @@ fn setGlobalNil(lua_state: *c.lua_State, name: [:0]const u8) void {
 }
 
 fn restrictToolLuaEnvironment(lua_state: *c.lua_State, sandbox: *ToolLuaEnvironment) void {
-    installWorkspaceTable(lua_state, sandbox);
+    installZoidTable(lua_state, sandbox);
 
-    // Remove standard escape hatches; workspace.read/write are the only FS APIs.
+    // Remove standard escape hatches; zoid.file(...):read/write/delete are the only FS APIs.
+    setGlobalNil(lua_state, "workspace");
     setGlobalNil(lua_state, "os");
     setGlobalNil(lua_state, "package");
     setGlobalNil(lua_state, "debug");
@@ -593,7 +655,7 @@ test "executeLuaFileCaptureOutput captures io.stderr writes and runtime errors" 
     try std.testing.expect(std.mem.indexOf(u8, boom_output.stderr, "boom") != null);
 }
 
-test "executeLuaFileCaptureOutputTool allows workspace read/write and captures streams" {
+test "executeLuaFileCaptureOutputTool allows zoid file read/write/delete and captures streams" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -601,8 +663,10 @@ test "executeLuaFileCaptureOutputTool allows workspace read/write and captures s
     const file = try tmp.dir.createFile(file_path, .{});
     defer file.close();
     try file.writeAll(
-        \\workspace.write("note.txt", "hello")
-        \\print(workspace.read("note.txt"))
+        \\local note = zoid.file("note.txt")
+        \\note:write("hello")
+        \\print(note:read())
+        \\note:delete()
         \\io.write("tail")
         \\io.stderr:write("warn\n")
         \\
@@ -621,6 +685,10 @@ test "executeLuaFileCaptureOutputTool allows workspace read/write and captures s
     try std.testing.expect(output.status == .ok);
     try std.testing.expectEqualStrings("hello\ntail", output.stdout);
     try std.testing.expectEqualStrings("warn\n", output.stderr);
+
+    const note_path = try std.fs.path.join(std.testing.allocator, &.{ workspace_root, "note.txt" });
+    defer std.testing.allocator.free(note_path);
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(note_path, .{}));
 }
 
 test "executeLuaFileCaptureOutputTool blocks os and package access" {
@@ -666,7 +734,7 @@ test "executeLuaFileCaptureOutputTool blocks workspace traversal" {
         const script = try tmp.dir.createFile("workspace/traversal.lua", .{});
         defer script.close();
         try script.writeAll(
-            \\workspace.read("../outside.txt")
+            \\zoid.file("../outside.txt"):delete()
             \\
         );
     }
