@@ -279,6 +279,14 @@ fn buildChatCompletionsPayloadWithTools(
     try writeFilesystemDeleteToolDefinition(allocator, writer, policy.workspace_root);
     try writer.writeAll(",");
     try writeLuaExecuteToolDefinition(allocator, writer, policy.workspace_root);
+    try writer.writeAll(",");
+    try writeHttpGetToolDefinition(allocator, writer);
+    try writer.writeAll(",");
+    try writeHttpPostToolDefinition(allocator, writer);
+    try writer.writeAll(",");
+    try writeHttpPutToolDefinition(allocator, writer);
+    try writer.writeAll(",");
+    try writeHttpDeleteToolDefinition(allocator, writer);
     try writer.writeAll("],\"tool_choice\":\"auto\"}");
 
     return payload_buffer.toOwnedSlice();
@@ -350,6 +358,70 @@ fn writeLuaExecuteToolDefinition(
     try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"lua_execute\",\"description\":");
     try writeJsonString(allocator, writer, description);
     try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false}}}");
+}
+
+fn writeHttpGetToolDefinition(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+) !void {
+    const description = try std.fmt.allocPrint(
+        allocator,
+        "Perform an HTTP GET request to a http:// or https:// URI. Returns response status and body (max {d} bytes).",
+        .{tool_runtime.max_allowed_http_response_bytes},
+    );
+    defer allocator.free(description);
+
+    try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"http_get\",\"description\":");
+    try writeJsonString(allocator, writer, description);
+    try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"uri\":{\"type\":\"string\"}},\"required\":[\"uri\"],\"additionalProperties\":false}}}");
+}
+
+fn writeHttpPostToolDefinition(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+) !void {
+    const description = try std.fmt.allocPrint(
+        allocator,
+        "Perform an HTTP POST request to a http:// or https:// URI with optional string body. Returns response status and body (max {d} bytes).",
+        .{tool_runtime.max_allowed_http_response_bytes},
+    );
+    defer allocator.free(description);
+
+    try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"http_post\",\"description\":");
+    try writeJsonString(allocator, writer, description);
+    try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"uri\":{\"type\":\"string\"},\"body\":{\"type\":\"string\"}},\"required\":[\"uri\"],\"additionalProperties\":false}}}");
+}
+
+fn writeHttpPutToolDefinition(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+) !void {
+    const description = try std.fmt.allocPrint(
+        allocator,
+        "Perform an HTTP PUT request to a http:// or https:// URI with optional string body. Returns response status and body (max {d} bytes).",
+        .{tool_runtime.max_allowed_http_response_bytes},
+    );
+    defer allocator.free(description);
+
+    try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"http_put\",\"description\":");
+    try writeJsonString(allocator, writer, description);
+    try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"uri\":{\"type\":\"string\"},\"body\":{\"type\":\"string\"}},\"required\":[\"uri\"],\"additionalProperties\":false}}}");
+}
+
+fn writeHttpDeleteToolDefinition(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+) !void {
+    const description = try std.fmt.allocPrint(
+        allocator,
+        "Perform an HTTP DELETE request to a http:// or https:// URI. Returns response status and body (max {d} bytes).",
+        .{tool_runtime.max_allowed_http_response_bytes},
+    );
+    defer allocator.free(description);
+
+    try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"http_delete\",\"description\":");
+    try writeJsonString(allocator, writer, description);
+    try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"uri\":{\"type\":\"string\"}},\"required\":[\"uri\"],\"additionalProperties\":false}}}");
 }
 
 fn buildRoleContentMessageJson(
@@ -589,11 +661,15 @@ test "buildChatCompletionsPayload creates valid payload" {
     try std.testing.expectEqualStrings("general kenobi", payload_messages[1].object.get("content").?.string);
 
     const tools = root.get("tools").?.array.items;
-    try std.testing.expectEqual(@as(usize, 4), tools.len);
+    try std.testing.expectEqual(@as(usize, 8), tools.len);
     try std.testing.expectEqualStrings("filesystem_read", tools[0].object.get("function").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("filesystem_write", tools[1].object.get("function").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("filesystem_delete", tools[2].object.get("function").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("lua_execute", tools[3].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("http_get", tools[4].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("http_post", tools[5].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("http_put", tools[6].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("http_delete", tools[7].object.get("function").?.object.get("name").?.string);
 }
 
 test "parseAssistantReply extracts assistant content" {

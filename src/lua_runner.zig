@@ -1,4 +1,6 @@
 const std = @import("std");
+const http_client = @import("http_client.zig");
+const workspace_fs = @import("workspace_fs.zig");
 const c = @cImport({
     @cInclude("lua.h");
     @cInclude("lauxlib.h");
@@ -80,11 +82,6 @@ const ToolLuaEnvironment = struct {
     workspace_root: []const u8,
     max_read_bytes: usize,
     max_http_response_bytes: usize,
-};
-
-const HttpRequestResult = struct {
-    status_code: u16,
-    body: []u8,
 };
 
 fn appendByte(
@@ -210,79 +207,6 @@ fn pushLuaErrorMessage(state: *c.lua_State, comptime format: []const u8, args: a
     return c.lua_error(state);
 }
 
-fn toCandidatePath(
-    allocator: std.mem.Allocator,
-    workspace_root: []const u8,
-    requested_path: []const u8,
-) ![]u8 {
-    if (requested_path.len == 0) return error.InvalidToolArguments;
-    if (std.fs.path.isAbsolute(requested_path)) {
-        return allocator.dupe(u8, requested_path);
-    }
-    return std.fs.path.join(allocator, &.{ workspace_root, requested_path });
-}
-
-fn isPathInsideWorkspace(workspace_root: []const u8, candidate_path: []const u8) bool {
-    if (std.mem.eql(u8, workspace_root, "/")) {
-        return std.mem.startsWith(u8, candidate_path, "/");
-    }
-    if (!std.mem.startsWith(u8, candidate_path, workspace_root)) return false;
-    if (candidate_path.len == workspace_root.len) return true;
-    return candidate_path[workspace_root.len] == std.fs.path.sep;
-}
-
-fn resolveAllowedReadPath(
-    allocator: std.mem.Allocator,
-    env: *const ToolLuaEnvironment,
-    requested_path: []const u8,
-) ![]u8 {
-    const candidate = try toCandidatePath(allocator, env.workspace_root, requested_path);
-    defer allocator.free(candidate);
-
-    const canonical = try std.fs.cwd().realpathAlloc(allocator, candidate);
-    errdefer allocator.free(canonical);
-    if (!isPathInsideWorkspace(env.workspace_root, canonical)) {
-        return error.PathNotAllowed;
-    }
-    return canonical;
-}
-
-fn resolveAllowedWritePath(
-    allocator: std.mem.Allocator,
-    env: *const ToolLuaEnvironment,
-    requested_path: []const u8,
-) ![]u8 {
-    const candidate = try toCandidatePath(allocator, env.workspace_root, requested_path);
-    defer allocator.free(candidate);
-
-    const parent_path = std.fs.path.dirname(candidate) orelse return error.InvalidToolArguments;
-    const parent_realpath = try std.fs.cwd().realpathAlloc(allocator, parent_path);
-    defer allocator.free(parent_realpath);
-    if (!isPathInsideWorkspace(env.workspace_root, parent_realpath)) {
-        return error.PathNotAllowed;
-    }
-
-    const file_name = std.fs.path.basename(candidate);
-    if (file_name.len == 0 or std.mem.eql(u8, file_name, ".") or std.mem.eql(u8, file_name, "..")) {
-        return error.InvalidToolArguments;
-    }
-
-    const resolved = try std.fs.path.join(allocator, &.{ parent_realpath, file_name });
-    errdefer allocator.free(resolved);
-    if (!isPathInsideWorkspace(env.workspace_root, resolved)) {
-        return error.PathNotAllowed;
-    }
-
-    const existing_realpath = std.fs.cwd().realpathAlloc(allocator, resolved) catch null;
-    if (existing_realpath) |path_value| {
-        defer allocator.free(path_value);
-        if (!isPathInsideWorkspace(env.workspace_root, path_value)) {
-            return error.PathNotAllowed;
-        }
-    }
-    return resolved;
-}
-
 fn luaZoidFileRead(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
     const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
@@ -315,22 +239,17 @@ fn luaZoidFileRead(lua_state: ?*c.lua_State) callconv(.c) c_int {
         max_bytes = converted;
     }
 
-    const resolved = resolveAllowedReadPath(env.allocator, env, requested_path) catch |err| {
+    const read_result = workspace_fs.readFileAlloc(
+        env.allocator,
+        env.workspace_root,
+        requested_path,
+        max_bytes,
+    ) catch |err| {
         return pushLuaErrorMessage(state, "zoid.file(path):read failed: {s}", .{@errorName(err)});
     };
-    defer env.allocator.free(resolved);
+    defer read_result.deinit(env.allocator);
 
-    const file = std.fs.cwd().openFile(resolved, .{}) catch |err| {
-        return pushLuaErrorMessage(state, "zoid.file(path):read failed: {s}", .{@errorName(err)});
-    };
-    defer file.close();
-
-    const content = file.readToEndAlloc(env.allocator, max_bytes) catch |err| {
-        return pushLuaErrorMessage(state, "zoid.file(path):read failed: {s}", .{@errorName(err)});
-    };
-    defer env.allocator.free(content);
-
-    _ = c.lua_pushlstring(state, content.ptr, content.len);
+    _ = c.lua_pushlstring(state, read_result.content.ptr, read_result.content.len);
     return 1;
 }
 
@@ -353,20 +272,17 @@ fn luaZoidFileWrite(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const content_ptr = c.luaL_checklstring(state, 2, &content_len) orelse return pushLuaErrorMessage(state, "zoid.file(path):write requires content", .{});
     const content = content_ptr[0..content_len];
 
-    const resolved = resolveAllowedWritePath(env.allocator, env, requested_path) catch |err| {
+    const write_result = workspace_fs.writeFile(
+        env.allocator,
+        env.workspace_root,
+        requested_path,
+        content,
+    ) catch |err| {
         return pushLuaErrorMessage(state, "zoid.file(path):write failed: {s}", .{@errorName(err)});
     };
-    defer env.allocator.free(resolved);
+    defer write_result.deinit(env.allocator);
 
-    const file = std.fs.cwd().createFile(resolved, .{ .truncate = true }) catch |err| {
-        return pushLuaErrorMessage(state, "zoid.file(path):write failed: {s}", .{@errorName(err)});
-    };
-    defer file.close();
-    file.writeAll(content) catch |err| {
-        return pushLuaErrorMessage(state, "zoid.file(path):write failed: {s}", .{@errorName(err)});
-    };
-
-    c.lua_pushinteger(state, @intCast(content.len));
+    c.lua_pushinteger(state, @intCast(write_result.bytes_written));
     return 1;
 }
 
@@ -385,14 +301,14 @@ fn luaZoidFileDelete(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const requested_path = path_ptr[0..path_len];
     luaPop(state, 1);
 
-    const resolved = resolveAllowedReadPath(env.allocator, env, requested_path) catch |err| {
+    const delete_result = workspace_fs.deleteFile(
+        env.allocator,
+        env.workspace_root,
+        requested_path,
+    ) catch |err| {
         return pushLuaErrorMessage(state, "zoid.file(path):delete failed: {s}", .{@errorName(err)});
     };
-    defer env.allocator.free(resolved);
-
-    std.fs.cwd().deleteFile(resolved) catch |err| {
-        return pushLuaErrorMessage(state, "zoid.file(path):delete failed: {s}", .{@errorName(err)});
-    };
+    defer delete_result.deinit(env.allocator);
 
     c.lua_pushboolean(state, 1);
     return 1;
@@ -416,48 +332,6 @@ fn luaZoidFile(lua_state: ?*c.lua_State) callconv(.c) c_int {
     c.lua_pushcclosure(state, luaZoidFileDelete, 0);
     c.lua_setfield(state, -2, "delete");
     return 1;
-}
-
-fn executeHttpRequest(
-    allocator: std.mem.Allocator,
-    method: std.http.Method,
-    uri: []const u8,
-    payload: ?[]const u8,
-    max_response_bytes: usize,
-) !HttpRequestResult {
-    if (uri.len == 0) return error.InvalidToolArguments;
-    if (max_response_bytes == 0) return error.InvalidToolArguments;
-
-    const parsed_uri = try std.Uri.parse(uri);
-    if (!std.ascii.eqlIgnoreCase(parsed_uri.scheme, "http") and
-        !std.ascii.eqlIgnoreCase(parsed_uri.scheme, "https"))
-    {
-        return error.UnsupportedUriScheme;
-    }
-
-    const response_storage = try allocator.alloc(u8, max_response_bytes);
-    defer allocator.free(response_storage);
-
-    var response_writer = std.Io.Writer.fixed(response_storage);
-
-    var client: std.http.Client = .{ .allocator = allocator };
-    defer client.deinit();
-
-    const response = client.fetch(.{
-        .location = .{ .uri = parsed_uri },
-        .method = method,
-        .payload = payload,
-        .response_writer = &response_writer,
-    }) catch |err| switch (err) {
-        error.WriteFailed => return error.StreamTooLong,
-        else => |fetch_err| return fetch_err,
-    };
-
-    const response_body = try allocator.dupe(u8, response_writer.buffered());
-    return .{
-        .status_code = @intFromEnum(response.status),
-        .body = response_body,
-    };
 }
 
 fn luaZoidUriRequest(
@@ -490,7 +364,7 @@ fn luaZoidUriRequest(
         return pushLuaErrorMessage(state, "zoid.uri(uri):{s} does not accept a body", .{method_name});
     }
 
-    const result = executeHttpRequest(
+    var result = http_client.executeRequest(
         env.allocator,
         method,
         uri,
@@ -499,7 +373,7 @@ fn luaZoidUriRequest(
     ) catch |err| {
         return pushLuaErrorMessage(state, "zoid.uri(uri):{s} failed: {s}", .{ method_name, @errorName(err) });
     };
-    defer env.allocator.free(result.body);
+    defer result.deinit(env.allocator);
 
     c.lua_newtable(state);
 

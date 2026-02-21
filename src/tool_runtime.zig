@@ -1,5 +1,7 @@
 const std = @import("std");
+const http_client = @import("http_client.zig");
 const lua_runner = @import("lua_runner.zig");
+const workspace_fs = @import("workspace_fs.zig");
 
 pub const sandbox_mode: []const u8 = "workspace-write";
 pub const enabled_tools = [_][]const u8{
@@ -7,6 +9,10 @@ pub const enabled_tools = [_][]const u8{
     "filesystem_write",
     "filesystem_delete",
     "lua_execute",
+    "http_get",
+    "http_post",
+    "http_put",
+    "http_delete",
 };
 pub const disabled_tools = [_][]const u8{};
 pub const default_max_read_bytes: usize = 128 * 1024;
@@ -76,6 +82,18 @@ pub fn executeToolCall(
     if (std.mem.eql(u8, tool_name, "lua_execute")) {
         return executeLuaExecute(allocator, policy, arguments_json);
     }
+    if (std.mem.eql(u8, tool_name, "http_get")) {
+        return executeHttpGet(allocator, arguments_json);
+    }
+    if (std.mem.eql(u8, tool_name, "http_post")) {
+        return executeHttpPost(allocator, arguments_json);
+    }
+    if (std.mem.eql(u8, tool_name, "http_put")) {
+        return executeHttpPut(allocator, arguments_json);
+    }
+    if (std.mem.eql(u8, tool_name, "http_delete")) {
+        return executeHttpDelete(allocator, arguments_json);
+    }
     return error.ToolDisabled;
 }
 
@@ -122,23 +140,22 @@ fn executeFilesystemRead(
         if (max_bytes > max_allowed_read_bytes) return error.InvalidToolArguments;
     }
 
-    const resolved_path = try resolveAllowedReadPath(allocator, policy, requested_path);
-    defer allocator.free(resolved_path);
-
-    const file = try std.fs.cwd().openFile(resolved_path, .{});
-    defer file.close();
-
-    const content = try file.readToEndAlloc(allocator, max_bytes);
-    defer allocator.free(content);
+    const read_result = try workspace_fs.readFileAlloc(
+        allocator,
+        policy.workspace_root,
+        requested_path,
+        max_bytes,
+    );
+    defer read_result.deinit(allocator);
 
     var output = std.Io.Writer.Allocating.init(allocator);
     errdefer output.deinit();
 
     const writer = &output.writer;
     try writer.writeAll("{\"ok\":true,\"tool\":\"filesystem_read\",\"path\":");
-    try writeJsonString(allocator, writer, resolved_path);
+    try writeJsonString(allocator, writer, read_result.path);
     try writer.writeAll(",\"content\":");
-    try writeJsonString(allocator, writer, content);
+    try writeJsonString(allocator, writer, read_result.content);
     try writer.writeAll("}");
 
     return output.toOwnedSlice();
@@ -167,21 +184,22 @@ fn executeFilesystemWrite(
         else => return error.InvalidToolArguments,
     };
 
-    const resolved_path = try resolveAllowedWritePath(allocator, policy, requested_path);
-    defer allocator.free(resolved_path);
-
-    const file = try std.fs.cwd().createFile(resolved_path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll(content);
+    const write_result = try workspace_fs.writeFile(
+        allocator,
+        policy.workspace_root,
+        requested_path,
+        content,
+    );
+    defer write_result.deinit(allocator);
 
     var output = std.Io.Writer.Allocating.init(allocator);
     errdefer output.deinit();
 
     const writer = &output.writer;
     try writer.writeAll("{\"ok\":true,\"tool\":\"filesystem_write\",\"path\":");
-    try writeJsonString(allocator, writer, resolved_path);
+    try writeJsonString(allocator, writer, write_result.path);
     try writer.writeAll(",\"bytes_written\":");
-    try writer.print("{d}", .{content.len});
+    try writer.print("{d}", .{write_result.bytes_written});
     try writer.writeAll("}");
 
     return output.toOwnedSlice();
@@ -205,17 +223,19 @@ fn executeFilesystemDelete(
         else => return error.InvalidToolArguments,
     };
 
-    const resolved_path = try resolveAllowedReadPath(allocator, policy, requested_path);
-    defer allocator.free(resolved_path);
-
-    try std.fs.cwd().deleteFile(resolved_path);
+    const delete_result = try workspace_fs.deleteFile(
+        allocator,
+        policy.workspace_root,
+        requested_path,
+    );
+    defer delete_result.deinit(allocator);
 
     var output = std.Io.Writer.Allocating.init(allocator);
     errdefer output.deinit();
 
     const writer = &output.writer;
     try writer.writeAll("{\"ok\":true,\"tool\":\"filesystem_delete\",\"path\":");
-    try writeJsonString(allocator, writer, resolved_path);
+    try writeJsonString(allocator, writer, delete_result.path);
     try writer.writeAll(",\"deleted\":true}");
 
     return output.toOwnedSlice();
@@ -239,7 +259,11 @@ fn executeLuaExecute(
         else => return error.InvalidToolArguments,
     };
 
-    const resolved_path = try resolveAllowedReadPath(allocator, policy, requested_path);
+    const resolved_path = try workspace_fs.resolveAllowedReadPath(
+        allocator,
+        policy.workspace_root,
+        requested_path,
+    );
     defer allocator.free(resolved_path);
 
     if (!std.mem.eql(u8, std.fs.path.extension(resolved_path), ".lua")) {
@@ -285,81 +309,78 @@ fn executeLuaExecute(
     return output.toOwnedSlice();
 }
 
-fn resolveAllowedReadPath(
-    allocator: std.mem.Allocator,
-    policy: *const Policy,
-    requested_path: []const u8,
-) ![]u8 {
-    const candidate = try toCandidatePath(allocator, policy.workspace_root, requested_path);
-    defer allocator.free(candidate);
-
-    const canonical = try std.fs.cwd().realpathAlloc(allocator, candidate);
-    errdefer allocator.free(canonical);
-
-    if (!isPathInsideWorkspace(policy.workspace_root, canonical)) {
-        return error.PathNotAllowed;
-    }
-    return canonical;
+fn executeHttpGet(allocator: std.mem.Allocator, arguments_json: []const u8) ![]u8 {
+    return executeHttpRequestTool(allocator, "http_get", .GET, false, arguments_json);
 }
 
-fn resolveAllowedWritePath(
-    allocator: std.mem.Allocator,
-    policy: *const Policy,
-    requested_path: []const u8,
-) ![]u8 {
-    const candidate = try toCandidatePath(allocator, policy.workspace_root, requested_path);
-    defer allocator.free(candidate);
-
-    const parent_path = std.fs.path.dirname(candidate) orelse return error.InvalidToolArguments;
-    const parent_realpath = try std.fs.cwd().realpathAlloc(allocator, parent_path);
-    defer allocator.free(parent_realpath);
-
-    if (!isPathInsideWorkspace(policy.workspace_root, parent_realpath)) {
-        return error.PathNotAllowed;
-    }
-
-    const file_name = std.fs.path.basename(candidate);
-    if (file_name.len == 0 or std.mem.eql(u8, file_name, ".") or std.mem.eql(u8, file_name, "..")) {
-        return error.InvalidToolArguments;
-    }
-
-    const resolved = try std.fs.path.join(allocator, &.{ parent_realpath, file_name });
-    errdefer allocator.free(resolved);
-
-    if (!isPathInsideWorkspace(policy.workspace_root, resolved)) {
-        return error.PathNotAllowed;
-    }
-
-    const existing_realpath = std.fs.cwd().realpathAlloc(allocator, resolved) catch null;
-    if (existing_realpath) |path_value| {
-        defer allocator.free(path_value);
-        if (!isPathInsideWorkspace(policy.workspace_root, path_value)) {
-            return error.PathNotAllowed;
-        }
-    }
-
-    return resolved;
+fn executeHttpPost(allocator: std.mem.Allocator, arguments_json: []const u8) ![]u8 {
+    return executeHttpRequestTool(allocator, "http_post", .POST, true, arguments_json);
 }
 
-fn toCandidatePath(
-    allocator: std.mem.Allocator,
-    workspace_root: []const u8,
-    requested_path: []const u8,
-) ![]u8 {
-    if (requested_path.len == 0) return error.InvalidToolArguments;
-    if (std.fs.path.isAbsolute(requested_path)) {
-        return allocator.dupe(u8, requested_path);
-    }
-    return std.fs.path.join(allocator, &.{ workspace_root, requested_path });
+fn executeHttpPut(allocator: std.mem.Allocator, arguments_json: []const u8) ![]u8 {
+    return executeHttpRequestTool(allocator, "http_put", .PUT, true, arguments_json);
 }
 
-fn isPathInsideWorkspace(workspace_root: []const u8, candidate_path: []const u8) bool {
-    if (std.mem.eql(u8, workspace_root, "/")) {
-        return std.mem.startsWith(u8, candidate_path, "/");
+fn executeHttpDelete(allocator: std.mem.Allocator, arguments_json: []const u8) ![]u8 {
+    return executeHttpRequestTool(allocator, "http_delete", .DELETE, false, arguments_json);
+}
+
+fn executeHttpRequestTool(
+    allocator: std.mem.Allocator,
+    tool_name: []const u8,
+    method: std.http.Method,
+    allows_body: bool,
+    arguments_json: []const u8,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{});
+    defer parsed.deinit();
+
+    const root_object = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidToolArguments,
+    };
+
+    const uri = switch (root_object.get("uri") orelse return error.InvalidToolArguments) {
+        .string => |value| value,
+        else => return error.InvalidToolArguments,
+    };
+
+    var payload: ?[]const u8 = null;
+    if (root_object.get("body")) |body_value| {
+        if (!allows_body) return error.InvalidToolArguments;
+        payload = switch (body_value) {
+            .string => |value| value,
+            else => return error.InvalidToolArguments,
+        };
     }
-    if (!std.mem.startsWith(u8, candidate_path, workspace_root)) return false;
-    if (candidate_path.len == workspace_root.len) return true;
-    return candidate_path[workspace_root.len] == std.fs.path.sep;
+
+    var result = try http_client.executeRequest(
+        allocator,
+        method,
+        uri,
+        payload,
+        max_allowed_http_response_bytes,
+    );
+    defer result.deinit(allocator);
+
+    const http_ok = result.status_code >= 200 and result.status_code < 300;
+
+    var output = std.Io.Writer.Allocating.init(allocator);
+    errdefer output.deinit();
+
+    const writer = &output.writer;
+    try writer.writeAll("{\"ok\":");
+    try writer.writeAll(if (http_ok) "true" else "false");
+    try writer.writeAll(",\"tool\":");
+    try writeJsonString(allocator, writer, tool_name);
+    try writer.writeAll(",\"uri\":");
+    try writeJsonString(allocator, writer, uri);
+    try writer.writeAll(",\"status\":");
+    try writer.print("{d}", .{result.status_code});
+    try writer.writeAll(",\"body\":");
+    try writeJsonString(allocator, writer, result.body);
+    try writer.writeAll("}");
+    return output.toOwnedSlice();
 }
 
 fn writeJsonString(allocator: std.mem.Allocator, writer: *std.Io.Writer, value: []const u8) !void {
@@ -387,7 +408,7 @@ test "buildPolicyJson emits required fields" {
     const root_object = parsed.value.object;
     try std.testing.expectEqualStrings("workspace-write", root_object.get("sandbox_mode").?.string);
     try std.testing.expectEqualStrings(policy.workspace_root, root_object.get("writable_roots").?.array.items[0].string);
-    try std.testing.expectEqual(@as(usize, 4), root_object.get("tools_enabled").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 8), root_object.get("tools_enabled").?.array.items.len);
 }
 
 test "filesystem write and read stay within workspace root" {
@@ -689,6 +710,304 @@ test "lua execute rejects traversal outside workspace root" {
             &policy,
             "lua_execute",
             "{\"path\":\"../outside.lua\"}",
+        ),
+    );
+}
+
+const ToolRuntimeHttpExpectation = struct {
+    method: []const u8,
+    target: []const u8,
+    body: []const u8,
+    status_code: u16,
+    response_body: []const u8,
+};
+
+const ToolRuntimeHttpServerContext = struct {
+    server: std.net.Server,
+    expected: []const ToolRuntimeHttpExpectation,
+    completed_requests: usize = 0,
+    failure: ?anyerror = null,
+};
+
+const ParsedToolRuntimeHttpRequest = struct {
+    method: []const u8,
+    target: []const u8,
+    body: []const u8,
+};
+
+fn parseToolRuntimeHttpRequest(request_bytes: []const u8) !ParsedToolRuntimeHttpRequest {
+    const header_end = std.mem.indexOf(u8, request_bytes, "\r\n\r\n") orelse return error.InvalidHttpRequest;
+    const headers = request_bytes[0..header_end];
+    const body = request_bytes[header_end + 4 ..];
+
+    const request_line_end = std.mem.indexOf(u8, headers, "\r\n") orelse return error.InvalidHttpRequest;
+    const request_line = headers[0..request_line_end];
+
+    var parts = std.mem.splitScalar(u8, request_line, ' ');
+    const method = parts.next() orelse return error.InvalidHttpRequest;
+    const target = parts.next() orelse return error.InvalidHttpRequest;
+    _ = parts.next() orelse return error.InvalidHttpRequest;
+
+    return .{
+        .method = method,
+        .target = target,
+        .body = body,
+    };
+}
+
+fn parseToolRuntimeContentLength(headers: []const u8) !usize {
+    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    _ = lines.next();
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+
+        const separator = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const key = std.mem.trim(u8, line[0..separator], " \t");
+        if (!std.ascii.eqlIgnoreCase(key, "content-length")) continue;
+
+        const value = std.mem.trim(u8, line[separator + 1 ..], " \t");
+        if (value.len == 0) return error.InvalidContentLength;
+        return std.fmt.parseInt(usize, value, 10);
+    }
+
+    return 0;
+}
+
+fn runToolRuntimeHttpServer(context: *ToolRuntimeHttpServerContext) void {
+    defer context.server.deinit();
+
+    while (context.completed_requests < context.expected.len) {
+        var connection = context.server.accept() catch |err| {
+            context.failure = err;
+            return;
+        };
+        defer connection.stream.close();
+
+        var request_buffer: [8192]u8 = undefined;
+        var read_len: usize = 0;
+        var expected_total_len: ?usize = null;
+
+        while (true) {
+            if (read_len >= request_buffer.len) {
+                context.failure = error.StreamTooLong;
+                return;
+            }
+
+            const bytes_read = connection.stream.read(request_buffer[read_len..]) catch |err| {
+                context.failure = err;
+                return;
+            };
+            if (bytes_read == 0) break;
+            read_len += bytes_read;
+
+            if (expected_total_len == null) {
+                if (std.mem.indexOf(u8, request_buffer[0..read_len], "\r\n\r\n")) |header_end| {
+                    const content_length = parseToolRuntimeContentLength(request_buffer[0..header_end]) catch |err| {
+                        context.failure = err;
+                        return;
+                    };
+                    expected_total_len = header_end + 4 + content_length;
+                }
+            }
+
+            if (expected_total_len) |total_len| {
+                if (read_len >= total_len) break;
+            }
+        }
+
+        const total_len = expected_total_len orelse {
+            context.failure = error.InvalidHttpRequest;
+            return;
+        };
+        if (read_len < total_len) {
+            context.failure = error.UnexpectedEndOfStream;
+            return;
+        }
+
+        const parsed = parseToolRuntimeHttpRequest(request_buffer[0..total_len]) catch |err| {
+            context.failure = err;
+            return;
+        };
+        const expected = context.expected[context.completed_requests];
+
+        if (!std.mem.eql(u8, parsed.method, expected.method) or
+            !std.mem.eql(u8, parsed.target, expected.target) or
+            !std.mem.eql(u8, parsed.body, expected.body))
+        {
+            context.failure = error.UnexpectedRequest;
+            return;
+        }
+
+        var response_header_buffer: [256]u8 = undefined;
+        const response_header = std.fmt.bufPrint(
+            &response_header_buffer,
+            "HTTP/1.1 {d} OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+            .{ expected.status_code, expected.response_body.len },
+        ) catch {
+            context.failure = error.ResponseBuildFailed;
+            return;
+        };
+
+        connection.stream.writeAll(response_header) catch |err| {
+            context.failure = err;
+            return;
+        };
+        connection.stream.writeAll(expected.response_body) catch |err| {
+            context.failure = err;
+            return;
+        };
+
+        context.completed_requests += 1;
+    }
+}
+
+test "http tools perform get/post/put/delete requests" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+
+    var listen_address = try std.net.Address.parseIp4("127.0.0.1", 0);
+    const server = try listen_address.listen(.{ .reuse_address = true });
+
+    const expectations = [_]ToolRuntimeHttpExpectation{
+        .{ .method = "GET", .target = "/get", .body = "", .status_code = 200, .response_body = "g" },
+        .{ .method = "POST", .target = "/post", .body = "alpha=1", .status_code = 201, .response_body = "p" },
+        .{ .method = "PUT", .target = "/put", .body = "update-me", .status_code = 202, .response_body = "u" },
+        .{ .method = "DELETE", .target = "/delete", .body = "", .status_code = 204, .response_body = "" },
+    };
+
+    var context = ToolRuntimeHttpServerContext{
+        .server = server,
+        .expected = &expectations,
+    };
+
+    const server_thread = std.Thread.spawn(.{}, runToolRuntimeHttpServer, .{&context}) catch |err| {
+        context.server.deinit();
+        return err;
+    };
+    defer server_thread.join();
+
+    const port = context.server.listen_address.getPort();
+    const get_uri = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/get", .{port});
+    defer std.testing.allocator.free(get_uri);
+    const post_uri = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/post", .{port});
+    defer std.testing.allocator.free(post_uri);
+    const put_uri = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/put", .{port});
+    defer std.testing.allocator.free(put_uri);
+    const delete_uri = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/delete", .{port});
+    defer std.testing.allocator.free(delete_uri);
+
+    const get_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"uri\":\"{s}\"}}", .{get_uri});
+    defer std.testing.allocator.free(get_args);
+    const post_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"uri\":\"{s}\",\"body\":\"alpha=1\"}}", .{post_uri});
+    defer std.testing.allocator.free(post_args);
+    const put_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"uri\":\"{s}\",\"body\":\"update-me\"}}", .{put_uri});
+    defer std.testing.allocator.free(put_args);
+    const delete_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"uri\":\"{s}\"}}", .{delete_uri});
+    defer std.testing.allocator.free(delete_args);
+
+    const get_result = try executeToolCall(std.testing.allocator, &policy, "http_get", get_args);
+    defer std.testing.allocator.free(get_result);
+    const post_result = try executeToolCall(std.testing.allocator, &policy, "http_post", post_args);
+    defer std.testing.allocator.free(post_result);
+    const put_result = try executeToolCall(std.testing.allocator, &policy, "http_put", put_args);
+    defer std.testing.allocator.free(put_result);
+    const delete_result = try executeToolCall(std.testing.allocator, &policy, "http_delete", delete_args);
+    defer std.testing.allocator.free(delete_result);
+
+    var parsed_get = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, get_result, .{});
+    defer parsed_get.deinit();
+    const get_object = parsed_get.value.object;
+    try std.testing.expect(get_object.get("ok").?.bool);
+    try std.testing.expectEqualStrings("http_get", get_object.get("tool").?.string);
+    try std.testing.expectEqualStrings(get_uri, get_object.get("uri").?.string);
+    try std.testing.expectEqual(@as(i64, 200), get_object.get("status").?.integer);
+    try std.testing.expectEqualStrings("g", get_object.get("body").?.string);
+
+    var parsed_post = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, post_result, .{});
+    defer parsed_post.deinit();
+    const post_object = parsed_post.value.object;
+    try std.testing.expect(post_object.get("ok").?.bool);
+    try std.testing.expectEqualStrings("http_post", post_object.get("tool").?.string);
+    try std.testing.expectEqualStrings(post_uri, post_object.get("uri").?.string);
+    try std.testing.expectEqual(@as(i64, 201), post_object.get("status").?.integer);
+    try std.testing.expectEqualStrings("p", post_object.get("body").?.string);
+
+    var parsed_put = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, put_result, .{});
+    defer parsed_put.deinit();
+    const put_object = parsed_put.value.object;
+    try std.testing.expect(put_object.get("ok").?.bool);
+    try std.testing.expectEqualStrings("http_put", put_object.get("tool").?.string);
+    try std.testing.expectEqualStrings(put_uri, put_object.get("uri").?.string);
+    try std.testing.expectEqual(@as(i64, 202), put_object.get("status").?.integer);
+    try std.testing.expectEqualStrings("u", put_object.get("body").?.string);
+
+    var parsed_delete = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, delete_result, .{});
+    defer parsed_delete.deinit();
+    const delete_object = parsed_delete.value.object;
+    try std.testing.expect(delete_object.get("ok").?.bool);
+    try std.testing.expectEqualStrings("http_delete", delete_object.get("tool").?.string);
+    try std.testing.expectEqualStrings(delete_uri, delete_object.get("uri").?.string);
+    try std.testing.expectEqual(@as(i64, 204), delete_object.get("status").?.integer);
+    try std.testing.expectEqualStrings("", delete_object.get("body").?.string);
+
+    try std.testing.expect(context.failure == null);
+    try std.testing.expectEqual(expectations.len, context.completed_requests);
+}
+
+test "http tools reject unsupported uri scheme" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+
+    try std.testing.expectError(
+        error.UnsupportedUriScheme,
+        executeToolCall(
+            std.testing.allocator,
+            &policy,
+            "http_get",
+            "{\"uri\":\"ftp://example.com/file.txt\"}",
+        ),
+    );
+}
+
+test "http get and delete reject body argument" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+
+    try std.testing.expectError(
+        error.InvalidToolArguments,
+        executeToolCall(
+            std.testing.allocator,
+            &policy,
+            "http_get",
+            "{\"uri\":\"https://example.com\",\"body\":\"unexpected\"}",
+        ),
+    );
+
+    try std.testing.expectError(
+        error.InvalidToolArguments,
+        executeToolCall(
+            std.testing.allocator,
+            &policy,
+            "http_delete",
+            "{\"uri\":\"https://example.com\",\"body\":\"unexpected\"}",
         ),
     );
 }
