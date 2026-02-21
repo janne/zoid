@@ -1,4 +1,5 @@
 const std = @import("std");
+const config_store = @import("config_store.zig");
 const openai_client = @import("openai_client.zig");
 const vaxis = @import("vaxis");
 
@@ -512,7 +513,12 @@ fn handlePickerAction(
                 const selected_model = picker.models.items[picker.selected];
                 allocator.free(current_model.*);
                 current_model.* = try allocator.dupe(u8, selected_model);
-                status_text.* = "Model changed for this chat session.";
+                config_store.setValue(allocator, "OPENAI_MODEL", selected_model) catch {
+                    status_text.* = "Model changed for this session, but failed to save config.";
+                    picker.active = false;
+                    return;
+                };
+                status_text.* = "Model changed and saved.";
             }
             picker.active = false;
         },
