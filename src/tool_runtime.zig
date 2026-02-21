@@ -4,13 +4,10 @@ pub const sandbox_mode: []const u8 = "workspace-write";
 pub const enabled_tools = [_][]const u8{
     "filesystem_read",
     "filesystem_write",
-    "shell_command",
 };
 pub const disabled_tools = [_][]const u8{};
 pub const default_max_read_bytes: usize = 128 * 1024;
 pub const max_allowed_read_bytes: usize = 1024 * 1024;
-pub const default_max_command_output_bytes: usize = 128 * 1024;
-pub const max_allowed_command_output_bytes: usize = 1024 * 1024;
 
 pub const Policy = struct {
     workspace_root: []u8,
@@ -68,9 +65,6 @@ pub fn executeToolCall(
     }
     if (std.mem.eql(u8, tool_name, "filesystem_write")) {
         return executeFilesystemWrite(allocator, policy, arguments_json);
-    }
-    if (std.mem.eql(u8, tool_name, "shell_command") or std.mem.eql(u8, tool_name, "exec")) {
-        return executeShellCommand(allocator, policy, arguments_json);
     }
     return error.ToolDisabled;
 }
@@ -183,86 +177,6 @@ fn executeFilesystemWrite(
     return output.toOwnedSlice();
 }
 
-fn executeShellCommand(
-    allocator: std.mem.Allocator,
-    policy: *const Policy,
-    arguments_json: []const u8,
-) ![]u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{});
-    defer parsed.deinit();
-
-    const root_object = switch (parsed.value) {
-        .object => |object| object,
-        else => return error.InvalidToolArguments,
-    };
-
-    const command = switch (root_object.get("command") orelse return error.InvalidToolArguments) {
-        .string => |value| value,
-        else => return error.InvalidToolArguments,
-    };
-    if (command.len == 0) return error.InvalidToolArguments;
-
-    var max_output_bytes: usize = default_max_command_output_bytes;
-    if (root_object.get("max_output_bytes")) |value| {
-        max_output_bytes = switch (value) {
-            .integer => |int_value| blk: {
-                if (int_value <= 0) return error.InvalidToolArguments;
-                const converted = std.math.cast(usize, int_value) orelse return error.InvalidToolArguments;
-                break :blk converted;
-            },
-            else => return error.InvalidToolArguments,
-        };
-        if (max_output_bytes > max_allowed_command_output_bytes) return error.InvalidToolArguments;
-    }
-
-    const run_result = try std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "/bin/sh", "-lc", command },
-        .cwd = policy.workspace_root,
-        .max_output_bytes = max_output_bytes,
-    });
-    defer allocator.free(run_result.stdout);
-    defer allocator.free(run_result.stderr);
-
-    var output = std.Io.Writer.Allocating.init(allocator);
-    errdefer output.deinit();
-
-    const writer = &output.writer;
-    try writer.writeAll("{\"ok\":true,\"tool\":\"shell_command\",\"command\":");
-    try writeJsonString(allocator, writer, command);
-    try writer.writeAll(",\"cwd\":");
-    try writeJsonString(allocator, writer, policy.workspace_root);
-    try writer.writeAll(",\"stdout\":");
-    try writeJsonString(allocator, writer, run_result.stdout);
-    try writer.writeAll(",\"stderr\":");
-    try writeJsonString(allocator, writer, run_result.stderr);
-
-    switch (run_result.term) {
-        .Exited => |exit_code| {
-            try writer.writeAll(",\"success\":");
-            try writer.writeAll(if (exit_code == 0) "true" else "false");
-            try writer.writeAll(",\"exit_code\":");
-            try writer.print("{d}", .{exit_code});
-            try writer.writeAll(",\"signal\":null");
-        },
-        .Signal => |signal| {
-            try writer.writeAll(",\"success\":false,\"exit_code\":null,\"signal\":");
-            try writer.print("{d}", .{signal});
-        },
-        .Stopped => |signal| {
-            try writer.writeAll(",\"success\":false,\"exit_code\":null,\"signal\":");
-            try writer.print("{d}", .{signal});
-        },
-        .Unknown => |value| {
-            try writer.writeAll(",\"success\":false,\"exit_code\":null,\"signal\":");
-            try writer.print("{d}", .{value});
-        },
-    }
-
-    try writer.writeAll("}");
-    return output.toOwnedSlice();
-}
-
 fn resolveAllowedReadPath(
     allocator: std.mem.Allocator,
     policy: *const Policy,
@@ -365,7 +279,7 @@ test "buildPolicyJson emits required fields" {
     const root_object = parsed.value.object;
     try std.testing.expectEqualStrings("workspace-write", root_object.get("sandbox_mode").?.string);
     try std.testing.expectEqualStrings(policy.workspace_root, root_object.get("writable_roots").?.array.items[0].string);
-    try std.testing.expectEqual(@as(usize, 3), root_object.get("tools_enabled").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 2), root_object.get("tools_enabled").?.array.items.len);
 }
 
 test "filesystem write and read stay within workspace root" {
@@ -423,7 +337,7 @@ test "filesystem write rejects traversal outside workspace root" {
     );
 }
 
-test "shell command executes in workspace root" {
+test "shell command tools are disabled" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -433,47 +347,23 @@ test "shell command executes in workspace root" {
     var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
     defer policy.deinit(std.testing.allocator);
 
-    const result = try executeToolCall(
-        std.testing.allocator,
-        &policy,
-        "shell_command",
-        "{\"command\":\"pwd\"}",
+    try std.testing.expectError(
+        error.ToolDisabled,
+        executeToolCall(
+            std.testing.allocator,
+            &policy,
+            "shell_command",
+            "{\"command\":\"pwd\"}",
+        ),
     );
-    defer std.testing.allocator.free(result);
 
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
-    defer parsed.deinit();
-
-    const root_object = parsed.value.object;
-    try std.testing.expect(root_object.get("ok").?.bool);
-    try std.testing.expect(root_object.get("success").?.bool);
-    try std.testing.expectEqualStrings(policy.workspace_root, root_object.get("cwd").?.string);
-    try std.testing.expect(std.mem.indexOf(u8, root_object.get("stdout").?.string, policy.workspace_root) != null);
-}
-
-test "exec alias maps to shell command" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
-    defer std.testing.allocator.free(tmp_path);
-
-    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
-    defer policy.deinit(std.testing.allocator);
-
-    const result = try executeToolCall(
-        std.testing.allocator,
-        &policy,
-        "exec",
-        "{\"command\":\"printf alias_ok\"}",
+    try std.testing.expectError(
+        error.ToolDisabled,
+        executeToolCall(
+            std.testing.allocator,
+            &policy,
+            "exec",
+            "{\"command\":\"pwd\"}",
+        ),
     );
-    defer std.testing.allocator.free(result);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
-    defer parsed.deinit();
-
-    const root_object = parsed.value.object;
-    try std.testing.expect(root_object.get("ok").?.bool);
-    try std.testing.expect(root_object.get("success").?.bool);
-    try std.testing.expectEqualStrings("alias_ok", root_object.get("stdout").?.string);
 }

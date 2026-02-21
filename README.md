@@ -13,3 +13,5 @@ A simple, lightweight, secure alternative to OpenClaw. Built on Zig and Lua.
 
 ## Secure
 - All keys are stored in an vault, not under version control.
+- Zoid can only read and write files in its own directory.
+- Zoid cannot execute any code, except through a built in Lua interpreter.

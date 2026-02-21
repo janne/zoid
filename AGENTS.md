@@ -10,7 +10,7 @@ Today the project provides:
 - A CLI binary (`zoid`) with command parsing in `src/cli.zig` and app entrypoint in `src/main.zig`.
 - Lua script execution via `zoid execute <file.lua>` in `src/lua_runner.zig`.
 - JSON config key/value storage via `zoid config set|get|unset|list` in `src/config_store.zig`.
-- OpenAI chat + one-shot run flows in `src/openai_client.zig` and `src/chat_session.zig`, including local tools (`filesystem_read`, `filesystem_write`, `shell_command`) with workspace-root policy handling via `src/tool_runtime.zig`.
+- OpenAI chat + one-shot run flows in `src/openai_client.zig` and `src/chat_session.zig`, including local tools (`filesystem_read`, `filesystem_write`) with workspace-root policy handling via `src/tool_runtime.zig`.
 - Shared OpenAI model policy in `src/model_catalog.zig` (default model, picker fallback models, and chat-model ID filtering rules).
 - Build + test pipeline in `build.zig`, including embedded Lua (static library from dependency `lua` in `build.zig.zon`).
 
@@ -67,8 +67,8 @@ If you change command behavior, error handling, config format, or Lua execution 
   - `src/chat_session.zig` should use `model_catalog.fallback_models` for picker fallback choices.
   - Keep model catalog invariants covered by tests (`default_model` included in `fallback_models`, fallback IDs unique, fallback IDs chat-capable).
 - Tool runtime changes:
-  - `src/tool_runtime.zig` enforces `workspace-write` policy rooted at current working directory and exposes `filesystem_read`, `filesystem_write`, and `shell_command`.
-  - `shell_command` runs via `/bin/sh -lc` with `cwd` set to workspace root and bounded output size.
+  - `src/tool_runtime.zig` enforces `workspace-write` policy rooted at current working directory and exposes `filesystem_read` and `filesystem_write` only.
+  - `shell_command` and `exec` are intentionally disabled for OpenAI tool calls; unknown/disabled tool calls must return `error.ToolDisabled`.
   - Keep path checks strict: resolve to canonical paths and reject access outside workspace root.
 - Config changes:
   - Preserve valid JSON object format (string keys and string values).
