@@ -77,7 +77,8 @@ If you change command behavior, error handling, config format, or Lua execution 
   - `filesystem_delete` only removes files whose canonical path resolves inside workspace root; traversal outside root must return `error.PathNotAllowed`.
   - `lua_execute` runs scripts via the embedded Lua runtime (`src/lua_runner.zig`) in-process, not via shell process execution, and only accepts `.lua` files under workspace root.
   - `lua_execute` must intercept Lua script output so it is never written to process stdout/stderr in TUI mode; instead surface captured streams in tool JSON (`stdout` and `stderr`, with truncation flags) so the agent can read outputs safely.
-  - In `lua_execute` tool-mode, remove `os`/`package`/`debug`/`require`/`dofile`/`loadfile`; expose only `zoid.file(path):read([max_bytes])`, `zoid.file(path):write(content)`, and `zoid.file(path):delete()` for filesystem access, all enforced to stay inside workspace root.
+  - In `lua_execute` tool-mode, remove `os`/`package`/`debug`/`require`/`dofile`/`loadfile`; expose `zoid.file(path):read([max_bytes])`, `zoid.file(path):write(content)`, `zoid.file(path):delete()`, and `zoid.uri(uri):get/post/put/delete`.
+  - `zoid.uri(uri)` allows only HTTP/HTTPS requests and returns a Lua table with `status`, `body`, and `ok`; response body capture is capped by sandbox policy (currently 1 MiB in `lua_execute`).
   - Tool-mode `io` must be a minimal capture-only table (`io.write` and `io.stderr:write`) so scripts can emit stdout/stderr for agent inspection without gaining general file I/O APIs.
   - `shell_command` and `exec` are intentionally disabled for OpenAI tool calls; unknown/disabled tool calls must return `error.ToolDisabled`.
   - Keep path checks strict: resolve to canonical paths and reject access outside workspace root.

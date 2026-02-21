@@ -13,6 +13,7 @@ pub const ExecuteLuaError = std.mem.Allocator.Error || error{
 
 pub const CaptureError = std.mem.Allocator.Error;
 pub const default_tool_max_read_bytes: usize = 128 * 1024;
+pub const default_tool_max_http_response_bytes: usize = 1024 * 1024;
 
 pub const CapturedExecutionStatus = enum {
     ok,
@@ -46,6 +47,7 @@ const max_captured_stream_bytes: usize = 256 * 1024;
 pub const ToolSandbox = struct {
     workspace_root: []const u8,
     max_read_bytes: usize = default_tool_max_read_bytes,
+    max_http_response_bytes: usize = default_tool_max_http_response_bytes,
 };
 
 const LuaOutputCapture = struct {
@@ -77,6 +79,12 @@ const ToolLuaEnvironment = struct {
     allocator: std.mem.Allocator,
     workspace_root: []const u8,
     max_read_bytes: usize,
+    max_http_response_bytes: usize,
+};
+
+const HttpRequestResult = struct {
+    status_code: u16,
+    body: []u8,
 };
 
 fn appendByte(
@@ -410,6 +418,144 @@ fn luaZoidFile(lua_state: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
+fn executeHttpRequest(
+    allocator: std.mem.Allocator,
+    method: std.http.Method,
+    uri: []const u8,
+    payload: ?[]const u8,
+    max_response_bytes: usize,
+) !HttpRequestResult {
+    if (uri.len == 0) return error.InvalidToolArguments;
+    if (max_response_bytes == 0) return error.InvalidToolArguments;
+
+    const parsed_uri = try std.Uri.parse(uri);
+    if (!std.ascii.eqlIgnoreCase(parsed_uri.scheme, "http") and
+        !std.ascii.eqlIgnoreCase(parsed_uri.scheme, "https"))
+    {
+        return error.UnsupportedUriScheme;
+    }
+
+    const response_storage = try allocator.alloc(u8, max_response_bytes);
+    defer allocator.free(response_storage);
+
+    var response_writer = std.Io.Writer.fixed(response_storage);
+
+    var client: std.http.Client = .{ .allocator = allocator };
+    defer client.deinit();
+
+    const response = client.fetch(.{
+        .location = .{ .uri = parsed_uri },
+        .method = method,
+        .payload = payload,
+        .response_writer = &response_writer,
+    }) catch |err| switch (err) {
+        error.WriteFailed => return error.StreamTooLong,
+        else => |fetch_err| return fetch_err,
+    };
+
+    const response_body = try allocator.dupe(u8, response_writer.buffered());
+    return .{
+        .status_code = @intFromEnum(response.status),
+        .body = response_body,
+    };
+}
+
+fn luaZoidUriRequest(
+    state: *c.lua_State,
+    method: std.http.Method,
+    method_name: []const u8,
+    allows_body: bool,
+) c_int {
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+    const nargs = c.lua_gettop(state);
+
+    if (c.lua_type(state, 1) != c.LUA_TTABLE) {
+        return pushLuaErrorMessage(state, "zoid.uri(uri):{s} requires URI handle", .{method_name});
+    }
+
+    _ = c.lua_getfield(state, 1, "_uri");
+    var uri_len: usize = 0;
+    const uri_ptr = c.lua_tolstring(state, -1, &uri_len) orelse return pushLuaErrorMessage(state, "zoid.uri(uri):{s} requires URI handle", .{method_name});
+    const uri = uri_ptr[0..uri_len];
+    luaPop(state, 1);
+
+    var payload: ?[]const u8 = null;
+    if (allows_body) {
+        if (nargs >= 2 and c.lua_type(state, 2) != c.LUA_TNIL) {
+            var body_len: usize = 0;
+            const body_ptr = c.luaL_checklstring(state, 2, &body_len) orelse return pushLuaErrorMessage(state, "zoid.uri(uri):{s} body must be a string", .{method_name});
+            payload = body_ptr[0..body_len];
+        }
+    } else if (nargs >= 2 and c.lua_type(state, 2) != c.LUA_TNIL) {
+        return pushLuaErrorMessage(state, "zoid.uri(uri):{s} does not accept a body", .{method_name});
+    }
+
+    const result = executeHttpRequest(
+        env.allocator,
+        method,
+        uri,
+        payload,
+        env.max_http_response_bytes,
+    ) catch |err| {
+        return pushLuaErrorMessage(state, "zoid.uri(uri):{s} failed: {s}", .{ method_name, @errorName(err) });
+    };
+    defer env.allocator.free(result.body);
+
+    c.lua_newtable(state);
+
+    c.lua_pushinteger(state, @intCast(result.status_code));
+    c.lua_setfield(state, -2, "status");
+
+    _ = c.lua_pushlstring(state, result.body.ptr, result.body.len);
+    c.lua_setfield(state, -2, "body");
+
+    c.lua_pushboolean(state, if (result.status_code >= 200 and result.status_code < 300) 1 else 0);
+    c.lua_setfield(state, -2, "ok");
+    return 1;
+}
+
+fn luaZoidUriGet(lua_state: ?*c.lua_State) callconv(.c) c_int {
+    const state = lua_state orelse return 0;
+    return luaZoidUriRequest(state, .GET, "get", false);
+}
+
+fn luaZoidUriPost(lua_state: ?*c.lua_State) callconv(.c) c_int {
+    const state = lua_state orelse return 0;
+    return luaZoidUriRequest(state, .POST, "post", true);
+}
+
+fn luaZoidUriPut(lua_state: ?*c.lua_State) callconv(.c) c_int {
+    const state = lua_state orelse return 0;
+    return luaZoidUriRequest(state, .PUT, "put", true);
+}
+
+fn luaZoidUriDelete(lua_state: ?*c.lua_State) callconv(.c) c_int {
+    const state = lua_state orelse return 0;
+    return luaZoidUriRequest(state, .DELETE, "delete", false);
+}
+
+fn luaZoidUri(lua_state: ?*c.lua_State) callconv(.c) c_int {
+    const state = lua_state orelse return 0;
+
+    var uri_len: usize = 0;
+    const uri_ptr = c.luaL_checklstring(state, 1, &uri_len) orelse return pushLuaErrorMessage(state, "zoid.uri requires URI string", .{});
+    const uri = uri_ptr[0..uri_len];
+
+    c.lua_newtable(state);
+    _ = c.lua_pushlstring(state, uri.ptr, uri.len);
+    c.lua_setfield(state, -2, "_uri");
+
+    c.lua_pushcclosure(state, luaZoidUriGet, 0);
+    c.lua_setfield(state, -2, "get");
+    c.lua_pushcclosure(state, luaZoidUriPost, 0);
+    c.lua_setfield(state, -2, "post");
+    c.lua_pushcclosure(state, luaZoidUriPut, 0);
+    c.lua_setfield(state, -2, "put");
+    c.lua_pushcclosure(state, luaZoidUriDelete, 0);
+    c.lua_setfield(state, -2, "delete");
+    return 1;
+}
+
 fn installOutputCapture(lua_state: *c.lua_State, capture: *LuaOutputCapture) void {
     c.lua_pushlightuserdata(lua_state, capture);
     _ = c.lua_setglobal(lua_state, capture_registry_key);
@@ -437,6 +583,8 @@ fn installZoidTable(lua_state: *c.lua_State, sandbox: *ToolLuaEnvironment) void 
     c.lua_newtable(lua_state);
     c.lua_pushcclosure(lua_state, luaZoidFile, 0);
     c.lua_setfield(lua_state, -2, "file");
+    c.lua_pushcclosure(lua_state, luaZoidUri, 0);
+    c.lua_setfield(lua_state, -2, "uri");
     _ = c.lua_setglobal(lua_state, "zoid");
 }
 
@@ -448,7 +596,7 @@ fn setGlobalNil(lua_state: *c.lua_State, name: [:0]const u8) void {
 fn restrictToolLuaEnvironment(lua_state: *c.lua_State, sandbox: *ToolLuaEnvironment) void {
     installZoidTable(lua_state, sandbox);
 
-    // Remove standard escape hatches; zoid.file(...):read/write/delete are the only FS APIs.
+    // Remove standard escape hatches; zoid.file(...) and zoid.uri(...) are the only side-effect APIs.
     setGlobalNil(lua_state, "workspace");
     setGlobalNil(lua_state, "os");
     setGlobalNil(lua_state, "package");
@@ -487,6 +635,7 @@ fn executeLuaFileCaptureOutputInternal(
             .allocator = allocator,
             .workspace_root = tool_sandbox.workspace_root,
             .max_read_bytes = tool_sandbox.max_read_bytes,
+            .max_http_response_bytes = tool_sandbox.max_http_response_bytes,
         };
         restrictToolLuaEnvironment(lua_state, &tool_env);
     }
@@ -751,4 +900,244 @@ test "executeLuaFileCaptureOutputTool blocks workspace traversal" {
 
     try std.testing.expect(output.status == .runtime_failed);
     try std.testing.expect(std.mem.indexOf(u8, output.stderr, "PathNotAllowed") != null);
+}
+
+const TestHttpExpectation = struct {
+    method: []const u8,
+    target: []const u8,
+    body: []const u8,
+    status_code: u16,
+    response_body: []const u8,
+};
+
+const TestHttpServerContext = struct {
+    server: std.net.Server,
+    expected: []const TestHttpExpectation,
+    completed_requests: usize = 0,
+    failure: ?anyerror = null,
+};
+
+const ParsedHttpRequest = struct {
+    method: []const u8,
+    target: []const u8,
+    body: []const u8,
+};
+
+fn parseHttpRequest(request_bytes: []const u8) !ParsedHttpRequest {
+    const header_end = std.mem.indexOf(u8, request_bytes, "\r\n\r\n") orelse return error.InvalidHttpRequest;
+    const headers = request_bytes[0..header_end];
+    const body = request_bytes[header_end + 4 ..];
+
+    const request_line_end = std.mem.indexOf(u8, headers, "\r\n") orelse return error.InvalidHttpRequest;
+    const request_line = headers[0..request_line_end];
+
+    var parts = std.mem.splitScalar(u8, request_line, ' ');
+    const method = parts.next() orelse return error.InvalidHttpRequest;
+    const target = parts.next() orelse return error.InvalidHttpRequest;
+    _ = parts.next() orelse return error.InvalidHttpRequest;
+
+    return .{
+        .method = method,
+        .target = target,
+        .body = body,
+    };
+}
+
+fn parseHttpContentLength(headers: []const u8) !usize {
+    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    _ = lines.next();
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+
+        const separator = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const key = std.mem.trim(u8, line[0..separator], " \t");
+        if (!std.ascii.eqlIgnoreCase(key, "content-length")) continue;
+
+        const value = std.mem.trim(u8, line[separator + 1 ..], " \t");
+        if (value.len == 0) return error.InvalidContentLength;
+        return std.fmt.parseInt(usize, value, 10);
+    }
+
+    return 0;
+}
+
+fn runTestHttpServer(context: *TestHttpServerContext) void {
+    defer context.server.deinit();
+
+    while (context.completed_requests < context.expected.len) {
+        var connection = context.server.accept() catch |err| {
+            context.failure = err;
+            return;
+        };
+        defer connection.stream.close();
+
+        var request_buffer: [8192]u8 = undefined;
+        var read_len: usize = 0;
+        var expected_total_len: ?usize = null;
+
+        while (true) {
+            if (read_len >= request_buffer.len) {
+                context.failure = error.StreamTooLong;
+                return;
+            }
+
+            const bytes_read = connection.stream.read(request_buffer[read_len..]) catch |err| {
+                context.failure = err;
+                return;
+            };
+            if (bytes_read == 0) break;
+            read_len += bytes_read;
+
+            if (expected_total_len == null) {
+                if (std.mem.indexOf(u8, request_buffer[0..read_len], "\r\n\r\n")) |header_end| {
+                    const content_length = parseHttpContentLength(request_buffer[0..header_end]) catch |err| {
+                        context.failure = err;
+                        return;
+                    };
+                    expected_total_len = header_end + 4 + content_length;
+                }
+            }
+
+            if (expected_total_len) |total_len| {
+                if (read_len >= total_len) break;
+            }
+        }
+
+        const total_len = expected_total_len orelse {
+            context.failure = error.InvalidHttpRequest;
+            return;
+        };
+        if (read_len < total_len) {
+            context.failure = error.UnexpectedEndOfStream;
+            return;
+        }
+
+        const parsed = parseHttpRequest(request_buffer[0..total_len]) catch |err| {
+            context.failure = err;
+            return;
+        };
+        const expected = context.expected[context.completed_requests];
+
+        if (!std.mem.eql(u8, parsed.method, expected.method) or
+            !std.mem.eql(u8, parsed.target, expected.target) or
+            !std.mem.eql(u8, parsed.body, expected.body))
+        {
+            context.failure = error.UnexpectedRequest;
+            return;
+        }
+
+        var response_header_buffer: [256]u8 = undefined;
+        const response_header = std.fmt.bufPrint(
+            &response_header_buffer,
+            "HTTP/1.1 {d} OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+            .{ expected.status_code, expected.response_body.len },
+        ) catch {
+            context.failure = error.ResponseBuildFailed;
+            return;
+        };
+
+        connection.stream.writeAll(response_header) catch |err| {
+            context.failure = err;
+            return;
+        };
+        connection.stream.writeAll(expected.response_body) catch |err| {
+            context.failure = err;
+            return;
+        };
+
+        context.completed_requests += 1;
+    }
+}
+
+test "executeLuaFileCaptureOutputTool supports zoid uri get/post/put/delete" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var listen_address = try std.net.Address.parseIp4("127.0.0.1", 0);
+    const server = try listen_address.listen(.{ .reuse_address = true });
+
+    const expectations = [_]TestHttpExpectation{
+        .{ .method = "GET", .target = "/get", .body = "", .status_code = 200, .response_body = "g" },
+        .{ .method = "POST", .target = "/post", .body = "alpha=1", .status_code = 201, .response_body = "p" },
+        .{ .method = "PUT", .target = "/put", .body = "update-me", .status_code = 202, .response_body = "u" },
+        .{ .method = "DELETE", .target = "/delete", .body = "", .status_code = 200, .response_body = "d" },
+    };
+
+    var context = TestHttpServerContext{
+        .server = server,
+        .expected = &expectations,
+    };
+
+    const server_thread = std.Thread.spawn(.{}, runTestHttpServer, .{&context}) catch |err| {
+        context.server.deinit();
+        return err;
+    };
+    defer server_thread.join();
+
+    const port = context.server.listen_address.getPort();
+    const script_content = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\local base = "http://127.0.0.1:{d}"
+        \\local r1 = zoid.uri(base .. "/get"):get()
+        \\local r2 = zoid.uri(base .. "/post"):post("alpha=1")
+        \\local r3 = zoid.uri(base .. "/put"):put("update-me")
+        \\local r4 = zoid.uri(base .. "/delete"):delete()
+        \\print("GET", r1.status, r1.body, r1.ok)
+        \\print("POST", r2.status, r2.body, r2.ok)
+        \\print("PUT", r3.status, r3.body, r3.ok)
+        \\print("DELETE", r4.status, r4.body, r4.ok)
+        \\
+    ,
+        .{port},
+    );
+    defer std.testing.allocator.free(script_content);
+
+    const script = try tmp.dir.createFile("http.lua", .{});
+    defer script.close();
+    try script.writeAll(script_content);
+
+    const script_path = try tmp.dir.realpathAlloc(std.testing.allocator, "http.lua");
+    defer std.testing.allocator.free(script_path);
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    var output = try executeLuaFileCaptureOutputTool(std.testing.allocator, script_path, .{
+        .workspace_root = workspace_root,
+    });
+    defer output.deinit(std.testing.allocator);
+
+    try std.testing.expect(output.status == .ok);
+    try std.testing.expectEqualStrings("", output.stderr);
+    try std.testing.expectEqualStrings(
+        "GET\t200\tg\ttrue\nPOST\t201\tp\ttrue\nPUT\t202\tu\ttrue\nDELETE\t200\td\ttrue\n",
+        output.stdout,
+    );
+
+    try std.testing.expect(context.failure == null);
+    try std.testing.expectEqual(expectations.len, context.completed_requests);
+}
+
+test "executeLuaFileCaptureOutputTool rejects unsupported uri schemes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script = try tmp.dir.createFile("scheme.lua", .{});
+    defer script.close();
+    try script.writeAll(
+        \\zoid.uri("ftp://example.com/file.txt"):get()
+        \\
+    );
+
+    const script_path = try tmp.dir.realpathAlloc(std.testing.allocator, "scheme.lua");
+    defer std.testing.allocator.free(script_path);
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    var output = try executeLuaFileCaptureOutputTool(std.testing.allocator, script_path, .{
+        .workspace_root = workspace_root,
+    });
+    defer output.deinit(std.testing.allocator);
+
+    try std.testing.expect(output.status == .runtime_failed);
+    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "UnsupportedUriScheme") != null);
 }

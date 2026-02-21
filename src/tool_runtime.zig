@@ -11,6 +11,7 @@ pub const enabled_tools = [_][]const u8{
 pub const disabled_tools = [_][]const u8{};
 pub const default_max_read_bytes: usize = 128 * 1024;
 pub const max_allowed_read_bytes: usize = 1024 * 1024;
+pub const max_allowed_http_response_bytes: usize = 1024 * 1024;
 
 pub const Policy = struct {
     workspace_root: []u8,
@@ -248,6 +249,7 @@ fn executeLuaExecute(
     var execution = try lua_runner.executeLuaFileCaptureOutputTool(allocator, resolved_path, .{
         .workspace_root = policy.workspace_root,
         .max_read_bytes = max_allowed_read_bytes,
+        .max_http_response_bytes = max_allowed_http_response_bytes,
     });
     defer execution.deinit(allocator);
 
@@ -587,6 +589,45 @@ test "lua execute sandbox exposes zoid fs and blocks os" {
     const deleted_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "sandbox.txt" });
     defer std.testing.allocator.free(deleted_path);
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(deleted_path, .{}));
+}
+
+test "lua execute sandbox exposes zoid uri handles" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("uri.lua", .{});
+    defer file.close();
+    try file.writeAll(
+        \\local handle = zoid.uri("https://example.com")
+        \\assert(type(handle.get) == "function")
+        \\assert(type(handle.post) == "function")
+        \\assert(type(handle.put) == "function")
+        \\assert(type(handle.delete) == "function")
+        \\print("ok")
+        \\
+    );
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+
+    const result = try executeToolCall(
+        std.testing.allocator,
+        &policy,
+        "lua_execute",
+        "{\"path\":\"uri.lua\"}",
+    );
+    defer std.testing.allocator.free(result);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+
+    const root_object = parsed.value.object;
+    try std.testing.expect(root_object.get("ok").?.bool);
+    try std.testing.expectEqualStrings("ok\n", root_object.get("stdout").?.string);
+    try std.testing.expectEqualStrings("", root_object.get("stderr").?.string);
 }
 
 test "lua execute reports runtime failure and stderr output" {

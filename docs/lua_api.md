@@ -13,7 +13,12 @@ Both modes use sandbox restrictions and Lua API surface.
 
 ### Extra API Added by Zoid
 
-Lua run through Zoid has a `zoid` global with a file handle constructor:
+Lua run through Zoid has a `zoid` global with:
+
+- `zoid.file(path)` file handles
+- `zoid.uri(uri)` HTTP request handles
+
+File example:
 
 ```lua
 local f = zoid.file("notes.txt")
@@ -22,11 +27,24 @@ local content = f:read()
 local ok = f:delete()
 ```
 
-Supported methods:
+URI example:
+
+```lua
+local endpoint = zoid.uri("https://httpbin.org/anything")
+local res = endpoint:post('{"hello":"world"}')
+print(res.status, res.ok)
+print(res.body)
+```
+
+Supported methods and return values:
 
 - `zoid.file(path):read([max_bytes]) -> string`
 - `zoid.file(path):write(content) -> integer` (bytes written)
 - `zoid.file(path):delete() -> boolean` (`true` on success)
+- `zoid.uri(uri):get() -> { status: integer, body: string, ok: boolean }`
+- `zoid.uri(uri):post([body]) -> { status: integer, body: string, ok: boolean }`
+- `zoid.uri(uri):put([body]) -> { status: integer, body: string, ok: boolean }`
+- `zoid.uri(uri):delete() -> { status: integer, body: string, ok: boolean }`
 
 ### APIs Removed or Disabled
 
@@ -64,6 +82,15 @@ Method-specific behavior:
 - `:write()` creates or truncates the target file
 - `:delete()` deletes an existing file and fails if it does not exist
 
+### HTTP Request Rules
+
+`zoid.uri(uri)` allows outbound HTTP/HTTPS requests:
+
+- Only `http://` and `https://` URIs are accepted
+- `:get()` and `:delete()` do not accept a request body
+- `:post([body])` and `:put([body])` accept an optional string body
+- Response body size is capped by sandbox policy
+
 ### Read Limits
 
 `zoid.file(path):read([max_bytes])` is limited by sandbox policy:
@@ -72,6 +99,14 @@ Method-specific behavior:
 - Tool runtime policy can raise this limit (currently up to 1 MiB for `lua_execute`)
 
 If requested `max_bytes` is invalid or above policy limit, the script receives a runtime error.
+
+### HTTP Response Limits
+
+`zoid.uri(...)` response bodies are limited by sandbox policy:
+
+- Default tool sandbox HTTP response limit: 1 MiB
+
+If a response exceeds the configured limit, the script receives a runtime error.
 
 ### Error Model in Tool Mode
 
