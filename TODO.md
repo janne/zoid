@@ -1,1 +1,0 @@
-Add /new command that creates a new AI session and /exit that exits the app and /help that lists the available commands

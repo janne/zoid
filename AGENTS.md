@@ -53,6 +53,7 @@ If you change command behavior, error handling, config format, or Lua execution 
 - Chat interface changes:
   - `src/chat_session.zig` now uses fullscreen `libvaxis` UI in the alternate screen when running on a TTY, with `vaxis.widgets.TextInput` handling readline-style editing (`Ctrl+A`, `Ctrl+E`, arrows, backspace/delete).
   - Chat input history is session-local: `Up`/`Down` browse previously submitted prompts/commands, and moving down past the newest history entry restores the current draft.
+  - Slash commands in chat: `/new` clears the current conversation+transcript (new local session), `/help` appends a local command list message, and `/exit`/`/quit` exits chat.
   - `chat` is TTY-only; non-interactive one-shot usage should go through `zoid run <prompt...>` and write only the agent output to stdout.
   - Keep the input box anchored at the bottom of the screen.
   - Input rendering is manual soft word-wrap, and the input box grows vertically upward as lines increase.

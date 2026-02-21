@@ -1,8 +1,6 @@
 Zoid
 ====
 
-# Long term plan below
-
 A simple, lightweight, secure alternative to OpenClaw. Built on Zig and Lua.
 
 ## Simple

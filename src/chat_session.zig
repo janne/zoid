@@ -6,6 +6,13 @@ const openai_client = @import("openai_client.zig");
 const vaxis = @import("vaxis");
 
 const max_input_len: usize = 16 * 1024;
+const help_command_text =
+    \\Available commands:
+    \\/help  Show this help message.
+    \\/new   Start a new AI session (clears current conversation and transcript).
+    \\/model Open the model picker.
+    \\/exit  Exit chat (/quit also works).
+;
 
 const Event = union(enum) {
     key_press: vaxis.Key,
@@ -261,6 +268,13 @@ fn runFullscreen(allocator: std.mem.Allocator, api_key: []const u8, model: []con
                                     try populateModelPicker(allocator, api_key, current_model, &model_picker);
                                     model_picker.active = true;
                                     status_text = "Select a model and press Enter.";
+                                } else if (isNewCommand(prompt)) {
+                                    clearConversation(allocator, &conversation);
+                                    clearTranscript(allocator, &transcript);
+                                    status_text = "Started a new AI session.";
+                                } else if (isHelpCommand(prompt)) {
+                                    try appendTranscriptEntry(allocator, &transcript, .assistant, help_command_text);
+                                    status_text = "";
                                 } else {
                                     try appendConversationMessage(allocator, &conversation, .user, prompt);
                                     try appendTranscriptEntry(allocator, &transcript, .user, prompt);
@@ -359,6 +373,11 @@ fn appendConversationMessage(
     });
 }
 
+fn clearConversation(allocator: std.mem.Allocator, list: *std.ArrayList(openai_client.Message)) void {
+    for (list.items) |message| allocator.free(message.content);
+    list.clearRetainingCapacity();
+}
+
 fn appendTranscriptEntry(
     allocator: std.mem.Allocator,
     list: *std.ArrayList(DisplayEntry),
@@ -371,6 +390,11 @@ fn appendTranscriptEntry(
         .role = role,
         .text = copy,
     });
+}
+
+fn clearTranscript(allocator: std.mem.Allocator, list: *std.ArrayList(DisplayEntry)) void {
+    for (list.items) |entry| allocator.free(entry.text);
+    list.clearRetainingCapacity();
 }
 
 const spinnerFrames = [_][]const u8{
@@ -1495,6 +1519,14 @@ fn isModelCommand(input: []const u8) bool {
     return std.mem.eql(u8, input, "/model");
 }
 
+fn isNewCommand(input: []const u8) bool {
+    return std.mem.eql(u8, input, "/new");
+}
+
+fn isHelpCommand(input: []const u8) bool {
+    return std.mem.eql(u8, input, "/help");
+}
+
 fn expectInputTextEquals(input: *const vaxis.widgets.TextInput, expected: []const u8) !void {
     const actual = try snapshotInputText(std.testing.allocator, input);
     defer std.testing.allocator.free(actual);
@@ -1510,6 +1542,16 @@ test "isExitCommand recognizes exit commands" {
 test "isModelCommand recognizes model command" {
     try std.testing.expect(isModelCommand("/model"));
     try std.testing.expect(!isModelCommand("model"));
+}
+
+test "isNewCommand recognizes new command" {
+    try std.testing.expect(isNewCommand("/new"));
+    try std.testing.expect(!isNewCommand("new"));
+}
+
+test "isHelpCommand recognizes help command" {
+    try std.testing.expect(isHelpCommand("/help"));
+    try std.testing.expect(!isHelpCommand("help"));
 }
 
 test "visibleTranscriptStart picks latest entries that fit" {
