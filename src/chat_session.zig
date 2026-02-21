@@ -1387,7 +1387,7 @@ fn drawTranscriptEntry(win: vaxis.Window, entry: DisplayEntry) void {
         _ = text_win.print(&user_segments, .{
             .row_offset = 0,
             .col_offset = 0,
-            .wrap = .word,
+            .wrap = .grapheme,
         });
         return;
     }
@@ -1544,7 +1544,7 @@ fn appendStyledText(
     const result = win.print(&segments, .{
         .row_offset = row.*,
         .col_offset = col.*,
-        .wrap = .word,
+        .wrap = .grapheme,
     });
     row.* = result.row;
     col.* = result.col;
@@ -1703,10 +1703,13 @@ fn estimateRows(width: u16, prefix: []const u8, text: []const u8) u32 {
 }
 
 fn countRowsForBytes(width: u16, rows: *u32, col: *u16, bytes: []const u8) void {
-    for (bytes) |byte| {
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const byte = bytes[i];
         if (byte == '\n') {
             rows.* += 1;
             col.* = 0;
+            i += 1;
             continue;
         }
 
@@ -1715,6 +1718,8 @@ fn countRowsForBytes(width: u16, rows: *u32, col: *u16, bytes: []const u8) void 
             rows.* += 1;
             col.* = 0;
         }
+        const seq_len = utf8SeqLen(bytes, i);
+        i += if (seq_len == 0) 1 else seq_len;
     }
 }
 
@@ -1849,6 +1854,11 @@ test "wrapSoftWords counts utf8 codepoints for width" {
     try std.testing.expectEqual(@as(usize, 2), lines.items.len);
     try std.testing.expectEqualStrings("åäö", text[lines.items[0].start..lines.items[0].end]);
     try std.testing.expectEqualStrings("x", text[lines.items[1].start..lines.items[1].end]);
+}
+
+test "estimateRows counts utf8 codepoints instead of bytes" {
+    const rows = estimateRows(10, "", "åäö");
+    try std.testing.expectEqual(@as(u32, 1), rows);
 }
 
 test "locateCursorSoftWrapped returns utf8-aware cursor column" {
