@@ -6,6 +6,7 @@ const openai_client = @import("openai_client.zig");
 const vaxis = @import("vaxis");
 
 const max_input_len: usize = 16 * 1024;
+const transcript_scrollback_rows: u32 = 500;
 const help_command_text =
     \\Available commands:
     \\/help  Show this help message.
@@ -79,6 +80,14 @@ const InputHistoryAction = enum {
     none,
     up,
     down,
+};
+
+const TranscriptScrollAction = enum {
+    none,
+    up_row,
+    down_row,
+    up_half,
+    down_half,
 };
 
 const InputHistoryState = struct {
@@ -222,9 +231,11 @@ fn runFullscreen(allocator: std.mem.Allocator, api_key: []const u8, model: []con
     defer model_picker.deinit(allocator);
     var input_history: InputHistoryState = .{};
     defer input_history.deinit(allocator);
+    var transcript_scroll_rows: usize = 0;
+    var transcript_half_page_rows: usize = 1;
 
     loop: while (true) {
-        if (pending and try harvestCompletedRequest(allocator, &request_state, &pending_thread, &conversation, &transcript, &pending, &status_text, &ticker_active)) {
+        if (pending and try harvestCompletedRequest(allocator, &request_state, &pending_thread, &conversation, &transcript, &pending, &status_text, &ticker_active, &transcript_scroll_rows)) {
             // Request finished, render immediately with fresh transcript state.
         }
 
@@ -241,72 +252,87 @@ fn runFullscreen(allocator: std.mem.Allocator, api_key: []const u8, model: []con
                     const action = pickerActionFromKey(key);
                     try handlePickerAction(action, allocator, &model_picker, &current_model, &status_text);
                 } else {
-                    const history_action = inputHistoryActionFromKey(key);
-                    if (history_action != .none) {
-                        try input_history.navigate(allocator, &input, history_action);
+                    const scroll_action = transcriptScrollActionFromKey(key);
+                    if (scroll_action != .none) {
+                        switch (scroll_action) {
+                            .none => unreachable,
+                            .up_row => transcript_scroll_rows +|= 1,
+                            .down_row => transcript_scroll_rows -|= 1,
+                            .up_half => transcript_scroll_rows +|= transcript_half_page_rows,
+                            .down_half => transcript_scroll_rows -|= transcript_half_page_rows,
+                        }
+                        status_text = "";
                     } else {
-                        if (isEscapeKey(key)) break :loop;
-
-                        if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true })) {
-                            if (pending) continue;
-
-                            const line_owned = try input.toOwnedSlice();
-                            defer allocator.free(line_owned);
-
-                            input_history.clearBrowseState(allocator);
-                            const prompt = std.mem.trim(u8, line_owned, " \t\r\n");
-                            if (prompt.len == 0) {
-                                status_text = "";
-                            } else if (prompt.len > max_input_len) {
-                                status_text = "Input line is too long.";
-                            } else if (isExitCommand(prompt)) {
-                                break :loop;
-                            } else {
-                                try input_history.append(allocator, prompt);
-
-                                if (isModelCommand(prompt)) {
-                                    try populateModelPicker(allocator, api_key, current_model, &model_picker);
-                                    model_picker.active = true;
-                                    status_text = "Select a model and press Enter.";
-                                } else if (isNewCommand(prompt)) {
-                                    clearConversation(allocator, &conversation);
-                                    clearTranscript(allocator, &transcript);
-                                    status_text = "Started a new AI session.";
-                                } else if (isHelpCommand(prompt)) {
-                                    try appendTranscriptEntry(allocator, &transcript, .assistant, help_command_text);
-                                    status_text = "";
-                                } else {
-                                    try appendConversationMessage(allocator, &conversation, .user, prompt);
-                                    try appendTranscriptEntry(allocator, &transcript, .user, prompt);
-
-                                    request_state.mutex.lock();
-                                    request_state.done = false;
-                                    request_state.reply = null;
-                                    request_state.error_text = null;
-                                    request_state.mutex.unlock();
-
-                                    const snapshot = try cloneMessagesForWorker(conversation.items);
-                                    errdefer freeWorkerMessages(snapshot);
-
-                                    const args = try std.heap.c_allocator.create(RequestWorkerArgs);
-                                    errdefer std.heap.c_allocator.destroy(args);
-                                    args.* = .{
-                                        .state = &request_state,
-                                        .api_key = api_key,
-                                        .model = current_model,
-                                        .messages = snapshot,
-                                    };
-
-                                    pending_thread = try std.Thread.spawn(.{}, requestWorkerMain, .{args});
-                                    pending = true;
-                                    spinner_frame = 0;
-                                    ticker_active.store(true, .unordered);
-                                    status_text = "Waiting for assistant response...";
-                                }
-                            }
+                        const history_action = inputHistoryActionFromKey(key);
+                        if (history_action != .none) {
+                            try input_history.navigate(allocator, &input, history_action);
                         } else {
-                            input_history.clearBrowseState(allocator);
-                            try input.update(.{ .key_press = key });
+                            if (isEscapeKey(key)) break :loop;
+
+                            if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true })) {
+                                if (pending) continue;
+
+                                const line_owned = try takeInputText(allocator, &input);
+                                defer allocator.free(line_owned);
+
+                                input_history.clearBrowseState(allocator);
+                                const prompt = std.mem.trim(u8, line_owned, " \t\r\n");
+                                if (prompt.len == 0) {
+                                    status_text = "";
+                                } else if (prompt.len > max_input_len) {
+                                    status_text = "Input line is too long.";
+                                } else if (isExitCommand(prompt)) {
+                                    break :loop;
+                                } else {
+                                    try input_history.append(allocator, prompt);
+
+                                    if (isModelCommand(prompt)) {
+                                        try populateModelPicker(allocator, api_key, current_model, &model_picker);
+                                        model_picker.active = true;
+                                        status_text = "Select a model and press Enter.";
+                                    } else if (isNewCommand(prompt)) {
+                                        clearConversation(allocator, &conversation);
+                                        clearTranscript(allocator, &transcript);
+                                        transcript_scroll_rows = 0;
+                                        status_text = "Started a new AI session.";
+                                    } else if (isHelpCommand(prompt)) {
+                                        try appendTranscriptEntry(allocator, &transcript, .assistant, help_command_text);
+                                        transcript_scroll_rows = 0;
+                                        status_text = "";
+                                    } else {
+                                        try appendConversationMessage(allocator, &conversation, .user, prompt);
+                                        try appendTranscriptEntry(allocator, &transcript, .user, prompt);
+                                        transcript_scroll_rows = 0;
+
+                                        request_state.mutex.lock();
+                                        request_state.done = false;
+                                        request_state.reply = null;
+                                        request_state.error_text = null;
+                                        request_state.mutex.unlock();
+
+                                        const snapshot = try cloneMessagesForWorker(conversation.items);
+                                        errdefer freeWorkerMessages(snapshot);
+
+                                        const args = try std.heap.c_allocator.create(RequestWorkerArgs);
+                                        errdefer std.heap.c_allocator.destroy(args);
+                                        args.* = .{
+                                            .state = &request_state,
+                                            .api_key = api_key,
+                                            .model = current_model,
+                                            .messages = snapshot,
+                                        };
+
+                                        pending_thread = try std.Thread.spawn(.{}, requestWorkerMain, .{args});
+                                        pending = true;
+                                        spinner_frame = 0;
+                                        ticker_active.store(true, .unordered);
+                                        status_text = "Waiting for assistant response...";
+                                    }
+                                }
+                            } else {
+                                input_history.clearBrowseState(allocator);
+                                try input.update(.{ .key_press = key });
+                            }
                         }
                     }
                 }
@@ -320,7 +346,7 @@ fn runFullscreen(allocator: std.mem.Allocator, api_key: []const u8, model: []con
             else => {},
         }
 
-        if (pending and try harvestCompletedRequest(allocator, &request_state, &pending_thread, &conversation, &transcript, &pending, &status_text, &ticker_active)) {
+        if (pending and try harvestCompletedRequest(allocator, &request_state, &pending_thread, &conversation, &transcript, &pending, &status_text, &ticker_active, &transcript_scroll_rows)) {
             spinner_frame = 0;
         }
 
@@ -331,6 +357,8 @@ fn runFullscreen(allocator: std.mem.Allocator, api_key: []const u8, model: []con
             &vx,
             &input,
             transcript.items,
+            &transcript_scroll_rows,
+            &transcript_half_page_rows,
             current_model,
             pending,
             spinner_frame,
@@ -384,7 +412,7 @@ fn appendTranscriptEntry(
     role: DisplayRole,
     text: []const u8,
 ) !void {
-    const copy = try allocator.dupe(u8, text);
+    const copy = try sanitizeTranscriptText(allocator, text);
     errdefer allocator.free(copy);
     try list.append(allocator, .{
         .role = role,
@@ -395,6 +423,84 @@ fn appendTranscriptEntry(
 fn clearTranscript(allocator: std.mem.Allocator, list: *std.ArrayList(DisplayEntry)) void {
     for (list.items) |entry| allocator.free(entry.text);
     list.clearRetainingCapacity();
+}
+
+fn sanitizeTranscriptText(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+) ![]u8 {
+    var output = std.ArrayList(u8).empty;
+    defer output.deinit(allocator);
+    try output.ensureTotalCapacity(allocator, text.len);
+
+    var i: usize = 0;
+    while (i < text.len) {
+        const byte = text[i];
+        switch (byte) {
+            '\r' => {
+                // Normalize both CRLF and CR to a single LF.
+                try output.append(allocator, '\n');
+                if (i + 1 < text.len and text[i + 1] == '\n') i += 1;
+            },
+            '\t' => {
+                try output.append(allocator, ' ');
+                try output.append(allocator, ' ');
+                try output.append(allocator, ' ');
+                try output.append(allocator, ' ');
+            },
+            0x1B => {
+                i = skipAnsiEscape(text, i);
+                continue;
+            },
+            else => {
+                if ((byte < 0x20 and byte != '\n') or byte == 0x7F) {
+                    try output.append(allocator, ' ');
+                } else {
+                    try output.append(allocator, byte);
+                }
+            },
+        }
+        i += 1;
+    }
+
+    return output.toOwnedSlice(allocator);
+}
+
+fn skipAnsiEscape(text: []const u8, esc_index: usize) usize {
+    var i = esc_index + 1;
+    if (i >= text.len) return text.len;
+
+    const leader = text[i];
+    i += 1;
+
+    // CSI: ESC [ ... final-byte
+    if (leader == '[') {
+        while (i < text.len) : (i += 1) {
+            const b = text[i];
+            if (b >= 0x40 and b <= 0x7E) return i + 1;
+        }
+        return text.len;
+    }
+
+    // OSC: ESC ] ... BEL or ST (ESC \)
+    if (leader == ']') {
+        while (i < text.len) : (i += 1) {
+            if (text[i] == 0x07) return i + 1;
+            if (text[i] == 0x1B and i + 1 < text.len and text[i + 1] == '\\') return i + 2;
+        }
+        return text.len;
+    }
+
+    // DCS/PM/APC: ESC P / ESC ^ / ESC _ ... ST
+    if (leader == 'P' or leader == '^' or leader == '_') {
+        while (i < text.len) : (i += 1) {
+            if (text[i] == 0x1B and i + 1 < text.len and text[i + 1] == '\\') return i + 2;
+        }
+        return text.len;
+    }
+
+    // Other one-byte escapes (e.g. ESC c / ESC 7 / ESC 8).
+    return i;
 }
 
 const spinnerFrames = [_][]const u8{
@@ -492,6 +598,7 @@ fn harvestCompletedRequest(
     pending: *bool,
     status_text: *?[]const u8,
     ticker_active: *std.atomic.Value(bool),
+    transcript_scroll_rows: *usize,
 ) !bool {
     if (!pending.*) return false;
 
@@ -523,6 +630,7 @@ fn harvestCompletedRequest(
     if (error_text) |err| {
         defer std.heap.c_allocator.free(err);
         try appendTranscriptEntry(allocator, transcript, .@"error", err);
+        transcript_scroll_rows.* = 0;
         status_text.* = "Request failed. Check API key/network and try again.";
         return true;
     }
@@ -531,6 +639,7 @@ fn harvestCompletedRequest(
         defer std.heap.c_allocator.free(assistant_reply);
         try appendConversationMessage(allocator, conversation, .assistant, assistant_reply);
         try appendTranscriptEntry(allocator, transcript, .assistant, assistant_reply);
+        transcript_scroll_rows.* = 0;
         status_text.* = "";
         return true;
     }
@@ -707,6 +816,22 @@ fn inputHistoryActionFromKey(key: vaxis.Key) InputHistoryAction {
     return .none;
 }
 
+fn transcriptScrollActionFromKey(key: vaxis.Key) TranscriptScrollAction {
+    if (key.matches('p', .{ .ctrl = true }) or isCtrlP(key)) return .up_row;
+    if (key.matches('n', .{ .ctrl = true }) or isCtrlN(key)) return .down_row;
+    if (key.matches('u', .{ .ctrl = true }) or isCtrlU(key)) return .up_half;
+    if (key.matches('d', .{ .ctrl = true }) or isCtrlD(key)) return .down_half;
+
+    if (key.text) |text| {
+        if (isCtrlPSequence(text)) return .up_row;
+        if (isCtrlNSequence(text)) return .down_row;
+        if (isCtrlUSequence(text)) return .up_half;
+        if (isCtrlDSequence(text)) return .down_half;
+    }
+
+    return .none;
+}
+
 fn isEnterSequence(text: []const u8) bool {
     return text.len == 1 and (text[0] == '\r' or text[0] == '\n');
 }
@@ -721,6 +846,14 @@ fn isCtrlNSequence(text: []const u8) bool {
 
 fn isCtrlPSequence(text: []const u8) bool {
     return text.len == 1 and text[0] == 0x10;
+}
+
+fn isCtrlUSequence(text: []const u8) bool {
+    return text.len == 1 and text[0] == 0x15;
+}
+
+fn isCtrlDSequence(text: []const u8) bool {
+    return text.len == 1 and text[0] == 0x04;
 }
 
 fn isUpSequence(text: []const u8) bool {
@@ -765,6 +898,14 @@ fn isCtrlP(key: vaxis.Key) bool {
     return key.matches('p', .{ .ctrl = true }) or key.codepoint == 0x10;
 }
 
+fn isCtrlU(key: vaxis.Key) bool {
+    return key.matches('u', .{ .ctrl = true }) or key.codepoint == 0x15;
+}
+
+fn isCtrlD(key: vaxis.Key) bool {
+    return key.matches('d', .{ .ctrl = true }) or key.codepoint == 0x04;
+}
+
 fn renderScreen(
     allocator: std.mem.Allocator,
     render_input_buffer: *std.ArrayList(u8),
@@ -772,6 +913,8 @@ fn renderScreen(
     vx: *vaxis.Vaxis,
     input: *vaxis.widgets.TextInput,
     transcript: []const DisplayEntry,
+    transcript_scroll_rows: *usize,
+    transcript_half_page_rows: *usize,
     model: []const u8,
     pending: bool,
     spinner_frame: usize,
@@ -843,7 +986,11 @@ fn renderScreen(
             .width = body_box.width -| 1,
             .height = body_box.height,
         });
-        drawTranscript(transcript_area, transcript);
+        transcript_half_page_rows.* = @max(@as(usize, 1), @as(usize, transcript_area.height) / 2);
+        drawTranscript(transcript_area, transcript, transcript_scroll_rows);
+    } else {
+        transcript_half_page_rows.* = 1;
+        transcript_scroll_rows.* = 0;
     }
 
     const input_box = root.child(.{
@@ -910,7 +1057,7 @@ fn renderScreen(
         });
     }
 
-    const shortcuts = "ctrl+t variants  tab agents  ctrl+p commands";
+    const shortcuts = "ctrl+p/n scroll  ctrl+u/d half-page  tab agents";
     const shortcuts_col: u16 = if (root.width > shortcuts.len + 2)
         @intCast(root.width - shortcuts.len - 2)
     else
@@ -959,6 +1106,16 @@ fn snapshotInputText(
     @memcpy(output[0..first.len], first);
     @memcpy(output[first.len..], second);
     return output;
+}
+
+fn takeInputText(
+    allocator: std.mem.Allocator,
+    input: *vaxis.widgets.TextInput,
+) ![]u8 {
+    const text = try snapshotInputText(allocator, input);
+    errdefer allocator.free(text);
+    input.clearRetainingCapacity();
+    return text;
 }
 
 fn setInputText(input: *vaxis.widgets.TextInput, text: []const u8) !void {
@@ -1134,86 +1291,132 @@ fn renderWrappedInput(
     }
 }
 
-fn drawTranscript(win: vaxis.Window, transcript: []const DisplayEntry) void {
+fn drawTranscript(win: vaxis.Window, transcript: []const DisplayEntry, scroll_rows: *usize) void {
+    if (win.width == 0 or win.height == 0) {
+        scroll_rows.* = 0;
+        return;
+    }
+
+    const total_rows = estimateTranscriptRows(transcript, win.width);
+    if (total_rows == 0) {
+        scroll_rows.* = 0;
+        return;
+    }
+
+    const visible_rows: u32 = win.height;
+    const buffer_rows: u32 = @min(total_rows, transcript_scrollback_rows);
+    const buffer_start: u32 = total_rows - buffer_rows;
+    const window_rows: u32 = @min(visible_rows, buffer_rows);
+    const max_offset: u32 = if (buffer_rows > window_rows) buffer_rows - window_rows else 0;
+
+    if (scroll_rows.* > max_offset) {
+        scroll_rows.* = max_offset;
+    }
+
+    const clamped_offset: u32 = @intCast(scroll_rows.*);
+    var view_end: u32 = total_rows - clamped_offset;
+    const min_view_end = buffer_start + window_rows;
+    if (view_end < min_view_end) view_end = min_view_end;
+    if (view_end > total_rows) view_end = total_rows;
+    const view_start = view_end - window_rows;
+
+    var global_row: u32 = 0;
+    for (transcript) |entry| {
+        const entry_rows = estimateEntryRows(entry, win.width);
+        const entry_start = global_row;
+        const entry_end = entry_start + entry_rows;
+
+        if (entry_end > view_start and entry_start < view_end) {
+            const y_off_i32 = @as(i32, @intCast(entry_start)) - @as(i32, @intCast(view_start));
+            const y_off: i17 = @intCast(y_off_i32);
+            const entry_win = win.child(.{
+                .x_off = 0,
+                .y_off = y_off,
+                .width = win.width,
+                .height = @intCast(entry_rows),
+            });
+            drawTranscriptEntry(entry_win, entry);
+        }
+
+        global_row += entry_rows + 1;
+    }
+}
+
+fn estimateTranscriptRows(transcript: []const DisplayEntry, width: u16) u32 {
+    if (transcript.len == 0 or width == 0) return 0;
+
+    var total: u32 = 0;
+    for (transcript) |entry| {
+        total += estimateEntryRows(entry, width);
+        total += 1;
+    }
+    return total;
+}
+
+fn drawTranscriptEntry(win: vaxis.Window, entry: DisplayEntry) void {
     if (win.width == 0 or win.height == 0) return;
 
-    const start = visibleTranscriptStart(transcript, win.width, win.height);
-    var row: u16 = 0;
     const bg_main: u8 = 233;
     const bg_panel: u8 = 235;
     const accent_fg: u8 = 141;
 
-    for (transcript[start..]) |entry| {
-        if (row >= win.height) break;
+    if (entry.role == .user) {
+        const text_width: u16 = if (win.width > 3) win.width - 3 else 1;
+        const text_rows = @as(u16, @intCast(estimateRows(text_width, "", entry.text)));
+        const block = win.child(.{
+            .x_off = 0,
+            .y_off = 0,
+            .width = win.width,
+            .height = text_rows + 2,
+        });
+        block.fill(.{
+            .char = .{ .grapheme = " ", .width = 1 },
+            .style = .{ .bg = .{ .index = bg_panel } },
+        });
+        drawLeftAccent(block, bg_panel, accent_fg);
 
-        if (entry.role == .user) {
-            const text_width: u16 = if (win.width > 3) win.width - 3 else 1;
-            const text_rows = @as(u16, @intCast(estimateRows(text_width, "", entry.text)));
-            const block_height: u16 = text_rows + 2;
-            if (row + block_height > win.height) break;
-
-            const block = win.child(.{
-                .x_off = 0,
-                .y_off = row,
-                .width = win.width,
-                .height = block_height,
-            });
-            block.fill(.{
-                .char = .{ .grapheme = " ", .width = 1 },
-                .style = .{ .bg = .{ .index = bg_panel } },
-            });
-            drawLeftAccent(block, bg_panel, accent_fg);
-
-            const text_win = block.child(.{
-                .x_off = 2,
-                .y_off = 1,
-                .width = text_width,
-                .height = text_rows,
-            });
-            const user_segments = [_]vaxis.Segment{
-                .{ .text = entry.text, .style = .{ .fg = .{ .index = 251 }, .bg = .{ .index = bg_panel } } },
-            };
-            _ = text_win.print(&user_segments, .{
-                .row_offset = 0,
-                .col_offset = 0,
-                .wrap = .word,
-            });
-
-            row += block_height;
-            if (row < win.height) row +|= 1;
-            continue;
-        }
-
-        const role_style: vaxis.Style = switch (entry.role) {
-            .user => unreachable,
-            .assistant => .{ .fg = .{ .index = 116 }, .bg = .{ .index = bg_main } },
-            .@"error" => .{ .fg = .{ .index = 203 }, .bg = .{ .index = bg_main } },
+        const text_win = block.child(.{
+            .x_off = 2,
+            .y_off = 1,
+            .width = text_width,
+            .height = text_rows,
+        });
+        const user_segments = [_]vaxis.Segment{
+            .{ .text = entry.text, .style = .{ .fg = .{ .index = 251 }, .bg = .{ .index = bg_panel } } },
         };
-
-        const body_style: vaxis.Style = switch (entry.role) {
-            .@"error" => .{ .fg = .{ .index = 203 }, .bg = .{ .index = bg_main } },
-            else => .{ .fg = .{ .index = 251 }, .bg = .{ .index = bg_main } },
-        };
-
-        const inline_code_style: vaxis.Style = switch (entry.role) {
-            .@"error" => .{ .fg = .{ .index = 203 }, .bg = .{ .index = 236 }, .bold = true },
-            else => .{ .fg = .{ .index = 223 }, .bg = .{ .index = 236 } },
-        };
-
-        const block_code_style: vaxis.Style = switch (entry.role) {
-            .@"error" => .{ .fg = .{ .index = 203 }, .bg = .{ .index = 236 } },
-            else => .{ .fg = .{ .index = 188 }, .bg = .{ .index = 236 } },
-        };
-
-        var cursor_row = row;
-        var cursor_col: u16 = 0;
-        appendStyledText(win, &cursor_row, &cursor_col, rolePrefix(entry.role), role_style);
-        appendMarkdownText(win, &cursor_row, &cursor_col, entry.text, body_style, inline_code_style, block_code_style);
-
-        row = cursor_row;
-        if (cursor_col > 0) row +|= 1;
-        if (row < win.height) row +|= 1;
+        _ = text_win.print(&user_segments, .{
+            .row_offset = 0,
+            .col_offset = 0,
+            .wrap = .word,
+        });
+        return;
     }
+
+    const role_style: vaxis.Style = switch (entry.role) {
+        .user => unreachable,
+        .assistant => .{ .fg = .{ .index = 116 }, .bg = .{ .index = bg_main } },
+        .@"error" => .{ .fg = .{ .index = 203 }, .bg = .{ .index = bg_main } },
+    };
+
+    const body_style: vaxis.Style = switch (entry.role) {
+        .@"error" => .{ .fg = .{ .index = 203 }, .bg = .{ .index = bg_main } },
+        else => .{ .fg = .{ .index = 251 }, .bg = .{ .index = bg_main } },
+    };
+
+    const inline_code_style: vaxis.Style = switch (entry.role) {
+        .@"error" => .{ .fg = .{ .index = 203 }, .bg = .{ .index = 236 }, .bold = true },
+        else => .{ .fg = .{ .index = 223 }, .bg = .{ .index = 236 } },
+    };
+
+    const block_code_style: vaxis.Style = switch (entry.role) {
+        .@"error" => .{ .fg = .{ .index = 203 }, .bg = .{ .index = 236 } },
+        else => .{ .fg = .{ .index = 188 }, .bg = .{ .index = 236 } },
+    };
+
+    var cursor_row: u16 = 0;
+    var cursor_col: u16 = 0;
+    appendStyledText(win, &cursor_row, &cursor_col, rolePrefix(entry.role), role_style);
+    appendMarkdownText(win, &cursor_row, &cursor_col, entry.text, body_style, inline_code_style, block_code_style);
 }
 
 const MarkdownSpanKind = enum {
@@ -1448,7 +1651,11 @@ fn visibleTranscriptStart(entries: []const DisplayEntry, width: u16, height: u16
         i -= 1;
 
         const rows_needed = estimateEntryRows(entries[i], width) + 1;
-        if (used_rows + rows_needed > height) return i + 1;
+        if (used_rows + rows_needed > height) {
+            // If the newest entry alone is taller than the viewport, still render it.
+            if (used_rows == 0) return i;
+            return i + 1;
+        }
 
         used_rows += rows_needed;
     }
@@ -1566,6 +1773,16 @@ test "visibleTranscriptStart picks latest entries that fit" {
     try std.testing.expect(idx <= 2);
 }
 
+test "visibleTranscriptStart keeps oversized latest entry visible" {
+    const entries = [_]DisplayEntry{
+        .{ .role = .user, .text = @constCast("short") },
+        .{ .role = .assistant, .text = @constCast("this entry is intentionally very long and wraps across many rows in a tiny viewport") },
+    };
+
+    const idx = visibleTranscriptStart(&entries, 8, 3);
+    try std.testing.expectEqual(@as(usize, 1), idx);
+}
+
 test "MarkdownIterator strips code fences and inline backticks" {
     const text =
         \\before `inline` after
@@ -1659,6 +1876,20 @@ test "inputHistoryActionFromKey detects up and down keys" {
     try std.testing.expect(inputHistoryActionFromKey(regular_key) == .none);
 }
 
+test "transcriptScrollActionFromKey detects row and half-page controls" {
+    const ctrl_p: vaxis.Key = .{ .codepoint = 0x10 };
+    const ctrl_n: vaxis.Key = .{ .codepoint = 0x0E };
+    const ctrl_u: vaxis.Key = .{ .codepoint = 0x15 };
+    const ctrl_d: vaxis.Key = .{ .codepoint = 0x04 };
+    const plain: vaxis.Key = .{ .codepoint = 'x', .text = "x" };
+
+    try std.testing.expect(transcriptScrollActionFromKey(ctrl_p) == .up_row);
+    try std.testing.expect(transcriptScrollActionFromKey(ctrl_n) == .down_row);
+    try std.testing.expect(transcriptScrollActionFromKey(ctrl_u) == .up_half);
+    try std.testing.expect(transcriptScrollActionFromKey(ctrl_d) == .down_half);
+    try std.testing.expect(transcriptScrollActionFromKey(plain) == .none);
+}
+
 test "InputHistoryState navigates and restores draft text" {
     var history: InputHistoryState = .{};
     defer history.deinit(std.testing.allocator);
@@ -1687,4 +1918,36 @@ test "InputHistoryState navigates and restores draft text" {
     try std.testing.expect(history.browse_index == null);
     try std.testing.expect(history.draft == null);
     try expectInputTextEquals(&input, "draft");
+}
+
+test "takeInputText snapshots and clears input buffer" {
+    var input = vaxis.widgets.TextInput.init(std.testing.allocator);
+    defer input.deinit();
+    try input.insertSliceAtCursor("echo time");
+
+    const taken = try takeInputText(std.testing.allocator, &input);
+    defer std.testing.allocator.free(taken);
+
+    try std.testing.expectEqualStrings("echo time", taken);
+    try expectInputTextEquals(&input, "");
+}
+
+test "sanitizeTranscriptText strips ansi and normalizes controls" {
+    const raw = "A\tB\r\nC\r\x1b[31mred\x1b[0m";
+    const cleaned = try sanitizeTranscriptText(std.testing.allocator, raw);
+    defer std.testing.allocator.free(cleaned);
+
+    try std.testing.expectEqualStrings("A    B\nC\nred", cleaned);
+}
+
+test "appendTranscriptEntry stores sanitized text" {
+    var transcript = std.ArrayList(DisplayEntry).empty;
+    defer {
+        for (transcript.items) |entry| std.testing.allocator.free(entry.text);
+        transcript.deinit(std.testing.allocator);
+    }
+
+    try appendTranscriptEntry(std.testing.allocator, &transcript, .assistant, "x\x1b[2J\ty");
+    try std.testing.expectEqual(@as(usize, 1), transcript.items.len);
+    try std.testing.expectEqualStrings("x    y", transcript.items[0].text);
 }

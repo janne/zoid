@@ -12,6 +12,6 @@ A simple, lightweight, secure alternative to OpenClaw. Built on Zig and Lua.
 - Built to be able to run on a small cloud instance, such as the forever free GCP E2-micro, or a Raspberry Pi.
 
 ## Secure
-- All keys are stored in an vault, not under version control.
-- Zoid can only read and write files in its own directory.
-- Zoid cannot execute any code, except through a built in Lua interpreter.
+- All keys are stored in an vault, not under version control (`~/Library/Application Support/zoid/config.json` on Mac and `~/.local/share/zoid/config.json` on Linux).
+- Zoid can only read and write files in its own directory (the same directory as it's started from).
+- Zoid cannot execute any external code, except lua scripts through the built in Lua interpreter.

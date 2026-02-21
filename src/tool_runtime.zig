@@ -207,14 +207,36 @@ fn executeLuaExecute(
         return error.InvalidToolArguments;
     }
 
-    try lua_runner.executeLuaFile(allocator, resolved_path);
+    var execution = try lua_runner.executeLuaFileCaptureOutput(allocator, resolved_path);
+    defer execution.deinit(allocator);
 
     var output = std.Io.Writer.Allocating.init(allocator);
     errdefer output.deinit();
 
     const writer = &output.writer;
-    try writer.writeAll("{\"ok\":true,\"tool\":\"lua_execute\",\"path\":");
+    const ok = execution.status == .ok;
+    try writer.writeAll("{\"ok\":");
+    try writer.writeAll(if (ok) "true" else "false");
+    try writer.writeAll(",\"tool\":\"lua_execute\",\"path\":");
     try writeJsonString(allocator, writer, resolved_path);
+    try writer.writeAll(",\"stdout\":");
+    try writeJsonString(allocator, writer, execution.stdout);
+    try writer.writeAll(",\"stderr\":");
+    try writeJsonString(allocator, writer, execution.stderr);
+    try writer.writeAll(",\"stdout_truncated\":");
+    try writer.writeAll(if (execution.stdout_truncated) "true" else "false");
+    try writer.writeAll(",\"stderr_truncated\":");
+    try writer.writeAll(if (execution.stderr_truncated) "true" else "false");
+    if (!ok) {
+        const error_name = switch (execution.status) {
+            .ok => unreachable,
+            .state_init_failed => "LuaStateInitFailed",
+            .load_failed => "LuaLoadFailed",
+            .runtime_failed => "LuaRuntimeFailed",
+        };
+        try writer.writeAll(",\"error\":");
+        try writeJsonString(allocator, writer, error_name);
+    }
     try writer.writeAll("}");
 
     return output.toOwnedSlice();
@@ -389,6 +411,7 @@ test "lua execute runs script inside workspace root" {
     try file.writeAll(
         \\local x = 1 + 2
         \\assert(x == 3)
+        \\print("ok")
         \\
     );
 
@@ -412,6 +435,47 @@ test "lua execute runs script inside workspace root" {
     const root_object = parsed.value.object;
     try std.testing.expect(root_object.get("ok").?.bool);
     try std.testing.expectEqualStrings("lua_execute", root_object.get("tool").?.string);
+    try std.testing.expectEqualStrings("ok\n", root_object.get("stdout").?.string);
+    try std.testing.expectEqualStrings("", root_object.get("stderr").?.string);
+    try std.testing.expect(!root_object.get("stdout_truncated").?.bool);
+    try std.testing.expect(!root_object.get("stderr_truncated").?.bool);
+    try std.testing.expect(root_object.get("error") == null);
+}
+
+test "lua execute reports runtime failure and stderr output" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("fail.lua", .{});
+    defer file.close();
+    try file.writeAll(
+        \\io.stderr:write("before boom\n")
+        \\error("boom")
+        \\
+    );
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+
+    const result = try executeToolCall(
+        std.testing.allocator,
+        &policy,
+        "lua_execute",
+        "{\"path\":\"fail.lua\"}",
+    );
+    defer std.testing.allocator.free(result);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+
+    const root_object = parsed.value.object;
+    try std.testing.expect(!root_object.get("ok").?.bool);
+    try std.testing.expectEqualStrings("LuaRuntimeFailed", root_object.get("error").?.string);
+    try std.testing.expect(std.mem.indexOf(u8, root_object.get("stderr").?.string, "before boom") != null);
+    try std.testing.expect(std.mem.indexOf(u8, root_object.get("stderr").?.string, "boom") != null);
 }
 
 test "lua execute rejects traversal outside workspace root" {

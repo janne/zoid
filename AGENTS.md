@@ -52,11 +52,15 @@ If you change command behavior, error handling, config format, or Lua execution 
   - Default command is `chat` when running `zoid` with no arguments.
 - Chat interface changes:
   - `src/chat_session.zig` now uses fullscreen `libvaxis` UI in the alternate screen when running on a TTY, with `vaxis.widgets.TextInput` handling readline-style editing (`Ctrl+A`, `Ctrl+E`, arrows, backspace/delete).
+  - When submitting chat input, snapshot text with `snapshotInputText`/`takeInputText` and then clear the widget; avoid `TextInput.toOwnedSlice()` in the live TUI loop to prevent input buffer corruption/ghost text rendering.
+  - Sanitize transcript text before rendering: strip ANSI escape sequences, normalize `\r`/`\r\n` to `\n`, replace tabs with spaces, and replace other control bytes with spaces to avoid terminal state corruption from model/tool output.
   - Chat input history is session-local: `Up`/`Down` browse previously submitted prompts/commands, and moving down past the newest history entry restores the current draft.
   - Slash commands in chat: `/new` clears the current conversation+transcript (new local session), `/help` appends a local command list message, and `/exit`/`/quit` exits chat.
   - `chat` is TTY-only; non-interactive one-shot usage should go through `zoid run <prompt...>` and write only the agent output to stdout.
   - Keep the input box anchored at the bottom of the screen.
   - Input rendering is manual soft word-wrap, and the input box grows vertically upward as lines increase.
+  - Transcript viewport selection must always include at least the latest entry even when a single message exceeds viewport height, so large tool outputs do not blank the transcript area.
+  - Transcript scrollback in chat is row-based with a 500-row buffer; `Ctrl+P`/`Ctrl+N` scroll one row up/down and `Ctrl+U`/`Ctrl+D` scroll half a screen up/down.
   - Assistant/error transcript rendering strips Markdown backtick delimiters and draws inline/fenced code with dedicated styles (no literal `` ` ``/``` fences shown).
   - `build.zig` must import the `vaxis` module into the `zoid` module for `@import("vaxis")` usage inside `src/`.
   - Model picker fallback models come from `src/model_catalog.zig` (`fallback_models`).
@@ -69,6 +73,8 @@ If you change command behavior, error handling, config format, or Lua execution 
 - Tool runtime changes:
   - `src/tool_runtime.zig` enforces `workspace-write` policy rooted at current working directory and exposes `filesystem_read`, `filesystem_write`, and `lua_execute`.
   - `lua_execute` runs scripts via the embedded Lua runtime (`src/lua_runner.zig`) in-process, not via shell process execution, and only accepts `.lua` files under workspace root.
+  - `lua_execute` must intercept Lua script output so it is never written to process stdout/stderr in TUI mode; instead surface captured streams in tool JSON (`stdout` and `stderr`, with truncation flags) so the agent can read outputs safely.
+  - In `lua_execute` tool-mode, the global Lua `os` library is disabled to prevent host-process side effects (`os.exit`, command execution, file/process mutations outside tool policy).
   - `shell_command` and `exec` are intentionally disabled for OpenAI tool calls; unknown/disabled tool calls must return `error.ToolDisabled`.
   - Keep path checks strict: resolve to canonical paths and reject access outside workspace root.
 - Config changes:
