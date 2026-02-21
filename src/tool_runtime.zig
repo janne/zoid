@@ -207,7 +207,10 @@ fn executeLuaExecute(
         return error.InvalidToolArguments;
     }
 
-    var execution = try lua_runner.executeLuaFileCaptureOutput(allocator, resolved_path);
+    var execution = try lua_runner.executeLuaFileCaptureOutputTool(allocator, resolved_path, .{
+        .workspace_root = policy.workspace_root,
+        .max_read_bytes = max_allowed_read_bytes,
+    });
     defer execution.deinit(allocator);
 
     var output = std.Io.Writer.Allocating.init(allocator);
@@ -440,6 +443,43 @@ test "lua execute runs script inside workspace root" {
     try std.testing.expect(!root_object.get("stdout_truncated").?.bool);
     try std.testing.expect(!root_object.get("stderr_truncated").?.bool);
     try std.testing.expect(root_object.get("error") == null);
+}
+
+test "lua execute sandbox exposes workspace fs and blocks os" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("sandbox.lua", .{});
+    defer file.close();
+    try file.writeAll(
+        \\workspace.write("sandbox.txt", "hello")
+        \\print(workspace.read("sandbox.txt"))
+        \\return os.getenv("HOME")
+        \\
+    );
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+
+    const result = try executeToolCall(
+        std.testing.allocator,
+        &policy,
+        "lua_execute",
+        "{\"path\":\"sandbox.lua\"}",
+    );
+    defer std.testing.allocator.free(result);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+
+    const root_object = parsed.value.object;
+    try std.testing.expect(!root_object.get("ok").?.bool);
+    try std.testing.expectEqualStrings("hello\n", root_object.get("stdout").?.string);
+    try std.testing.expect(std.mem.indexOf(u8, root_object.get("stderr").?.string, "os") != null);
+    try std.testing.expectEqualStrings("LuaRuntimeFailed", root_object.get("error").?.string);
 }
 
 test "lua execute reports runtime failure and stderr output" {

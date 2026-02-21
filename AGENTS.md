@@ -74,7 +74,8 @@ If you change command behavior, error handling, config format, or Lua execution 
   - `src/tool_runtime.zig` enforces `workspace-write` policy rooted at current working directory and exposes `filesystem_read`, `filesystem_write`, and `lua_execute`.
   - `lua_execute` runs scripts via the embedded Lua runtime (`src/lua_runner.zig`) in-process, not via shell process execution, and only accepts `.lua` files under workspace root.
   - `lua_execute` must intercept Lua script output so it is never written to process stdout/stderr in TUI mode; instead surface captured streams in tool JSON (`stdout` and `stderr`, with truncation flags) so the agent can read outputs safely.
-  - In `lua_execute` tool-mode, keep `os` available (for safe calls like `os.getenv`) but override `os.exit` so it terminates only the current Lua script and cannot terminate the host process/TUI.
+  - In `lua_execute` tool-mode, remove `os`/`package`/`debug`/`require`/`dofile`/`loadfile`; expose only `workspace.read(path[, max_bytes])` and `workspace.write(path, content)` for filesystem access, both enforced to stay inside workspace root.
+  - Tool-mode `io` must be a minimal capture-only table (`io.write` and `io.stderr:write`) so scripts can emit stdout/stderr for agent inspection without gaining general file I/O APIs.
   - `shell_command` and `exec` are intentionally disabled for OpenAI tool calls; unknown/disabled tool calls must return `error.ToolDisabled`.
   - Keep path checks strict: resolve to canonical paths and reject access outside workspace root.
 - Config changes:
