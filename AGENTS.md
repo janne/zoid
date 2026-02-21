@@ -10,6 +10,8 @@ Today the project provides:
 - A CLI binary (`zoid`) with command parsing in `src/cli.zig` and app entrypoint in `src/main.zig`.
 - Lua script execution via `zoid execute <file.lua>` in `src/lua_runner.zig`.
 - JSON config key/value storage via `zoid config set|get|unset|list` in `src/config_store.zig`.
+- OpenAI chat + one-shot run flows in `src/openai_client.zig` and `src/chat_session.zig`, including local tools (`filesystem_read`, `filesystem_write`, `shell_command`) with workspace-root policy handling via `src/tool_runtime.zig`.
+- Shared OpenAI model policy in `src/model_catalog.zig` (default model, picker fallback models, and chat-model ID filtering rules).
 - Build + test pipeline in `build.zig`, including embedded Lua (static library from dependency `lua` in `build.zig.zon`).
 
 Not implemented yet (vision-stage in `README.md`):
@@ -54,6 +56,14 @@ If you change command behavior, error handling, config format, or Lua execution 
   - Keep the input box anchored at the bottom of the screen.
   - Input rendering is manual soft word-wrap, and the input box grows vertically upward as lines increase.
   - `build.zig` must import the `vaxis` module into the `zoid` module for `@import("vaxis")` usage inside `src/`.
+  - Model picker fallback models come from `src/model_catalog.zig` (`fallback_models`).
+- OpenAI model policy changes:
+  - Keep `src/model_catalog.zig` as the single source of truth for `default_model`, `fallback_models`, and `isChatModelId`.
+  - `src/openai_client.zig` should use `model_catalog.isChatModelId` when filtering `/v1/models` results.
+- Tool runtime changes:
+  - `src/tool_runtime.zig` enforces `workspace-write` policy rooted at current working directory and exposes `filesystem_read`, `filesystem_write`, and `shell_command`.
+  - `shell_command` runs via `/bin/sh -lc` with `cwd` set to workspace root and bounded output size.
+  - Keep path checks strict: resolve to canonical paths and reject access outside workspace root.
 - Config changes:
   - Preserve valid JSON object format (string keys and string values).
   - Keep deterministic key listing behavior (`list` is currently sorted).
