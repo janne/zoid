@@ -40,6 +40,7 @@ fn luaErrorMessage(state: *c.lua_State) []const u8 {
 
 const capture_registry_key = "__zoid_output_capture";
 const max_captured_stream_bytes: usize = 256 * 1024;
+const script_exit_sentinel = "__zoid_tool_script_exit__";
 
 const LuaOutputCapture = struct {
     allocator: std.mem.Allocator,
@@ -47,6 +48,8 @@ const LuaOutputCapture = struct {
     stderr: std.ArrayList(u8) = .empty,
     stdout_truncated: bool = false,
     stderr_truncated: bool = false,
+    exit_requested: bool = false,
+    exit_code: c_int = 0,
 
     fn deinit(self: *LuaOutputCapture) void {
         self.stdout.deinit(self.allocator);
@@ -174,6 +177,33 @@ fn luaCapturedIoStderrWrite(lua_state: ?*c.lua_State) callconv(.c) c_int {
     return 0;
 }
 
+fn parseLuaExitCode(state: *c.lua_State) c_int {
+    if (c.lua_gettop(state) < 1) return 0;
+
+    const arg_type = c.lua_type(state, 1);
+    if (arg_type == c.LUA_TBOOLEAN) {
+        return if (c.lua_toboolean(state, 1) != 0) 0 else 1;
+    }
+    if (arg_type == c.LUA_TNUMBER) {
+        var isnum: c_int = 0;
+        const raw = c.lua_tointegerx(state, 1, &isnum);
+        if (isnum == 0) return 0;
+        return std.math.cast(c_int, raw) orelse if (raw < 0) std.math.minInt(c_int) else std.math.maxInt(c_int);
+    }
+    return 0;
+}
+
+fn luaCapturedExit(lua_state: ?*c.lua_State) callconv(.c) c_int {
+    const state = lua_state orelse return 0;
+    const capture = captureFromLuaState(state) orelse return 0;
+
+    capture.exit_requested = true;
+    capture.exit_code = parseLuaExitCode(state);
+
+    _ = c.lua_pushlstring(state, script_exit_sentinel.ptr, script_exit_sentinel.len);
+    return c.lua_error(state);
+}
+
 fn installOutputCapture(lua_state: *c.lua_State, capture: *LuaOutputCapture) void {
     c.lua_pushlightuserdata(lua_state, capture);
     _ = c.lua_setglobal(lua_state, capture_registry_key);
@@ -195,10 +225,14 @@ fn installOutputCapture(lua_state: *c.lua_State, capture: *LuaOutputCapture) voi
 }
 
 fn restrictToolLuaEnvironment(lua_state: *c.lua_State) void {
-    // Disable OS library in tool-mode to prevent process-level side effects
-    // such as os.exit/execute/remove/rename.
-    c.lua_pushnil(lua_state);
-    _ = c.lua_setglobal(lua_state, "os");
+    // Keep standard libraries available for benign usage (e.g. os.getenv),
+    // but make exit APIs terminate only the current Lua script.
+    _ = c.lua_getglobal(lua_state, "os");
+    if (c.lua_type(lua_state, -1) == c.LUA_TTABLE) {
+        c.lua_pushcclosure(lua_state, luaCapturedExit, 0);
+        c.lua_setfield(lua_state, -2, "exit");
+    }
+    luaPop(lua_state, 1);
 }
 
 fn finalizeCapture(
@@ -268,6 +302,18 @@ pub fn executeLuaFileCaptureOutput(
     }
 
     if (c.lua_pcallk(lua_state, 0, c.LUA_MULTRET, 0, 0, null) != c.LUA_OK) {
+        if (capture.exit_requested) {
+            if (capture.exit_code != 0) {
+                var buf: [64]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "script exited with code {d}", .{capture.exit_code}) catch "script exited with non-zero status";
+                capture.appendStderrSlice(msg);
+            }
+            return finalizeCapture(
+                allocator,
+                &capture,
+                if (capture.exit_code == 0) .ok else .runtime_failed,
+            );
+        }
         capture.appendStderrSlice(luaErrorMessage(lua_state));
         return finalizeCapture(allocator, &capture, .runtime_failed);
     }
@@ -373,16 +419,17 @@ test "executeLuaFileCaptureOutput captures io.stderr writes and runtime errors" 
     try std.testing.expect(std.mem.indexOf(u8, boom_output.stderr, "boom") != null);
 }
 
-test "executeLuaFileCaptureOutput blocks os library" {
+test "executeLuaFileCaptureOutput os.exit(0) stops script without failing host" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const file_path = "no_os.lua";
+    const file_path = "exit_zero.lua";
     const file = try tmp.dir.createFile(file_path, .{});
     defer file.close();
     try file.writeAll(
-        \\print(type(os))
+        \\print("before")
         \\os.exit(0)
+        \\print("after")
         \\
     );
 
@@ -392,7 +439,23 @@ test "executeLuaFileCaptureOutput blocks os library" {
     var output = try executeLuaFileCaptureOutput(std.testing.allocator, abs_path);
     defer output.deinit(std.testing.allocator);
 
-    try std.testing.expect(output.status == .runtime_failed);
-    try std.testing.expectEqualStrings("nil\n", output.stdout);
-    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "nil value") != null);
+    try std.testing.expect(output.status == .ok);
+    try std.testing.expectEqualStrings("before\n", output.stdout);
+    try std.testing.expectEqualStrings("", output.stderr);
+}
+
+test "executeLuaFileCaptureOutput os.exit non-zero reports runtime failure" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("os_exit.lua", .{});
+    defer file.close();
+    try file.writeAll("os.exit(3)\n");
+
+    const os_path = try tmp.dir.realpathAlloc(std.testing.allocator, "os_exit.lua");
+    defer std.testing.allocator.free(os_path);
+    var os_output = try executeLuaFileCaptureOutput(std.testing.allocator, os_path);
+    defer os_output.deinit(std.testing.allocator);
+    try std.testing.expect(os_output.status == .runtime_failed);
+    try std.testing.expect(std.mem.indexOf(u8, os_output.stderr, "code 3") != null);
 }
