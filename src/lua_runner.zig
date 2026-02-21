@@ -1,4 +1,6 @@
 const std = @import("std");
+const config_runtime = @import("config_runtime.zig");
+const config_store = @import("config_store.zig");
 const http_client = @import("http_client.zig");
 const workspace_fs = @import("workspace_fs.zig");
 const c = @cImport({
@@ -50,6 +52,7 @@ pub const ToolSandbox = struct {
     workspace_root: []const u8,
     max_read_bytes: usize = default_tool_max_read_bytes,
     max_http_response_bytes: usize = default_tool_max_http_response_bytes,
+    config_path_override: ?[]const u8 = null,
 };
 
 const LuaOutputCapture = struct {
@@ -82,6 +85,7 @@ const ToolLuaEnvironment = struct {
     workspace_root: []const u8,
     max_read_bytes: usize,
     max_http_response_bytes: usize,
+    config_path_override: ?[]const u8,
 };
 
 fn appendByte(
@@ -430,6 +434,144 @@ fn luaZoidUri(lua_state: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
+fn luaZoidConfigList(lua_state: ?*c.lua_State) callconv(.c) c_int {
+    const state = lua_state orelse return 0;
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+
+    if (c.lua_type(state, 1) != c.LUA_TTABLE) {
+        return pushLuaErrorMessage(state, "zoid.config():list requires config handle", .{});
+    }
+
+    var result = config_runtime.execute(
+        env.allocator,
+        .{ .config_path_override = env.config_path_override },
+        .list,
+    ) catch |err| {
+        return pushLuaErrorMessage(state, "zoid.config():list failed: {s}", .{@errorName(err)});
+    };
+    defer result.deinit(env.allocator);
+
+    const keys = switch (result) {
+        .list => |value| value,
+        else => unreachable,
+    };
+
+    c.lua_newtable(state);
+    for (keys, 0..) |key, index| {
+        c.lua_pushinteger(state, @intCast(index + 1));
+        _ = c.lua_pushlstring(state, key.ptr, key.len);
+        c.lua_settable(state, -3);
+    }
+    return 1;
+}
+
+fn luaZoidConfigGet(lua_state: ?*c.lua_State) callconv(.c) c_int {
+    const state = lua_state orelse return 0;
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+
+    if (c.lua_type(state, 1) != c.LUA_TTABLE) {
+        return pushLuaErrorMessage(state, "zoid.config():get requires config handle", .{});
+    }
+
+    var key_len: usize = 0;
+    const key_ptr = c.luaL_checklstring(state, 2, &key_len) orelse return pushLuaErrorMessage(state, "zoid.config():get requires key", .{});
+    const key = key_ptr[0..key_len];
+
+    var result = config_runtime.execute(
+        env.allocator,
+        .{ .config_path_override = env.config_path_override },
+        .{ .get = key },
+    ) catch |err| {
+        return pushLuaErrorMessage(state, "zoid.config():get failed: {s}", .{@errorName(err)});
+    };
+    defer result.deinit(env.allocator);
+
+    switch (result) {
+        .get => |maybe_value| {
+            if (maybe_value) |value| {
+                _ = c.lua_pushlstring(state, value.ptr, value.len);
+            } else {
+                c.lua_pushnil(state);
+            }
+        },
+        else => unreachable,
+    }
+    return 1;
+}
+
+fn luaZoidConfigSet(lua_state: ?*c.lua_State) callconv(.c) c_int {
+    const state = lua_state orelse return 0;
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+
+    if (c.lua_type(state, 1) != c.LUA_TTABLE) {
+        return pushLuaErrorMessage(state, "zoid.config():set requires config handle", .{});
+    }
+
+    var key_len: usize = 0;
+    const key_ptr = c.luaL_checklstring(state, 2, &key_len) orelse return pushLuaErrorMessage(state, "zoid.config():set requires key", .{});
+    const key = key_ptr[0..key_len];
+
+    var value_len: usize = 0;
+    const value_ptr = c.luaL_checklstring(state, 3, &value_len) orelse return pushLuaErrorMessage(state, "zoid.config():set requires value", .{});
+    const value = value_ptr[0..value_len];
+
+    var result = config_runtime.execute(
+        env.allocator,
+        .{ .config_path_override = env.config_path_override },
+        .{ .set = .{ .key = key, .value = value } },
+    ) catch |err| {
+        return pushLuaErrorMessage(state, "zoid.config():set failed: {s}", .{@errorName(err)});
+    };
+    defer result.deinit(env.allocator);
+
+    c.lua_pushboolean(state, 1);
+    return 1;
+}
+
+fn luaZoidConfigUnset(lua_state: ?*c.lua_State) callconv(.c) c_int {
+    const state = lua_state orelse return 0;
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+
+    if (c.lua_type(state, 1) != c.LUA_TTABLE) {
+        return pushLuaErrorMessage(state, "zoid.config():unset requires config handle", .{});
+    }
+
+    var key_len: usize = 0;
+    const key_ptr = c.luaL_checklstring(state, 2, &key_len) orelse return pushLuaErrorMessage(state, "zoid.config():unset requires key", .{});
+    const key = key_ptr[0..key_len];
+
+    var result = config_runtime.execute(
+        env.allocator,
+        .{ .config_path_override = env.config_path_override },
+        .{ .unset = key },
+    ) catch |err| {
+        return pushLuaErrorMessage(state, "zoid.config():unset failed: {s}", .{@errorName(err)});
+    };
+    defer result.deinit(env.allocator);
+
+    const removed = switch (result) {
+        .unset => |value| value,
+        else => unreachable,
+    };
+    c.lua_pushboolean(state, if (removed) 1 else 0);
+    return 1;
+}
+
+fn luaZoidConfig(lua_state: ?*c.lua_State) callconv(.c) c_int {
+    const state = lua_state orelse return 0;
+
+    c.lua_newtable(state);
+    c.lua_pushcclosure(state, luaZoidConfigList, 0);
+    c.lua_setfield(state, -2, "list");
+    c.lua_pushcclosure(state, luaZoidConfigGet, 0);
+    c.lua_setfield(state, -2, "get");
+    c.lua_pushcclosure(state, luaZoidConfigSet, 0);
+    c.lua_setfield(state, -2, "set");
+    c.lua_pushcclosure(state, luaZoidConfigUnset, 0);
+    c.lua_setfield(state, -2, "unset");
+    return 1;
+}
+
 fn installOutputCapture(lua_state: *c.lua_State, capture: *LuaOutputCapture) void {
     c.lua_pushlightuserdata(lua_state, capture);
     _ = c.lua_setglobal(lua_state, capture_registry_key);
@@ -459,6 +601,8 @@ fn installZoidTable(lua_state: *c.lua_State, sandbox: *ToolLuaEnvironment) void 
     c.lua_setfield(lua_state, -2, "file");
     c.lua_pushcclosure(lua_state, luaZoidUri, 0);
     c.lua_setfield(lua_state, -2, "uri");
+    c.lua_pushcclosure(lua_state, luaZoidConfig, 0);
+    c.lua_setfield(lua_state, -2, "config");
     _ = c.lua_setglobal(lua_state, "zoid");
 }
 
@@ -470,7 +614,7 @@ fn setGlobalNil(lua_state: *c.lua_State, name: [:0]const u8) void {
 fn restrictToolLuaEnvironment(lua_state: *c.lua_State, sandbox: *ToolLuaEnvironment) void {
     installZoidTable(lua_state, sandbox);
 
-    // Remove standard escape hatches; zoid.file(...) and zoid.uri(...) are the only side-effect APIs.
+    // Remove standard escape hatches; zoid.file(...), zoid.uri(...), and zoid.config() are side-effect APIs.
     setGlobalNil(lua_state, "workspace");
     setGlobalNil(lua_state, "os");
     setGlobalNil(lua_state, "package");
@@ -510,6 +654,7 @@ fn executeLuaFileCaptureOutputInternal(
             .workspace_root = tool_sandbox.workspace_root,
             .max_read_bytes = tool_sandbox.max_read_bytes,
             .max_http_response_bytes = tool_sandbox.max_http_response_bytes,
+            .config_path_override = tool_sandbox.config_path_override,
         };
         restrictToolLuaEnvironment(lua_state, &tool_env);
     }
@@ -712,6 +857,56 @@ test "executeLuaFileCaptureOutputTool allows zoid file read/write/delete and cap
     const note_path = try std.fs.path.join(std.testing.allocator, &.{ workspace_root, "note.txt" });
     defer std.testing.allocator.free(note_path);
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(note_path, .{}));
+}
+
+test "executeLuaFileCaptureOutputTool supports zoid config list/get/set/unset" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file_path = "config.lua";
+    const file = try tmp.dir.createFile(file_path, .{});
+    defer file.close();
+    try file.writeAll(
+        \\local cfg = zoid.config()
+        \\cfg:set("OPENAI_API_KEY", "secret")
+        \\cfg:set("ZETA", "1")
+        \\local keys = cfg:list()
+        \\print("keys", #keys, keys[1], keys[2])
+        \\print("api", cfg:get("OPENAI_API_KEY"))
+        \\print("missing", cfg:get("NOT_FOUND") == nil)
+        \\print("removed", cfg:unset("ZETA"))
+        \\print("removed_again", cfg:unset("ZETA"))
+        \\
+    );
+
+    const abs_path = try tmp.dir.realpathAlloc(std.testing.allocator, file_path);
+    defer std.testing.allocator.free(abs_path);
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+    const config_path = try std.fs.path.join(std.testing.allocator, &.{ workspace_root, "config.json" });
+    defer std.testing.allocator.free(config_path);
+
+    var output = try executeLuaFileCaptureOutputTool(std.testing.allocator, abs_path, .{
+        .workspace_root = workspace_root,
+        .config_path_override = config_path,
+    });
+    defer output.deinit(std.testing.allocator);
+
+    try std.testing.expect(output.status == .ok);
+    try std.testing.expectEqualStrings(
+        "keys\t2\tOPENAI_API_KEY\tZETA\napi\tsecret\nmissing\ttrue\nremoved\ttrue\nremoved_again\tfalse\n",
+        output.stdout,
+    );
+    try std.testing.expectEqualStrings("", output.stderr);
+
+    const api_key = try config_store.getValueAtPath(std.testing.allocator, config_path, "OPENAI_API_KEY");
+    defer if (api_key) |value| std.testing.allocator.free(value);
+    try std.testing.expect(api_key != null);
+    try std.testing.expectEqualStrings("secret", api_key.?);
+
+    const zeta = try config_store.getValueAtPath(std.testing.allocator, config_path, "ZETA");
+    defer if (zeta) |value| std.testing.allocator.free(value);
+    try std.testing.expect(zeta == null);
 }
 
 test "executeLuaFileCaptureOutputTool blocks os and package access" {

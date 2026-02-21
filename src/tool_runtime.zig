@@ -1,4 +1,5 @@
 const std = @import("std");
+const config_runtime = @import("config_runtime.zig");
 const http_client = @import("http_client.zig");
 const lua_runner = @import("lua_runner.zig");
 const workspace_fs = @import("workspace_fs.zig");
@@ -9,6 +10,7 @@ pub const enabled_tools = [_][]const u8{
     "filesystem_write",
     "filesystem_delete",
     "lua_execute",
+    "config",
     "http_get",
     "http_post",
     "http_put",
@@ -21,6 +23,7 @@ pub const max_allowed_http_response_bytes: usize = 1024 * 1024;
 
 pub const Policy = struct {
     workspace_root: []u8,
+    config_path_override: ?[]const u8 = null,
 
     pub fn initForCurrentWorkspace(allocator: std.mem.Allocator) !Policy {
         const cwd = try std.process.getCwdAlloc(allocator);
@@ -81,6 +84,9 @@ pub fn executeToolCall(
     }
     if (std.mem.eql(u8, tool_name, "lua_execute")) {
         return executeLuaExecute(allocator, policy, arguments_json);
+    }
+    if (std.mem.eql(u8, tool_name, "config")) {
+        return executeConfig(allocator, policy, arguments_json);
     }
     if (std.mem.eql(u8, tool_name, "http_get")) {
         return executeHttpGet(allocator, arguments_json);
@@ -274,6 +280,7 @@ fn executeLuaExecute(
         .workspace_root = policy.workspace_root,
         .max_read_bytes = max_allowed_read_bytes,
         .max_http_response_bytes = max_allowed_http_response_bytes,
+        .config_path_override = policy.config_path_override,
     });
     defer execution.deinit(allocator);
 
@@ -307,6 +314,120 @@ fn executeLuaExecute(
     try writer.writeAll("}");
 
     return output.toOwnedSlice();
+}
+
+fn executeConfig(
+    allocator: std.mem.Allocator,
+    policy: *const Policy,
+    arguments_json: []const u8,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{});
+    defer parsed.deinit();
+
+    const root_object = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidToolArguments,
+    };
+
+    const action = switch (root_object.get("action") orelse return error.InvalidToolArguments) {
+        .string => |value| value,
+        else => return error.InvalidToolArguments,
+    };
+
+    const request: config_runtime.Request = blk: {
+        if (std.mem.eql(u8, action, "list")) {
+            if (root_object.get("key") != null or root_object.get("value") != null) {
+                return error.InvalidToolArguments;
+            }
+            break :blk .list;
+        }
+        if (std.mem.eql(u8, action, "get")) {
+            if (root_object.get("value") != null) return error.InvalidToolArguments;
+            const key = try requireStringProperty(root_object, "key");
+            break :blk .{ .get = key };
+        }
+        if (std.mem.eql(u8, action, "set")) {
+            const key = try requireStringProperty(root_object, "key");
+            const value = try requireStringProperty(root_object, "value");
+            break :blk .{ .set = .{ .key = key, .value = value } };
+        }
+        if (std.mem.eql(u8, action, "unset")) {
+            if (root_object.get("value") != null) return error.InvalidToolArguments;
+            const key = try requireStringProperty(root_object, "key");
+            break :blk .{ .unset = key };
+        }
+        return error.InvalidToolArguments;
+    };
+
+    var result = try config_runtime.execute(
+        allocator,
+        .{ .config_path_override = policy.config_path_override },
+        request,
+    );
+    defer result.deinit(allocator);
+
+    var output = std.Io.Writer.Allocating.init(allocator);
+    errdefer output.deinit();
+    const writer = &output.writer;
+
+    try writer.writeAll("{\"ok\":true,\"tool\":\"config\",\"action\":");
+    try writeJsonString(allocator, writer, action);
+    switch (result) {
+        .list => |keys| {
+            try writer.writeAll(",\"keys\":[");
+            for (keys, 0..) |key, index| {
+                if (index != 0) try writer.writeAll(",");
+                try writeJsonString(allocator, writer, key);
+            }
+            try writer.writeAll("]}");
+        },
+        .get => |maybe_value| {
+            try writer.writeAll(",\"key\":");
+            try writeJsonString(allocator, writer, switch (request) {
+                .get => |key| key,
+                else => unreachable,
+            });
+            try writer.writeAll(",\"found\":");
+            try writer.writeAll(if (maybe_value != null) "true" else "false");
+            try writer.writeAll(",\"value\":");
+            if (maybe_value) |value| {
+                try writeJsonString(allocator, writer, value);
+            } else {
+                try writer.writeAll("null");
+            }
+            try writer.writeAll("}");
+        },
+        .set => {
+            try writer.writeAll(",\"key\":");
+            try writeJsonString(allocator, writer, switch (request) {
+                .set => |set_request| set_request.key,
+                else => unreachable,
+            });
+            try writer.writeAll(",\"updated\":true}");
+        },
+        .unset => |removed| {
+            try writer.writeAll(",\"key\":");
+            try writeJsonString(allocator, writer, switch (request) {
+                .unset => |key| key,
+                else => unreachable,
+            });
+            try writer.writeAll(",\"removed\":");
+            try writer.writeAll(if (removed) "true" else "false");
+            try writer.writeAll("}");
+        },
+    }
+
+    return output.toOwnedSlice();
+}
+
+fn requireStringProperty(
+    root_object: std.json.ObjectMap,
+    property_name: []const u8,
+) ![]const u8 {
+    return switch (root_object.get(property_name) orelse return error.InvalidToolArguments) {
+        .string => |value| value,
+        else => return error.InvalidToolArguments,
+    };
 }
 
 fn executeHttpGet(allocator: std.mem.Allocator, arguments_json: []const u8) ![]u8 {
@@ -408,7 +529,7 @@ test "buildPolicyJson emits required fields" {
     const root_object = parsed.value.object;
     try std.testing.expectEqualStrings("workspace-write", root_object.get("sandbox_mode").?.string);
     try std.testing.expectEqualStrings(policy.workspace_root, root_object.get("writable_roots").?.array.items[0].string);
-    try std.testing.expectEqual(@as(usize, 8), root_object.get("tools_enabled").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 9), root_object.get("tools_enabled").?.array.items.len);
 }
 
 test "filesystem write and read stay within workspace root" {
@@ -649,6 +770,132 @@ test "lua execute sandbox exposes zoid uri handles" {
     try std.testing.expect(root_object.get("ok").?.bool);
     try std.testing.expectEqualStrings("ok\n", root_object.get("stdout").?.string);
     try std.testing.expectEqualStrings("", root_object.get("stderr").?.string);
+}
+
+test "config tool supports list/get/set/unset" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+    const config_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "config.json" });
+    defer std.testing.allocator.free(config_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+    policy.config_path_override = config_path;
+
+    const set_result = try executeToolCall(
+        std.testing.allocator,
+        &policy,
+        "config",
+        "{\"action\":\"set\",\"key\":\"OPENAI_API_KEY\",\"value\":\"secret\"}",
+    );
+    defer std.testing.allocator.free(set_result);
+
+    const get_result = try executeToolCall(
+        std.testing.allocator,
+        &policy,
+        "config",
+        "{\"action\":\"get\",\"key\":\"OPENAI_API_KEY\"}",
+    );
+    defer std.testing.allocator.free(get_result);
+
+    const list_result = try executeToolCall(
+        std.testing.allocator,
+        &policy,
+        "config",
+        "{\"action\":\"list\"}",
+    );
+    defer std.testing.allocator.free(list_result);
+
+    const unset_result = try executeToolCall(
+        std.testing.allocator,
+        &policy,
+        "config",
+        "{\"action\":\"unset\",\"key\":\"OPENAI_API_KEY\"}",
+    );
+    defer std.testing.allocator.free(unset_result);
+
+    var parsed_set = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, set_result, .{});
+    defer parsed_set.deinit();
+    const set_object = parsed_set.value.object;
+    try std.testing.expect(set_object.get("ok").?.bool);
+    try std.testing.expectEqualStrings("config", set_object.get("tool").?.string);
+    try std.testing.expectEqualStrings("set", set_object.get("action").?.string);
+    try std.testing.expect(set_object.get("updated").?.bool);
+
+    var parsed_get = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, get_result, .{});
+    defer parsed_get.deinit();
+    const get_object = parsed_get.value.object;
+    try std.testing.expect(get_object.get("ok").?.bool);
+    try std.testing.expectEqualStrings("get", get_object.get("action").?.string);
+    try std.testing.expect(get_object.get("found").?.bool);
+    try std.testing.expectEqualStrings("secret", get_object.get("value").?.string);
+
+    var parsed_list = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, list_result, .{});
+    defer parsed_list.deinit();
+    const list_object = parsed_list.value.object;
+    try std.testing.expect(list_object.get("ok").?.bool);
+    try std.testing.expectEqualStrings("list", list_object.get("action").?.string);
+    const keys = list_object.get("keys").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), keys.len);
+    try std.testing.expectEqualStrings("OPENAI_API_KEY", keys[0].string);
+
+    var parsed_unset = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, unset_result, .{});
+    defer parsed_unset.deinit();
+    const unset_object = parsed_unset.value.object;
+    try std.testing.expect(unset_object.get("ok").?.bool);
+    try std.testing.expectEqualStrings("unset", unset_object.get("action").?.string);
+    try std.testing.expect(unset_object.get("removed").?.bool);
+
+    const get_missing_result = try executeToolCall(
+        std.testing.allocator,
+        &policy,
+        "config",
+        "{\"action\":\"get\",\"key\":\"OPENAI_API_KEY\"}",
+    );
+    defer std.testing.allocator.free(get_missing_result);
+
+    var parsed_missing = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, get_missing_result, .{});
+    defer parsed_missing.deinit();
+    const missing_object = parsed_missing.value.object;
+    try std.testing.expect(!missing_object.get("found").?.bool);
+    try std.testing.expect(missing_object.get("value").? == .null);
+}
+
+test "config tool validates arguments" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+    const config_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "config.json" });
+    defer std.testing.allocator.free(config_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+    policy.config_path_override = config_path;
+
+    try std.testing.expectError(
+        error.InvalidToolArguments,
+        executeToolCall(
+            std.testing.allocator,
+            &policy,
+            "config",
+            "{\"action\":\"get\"}",
+        ),
+    );
+
+    try std.testing.expectError(
+        error.InvalidToolArguments,
+        executeToolCall(
+            std.testing.allocator,
+            &policy,
+            "config",
+            "{\"action\":\"list\",\"key\":\"unexpected\"}",
+        ),
+    );
 }
 
 test "lua execute reports runtime failure and stderr output" {

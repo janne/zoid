@@ -17,6 +17,7 @@ Lua run through Zoid has a `zoid` global with:
 
 - `zoid.file(path)` file handles
 - `zoid.uri(uri)` HTTP request handles
+- `zoid.config()` config handles
 
 File example:
 
@@ -36,6 +37,18 @@ print(res.status, res.ok)
 print(res.body)
 ```
 
+Config example:
+
+```lua
+local cfg = zoid.config()
+cfg:set("OPENAI_API_KEY", "secret")
+print(cfg:get("OPENAI_API_KEY"))
+for _, key in ipairs(cfg:list()) do
+  print(key)
+end
+cfg:unset("OPENAI_API_KEY")
+```
+
 Supported methods and return values:
 
 - `zoid.file(path):read([max_bytes]) -> string`
@@ -45,6 +58,10 @@ Supported methods and return values:
 - `zoid.uri(uri):post([body]) -> { status: integer, body: string, ok: boolean }`
 - `zoid.uri(uri):put([body]) -> { status: integer, body: string, ok: boolean }`
 - `zoid.uri(uri):delete() -> { status: integer, body: string, ok: boolean }`
+- `zoid.config():list() -> { string, ... }` (sorted config keys)
+- `zoid.config():get(key) -> string | nil`
+- `zoid.config():set(key, value) -> boolean` (`true` on success)
+- `zoid.config():unset(key) -> boolean` (`true` if key existed and was removed)
 
 ### APIs Removed or Disabled
 

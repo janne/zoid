@@ -280,6 +280,8 @@ fn buildChatCompletionsPayloadWithTools(
     try writer.writeAll(",");
     try writeLuaExecuteToolDefinition(allocator, writer, policy.workspace_root);
     try writer.writeAll(",");
+    try writeConfigToolDefinition(allocator, writer);
+    try writer.writeAll(",");
     try writeHttpGetToolDefinition(allocator, writer);
     try writer.writeAll(",");
     try writeHttpPostToolDefinition(allocator, writer);
@@ -374,6 +376,16 @@ fn writeHttpGetToolDefinition(
     try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"http_get\",\"description\":");
     try writeJsonString(allocator, writer, description);
     try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"uri\":{\"type\":\"string\"}},\"required\":[\"uri\"],\"additionalProperties\":false}}}");
+}
+
+fn writeConfigToolDefinition(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+) !void {
+    const description = "Read and update Zoid config key/value pairs. Use action=list|get|set|unset. Key/value are UTF-8 strings.";
+    try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"config\",\"description\":");
+    try writeJsonString(allocator, writer, description);
+    try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"list\",\"get\",\"set\",\"unset\"]},\"key\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"action\"],\"additionalProperties\":false}}}");
 }
 
 fn writeHttpPostToolDefinition(
@@ -661,15 +673,16 @@ test "buildChatCompletionsPayload creates valid payload" {
     try std.testing.expectEqualStrings("general kenobi", payload_messages[1].object.get("content").?.string);
 
     const tools = root.get("tools").?.array.items;
-    try std.testing.expectEqual(@as(usize, 8), tools.len);
+    try std.testing.expectEqual(@as(usize, 9), tools.len);
     try std.testing.expectEqualStrings("filesystem_read", tools[0].object.get("function").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("filesystem_write", tools[1].object.get("function").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("filesystem_delete", tools[2].object.get("function").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("lua_execute", tools[3].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("http_get", tools[4].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("http_post", tools[5].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("http_put", tools[6].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("http_delete", tools[7].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("config", tools[4].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("http_get", tools[5].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("http_post", tools[6].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("http_put", tools[7].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("http_delete", tools[8].object.get("function").?.object.get("name").?.string);
 }
 
 test "parseAssistantReply extracts assistant content" {
