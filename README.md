@@ -4,7 +4,7 @@ Zoid
 A simple, lightweight, secure alternative to OpenClaw. Built on Zig and Lua.
 
 ## Simple
-- One small binary, including Lua support, and integration with AI agents and Telegram.
+- One small binary, including [Lua support](docs/lua_api.md), and integration with AI agents and Telegram.
 - No external dependencies, all built into one binary.
 - One friendly CLI command for maintaining the service - zoid.
 

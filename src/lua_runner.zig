@@ -47,6 +47,8 @@ fn luaErrorMessage(state: *c.lua_State) []const u8 {
 const capture_registry_key = "__zoid_output_capture";
 const tool_sandbox_registry_key = "__zoid_tool_sandbox";
 const max_captured_stream_bytes: usize = 256 * 1024;
+const max_json_decode_depth: usize = 64;
+var json_null_sentinel: u8 = 0;
 
 pub const ToolSandbox = struct {
     workspace_root: []const u8,
@@ -86,6 +88,11 @@ const ToolLuaEnvironment = struct {
     max_read_bytes: usize,
     max_http_response_bytes: usize,
     config_path_override: ?[]const u8,
+};
+
+const OwnedRequestHeader = struct {
+    name: []u8,
+    value: []u8,
 };
 
 fn appendByte(
@@ -209,6 +216,53 @@ fn pushLuaErrorMessage(state: *c.lua_State, comptime format: []const u8, args: a
     const message = std.fmt.bufPrint(&buffer, format, args) catch "Lua operation failed.";
     _ = c.lua_pushlstring(state, message.ptr, message.len);
     return c.lua_error(state);
+}
+
+fn deinitOwnedRequestHeaders(allocator: std.mem.Allocator, headers: *std.ArrayList(OwnedRequestHeader)) void {
+    for (headers.items) |header| {
+        allocator.free(header.name);
+        allocator.free(header.value);
+    }
+    headers.deinit(allocator);
+}
+
+fn pushJsonNull(state: *c.lua_State) void {
+    c.lua_pushlightuserdata(state, @ptrCast(&json_null_sentinel));
+}
+
+fn pushLuaJsonValue(state: *c.lua_State, value: std.json.Value, depth: usize) !void {
+    if (depth >= max_json_decode_depth) return error.JsonNestingTooDeep;
+
+    switch (value) {
+        .null => pushJsonNull(state),
+        .bool => |bool_value| c.lua_pushboolean(state, if (bool_value) 1 else 0),
+        .integer => |int_value| c.lua_pushinteger(state, @intCast(int_value)),
+        .float => |float_value| c.lua_pushnumber(state, float_value),
+        .number_string => |number_string| {
+            const float_value = try std.fmt.parseFloat(f64, number_string);
+            c.lua_pushnumber(state, float_value);
+        },
+        .string => |string_value| {
+            _ = c.lua_pushlstring(state, string_value.ptr, string_value.len);
+        },
+        .array => |array_value| {
+            c.lua_newtable(state);
+            for (array_value.items, 0..) |entry, index| {
+                try pushLuaJsonValue(state, entry, depth + 1);
+                c.lua_rawseti(state, -2, @intCast(index + 1));
+            }
+        },
+        .object => |object_value| {
+            c.lua_newtable(state);
+            var iterator = object_value.iterator();
+            while (iterator.next()) |entry| {
+                const key = entry.key_ptr.*;
+                _ = c.lua_pushlstring(state, key.ptr, key.len);
+                try pushLuaJsonValue(state, entry.value_ptr.*, depth + 1);
+                c.lua_settable(state, -3);
+            }
+        },
+    }
 }
 
 fn luaZoidFileRead(lua_state: ?*c.lua_State) callconv(.c) c_int {
@@ -338,6 +392,117 @@ fn luaZoidFile(lua_state: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
+fn parseUriHeaderOptions(
+    state: *c.lua_State,
+    method_name: []const u8,
+    headers_index: c_int,
+    env: *ToolLuaEnvironment,
+    owned_headers: *std.ArrayList(OwnedRequestHeader),
+) ?c_int {
+    const headers_table = c.lua_absindex(state, headers_index);
+
+    c.lua_pushnil(state);
+    while (c.lua_next(state, headers_table) != 0) {
+        if (c.lua_type(state, -2) != c.LUA_TSTRING) {
+            c.lua_settop(state, headers_table);
+            return pushLuaErrorMessage(state, "zoid.uri(uri):{s} option headers keys must be strings", .{method_name});
+        }
+        if (c.lua_type(state, -1) != c.LUA_TSTRING) {
+            c.lua_settop(state, headers_table);
+            return pushLuaErrorMessage(state, "zoid.uri(uri):{s} option headers values must be strings", .{method_name});
+        }
+
+        if (owned_headers.items.len >= http_client.max_request_headers) {
+            c.lua_settop(state, headers_table);
+            return pushLuaErrorMessage(state, "zoid.uri(uri):{s} has too many headers", .{method_name});
+        }
+
+        var header_name_len: usize = 0;
+        const header_name_ptr = c.lua_tolstring(state, -2, &header_name_len) orelse {
+            c.lua_settop(state, headers_table);
+            return pushLuaErrorMessage(state, "zoid.uri(uri):{s} option headers keys must be strings", .{method_name});
+        };
+        const header_name = header_name_ptr[0..header_name_len];
+
+        var header_value_len: usize = 0;
+        const header_value_ptr = c.lua_tolstring(state, -1, &header_value_len) orelse {
+            c.lua_settop(state, headers_table);
+            return pushLuaErrorMessage(state, "zoid.uri(uri):{s} option headers values must be strings", .{method_name});
+        };
+        const header_value = header_value_ptr[0..header_value_len];
+
+        const owned_header_name = env.allocator.dupe(u8, header_name) catch |err| {
+            c.lua_settop(state, headers_table);
+            return pushLuaErrorMessage(state, "zoid.uri(uri):{s} failed: {s}", .{ method_name, @errorName(err) });
+        };
+
+        const owned_header_value = env.allocator.dupe(u8, header_value) catch |err| {
+            env.allocator.free(owned_header_name);
+            c.lua_settop(state, headers_table);
+            return pushLuaErrorMessage(state, "zoid.uri(uri):{s} failed: {s}", .{ method_name, @errorName(err) });
+        };
+
+        owned_headers.append(env.allocator, .{
+            .name = owned_header_name,
+            .value = owned_header_value,
+        }) catch |err| {
+            env.allocator.free(owned_header_name);
+            env.allocator.free(owned_header_value);
+            c.lua_settop(state, headers_table);
+            return pushLuaErrorMessage(state, "zoid.uri(uri):{s} failed: {s}", .{ method_name, @errorName(err) });
+        };
+        luaPop(state, 1);
+    }
+
+    return null;
+}
+
+fn parseUriRequestOptions(
+    state: *c.lua_State,
+    method_name: []const u8,
+    options_index: c_int,
+    env: *ToolLuaEnvironment,
+    owned_headers: *std.ArrayList(OwnedRequestHeader),
+) ?c_int {
+    if (c.lua_type(state, options_index) != c.LUA_TTABLE) {
+        return pushLuaErrorMessage(state, "zoid.uri(uri):{s} options must be a table", .{method_name});
+    }
+
+    const options_table = c.lua_absindex(state, options_index);
+    c.lua_pushnil(state);
+    while (c.lua_next(state, options_table) != 0) {
+        if (c.lua_type(state, -2) != c.LUA_TSTRING) {
+            c.lua_settop(state, options_table);
+            return pushLuaErrorMessage(state, "zoid.uri(uri):{s} option keys must be strings", .{method_name});
+        }
+
+        var option_key_len: usize = 0;
+        const option_key_ptr = c.lua_tolstring(state, -2, &option_key_len) orelse {
+            c.lua_settop(state, options_table);
+            return pushLuaErrorMessage(state, "zoid.uri(uri):{s} option keys must be strings", .{method_name});
+        };
+        const option_key = option_key_ptr[0..option_key_len];
+
+        if (std.mem.eql(u8, option_key, "headers")) {
+            if (c.lua_type(state, -1) != c.LUA_TTABLE) {
+                c.lua_settop(state, options_table);
+                return pushLuaErrorMessage(state, "zoid.uri(uri):{s} option headers must be a table", .{method_name});
+            }
+            if (parseUriHeaderOptions(state, method_name, -1, env, owned_headers)) |lua_error| {
+                c.lua_settop(state, options_table);
+                return lua_error;
+            }
+            luaPop(state, 1);
+            continue;
+        }
+
+        c.lua_settop(state, options_table);
+        return pushLuaErrorMessage(state, "zoid.uri(uri):{s} unsupported option '{s}'", .{ method_name, option_key });
+    }
+
+    return null;
+}
+
 fn luaZoidUriRequest(
     state: *c.lua_State,
     method: std.http.Method,
@@ -357,15 +522,64 @@ fn luaZoidUriRequest(
     const uri = uri_ptr[0..uri_len];
     luaPop(state, 1);
 
+    var owned_headers = std.ArrayList(OwnedRequestHeader).empty;
+    defer deinitOwnedRequestHeaders(env.allocator, &owned_headers);
+
     var payload: ?[]const u8 = null;
+    var options_index: ?c_int = null;
+
     if (allows_body) {
-        if (nargs >= 2 and c.lua_type(state, 2) != c.LUA_TNIL) {
-            var body_len: usize = 0;
-            const body_ptr = c.luaL_checklstring(state, 2, &body_len) orelse return pushLuaErrorMessage(state, "zoid.uri(uri):{s} body must be a string", .{method_name});
-            payload = body_ptr[0..body_len];
+        if (nargs > 3) {
+            return pushLuaErrorMessage(state, "zoid.uri(uri):{s} accepts body and optional options only", .{method_name});
         }
-    } else if (nargs >= 2 and c.lua_type(state, 2) != c.LUA_TNIL) {
-        return pushLuaErrorMessage(state, "zoid.uri(uri):{s} does not accept a body", .{method_name});
+
+        if (nargs >= 2 and c.lua_type(state, 2) != c.LUA_TNIL) {
+            if (c.lua_type(state, 2) == c.LUA_TTABLE) {
+                options_index = 2;
+            } else {
+                var body_len: usize = 0;
+                const body_ptr = c.luaL_checklstring(state, 2, &body_len) orelse return pushLuaErrorMessage(state, "zoid.uri(uri):{s} body must be a string", .{method_name});
+                payload = body_ptr[0..body_len];
+            }
+        }
+
+        if (nargs >= 3 and c.lua_type(state, 3) != c.LUA_TNIL) {
+            if (c.lua_type(state, 3) != c.LUA_TTABLE) {
+                return pushLuaErrorMessage(state, "zoid.uri(uri):{s} options must be a table", .{method_name});
+            }
+            if (options_index != null) {
+                return pushLuaErrorMessage(state, "zoid.uri(uri):{s} options must be provided once", .{method_name});
+            }
+            options_index = 3;
+        }
+    } else {
+        if (nargs > 2) {
+            return pushLuaErrorMessage(state, "zoid.uri(uri):{s} accepts optional options only", .{method_name});
+        }
+
+        if (nargs >= 2 and c.lua_type(state, 2) != c.LUA_TNIL) {
+            if (c.lua_type(state, 2) != c.LUA_TTABLE) {
+                return pushLuaErrorMessage(state, "zoid.uri(uri):{s} options must be a table", .{method_name});
+            }
+            options_index = 2;
+        }
+    }
+
+    if (options_index) |index| {
+        if (parseUriRequestOptions(state, method_name, index, env, &owned_headers)) |lua_error| {
+            return lua_error;
+        }
+    }
+
+    const request_headers = env.allocator.alloc(http_client.RequestHeader, owned_headers.items.len) catch |err| {
+        return pushLuaErrorMessage(state, "zoid.uri(uri):{s} failed: {s}", .{ method_name, @errorName(err) });
+    };
+    defer env.allocator.free(request_headers);
+    for (owned_headers.items, 0..) |header, index| {
+        request_headers[index] = .{
+            .name = header.name,
+            .value = header.value,
+        };
     }
 
     var result = http_client.executeRequest(
@@ -373,6 +587,7 @@ fn luaZoidUriRequest(
         method,
         uri,
         payload,
+        request_headers,
         env.max_http_response_bytes,
     ) catch |err| {
         return pushLuaErrorMessage(state, "zoid.uri(uri):{s} failed: {s}", .{ method_name, @errorName(err) });
@@ -572,6 +787,36 @@ fn luaZoidConfig(lua_state: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
+fn luaZoidJsonDecode(lua_state: ?*c.lua_State) callconv(.c) c_int {
+    const state = lua_state orelse return 0;
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+
+    var json_len: usize = 0;
+    const json_ptr = c.luaL_checklstring(state, 1, &json_len) orelse return pushLuaErrorMessage(state, "zoid.json.decode requires JSON string", .{});
+    const json_text = json_ptr[0..json_len];
+
+    var parsed = std.json.parseFromSlice(std.json.Value, env.allocator, json_text, .{}) catch |err| {
+        return pushLuaErrorMessage(state, "zoid.json.decode failed: {s}", .{@errorName(err)});
+    };
+    defer parsed.deinit();
+
+    pushLuaJsonValue(state, parsed.value, 0) catch |err| {
+        return pushLuaErrorMessage(state, "zoid.json.decode failed: {s}", .{@errorName(err)});
+    };
+    return 1;
+}
+
+fn luaZoidJson(lua_state: ?*c.lua_State) callconv(.c) c_int {
+    const state = lua_state orelse return 0;
+
+    c.lua_newtable(state);
+    c.lua_pushcclosure(state, luaZoidJsonDecode, 0);
+    c.lua_setfield(state, -2, "decode");
+    pushJsonNull(state);
+    c.lua_setfield(state, -2, "null");
+    return 1;
+}
+
 fn installOutputCapture(lua_state: *c.lua_State, capture: *LuaOutputCapture) void {
     c.lua_pushlightuserdata(lua_state, capture);
     _ = c.lua_setglobal(lua_state, capture_registry_key);
@@ -603,6 +848,8 @@ fn installZoidTable(lua_state: *c.lua_State, sandbox: *ToolLuaEnvironment) void 
     c.lua_setfield(lua_state, -2, "uri");
     c.lua_pushcclosure(lua_state, luaZoidConfig, 0);
     c.lua_setfield(lua_state, -2, "config");
+    _ = luaZoidJson(lua_state);
+    c.lua_setfield(lua_state, -2, "json");
     _ = c.lua_setglobal(lua_state, "zoid");
 }
 
@@ -614,7 +861,7 @@ fn setGlobalNil(lua_state: *c.lua_State, name: [:0]const u8) void {
 fn restrictToolLuaEnvironment(lua_state: *c.lua_State, sandbox: *ToolLuaEnvironment) void {
     installZoidTable(lua_state, sandbox);
 
-    // Remove standard escape hatches; zoid.file(...), zoid.uri(...), and zoid.config() are side-effect APIs.
+    // Remove standard escape hatches; zoid.file(...), zoid.uri(...), zoid.config(), and zoid.json.decode are sandbox APIs.
     setGlobalNil(lua_state, "workspace");
     setGlobalNil(lua_state, "os");
     setGlobalNil(lua_state, "package");
@@ -971,10 +1218,16 @@ test "executeLuaFileCaptureOutputTool blocks workspace traversal" {
     try std.testing.expect(std.mem.indexOf(u8, output.stderr, "PathNotAllowed") != null);
 }
 
+const TestHttpHeaderExpectation = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
 const TestHttpExpectation = struct {
     method: []const u8,
     target: []const u8,
     body: []const u8,
+    headers: []const TestHttpHeaderExpectation = &.{},
     status_code: u16,
     response_body: []const u8,
 };
@@ -989,6 +1242,7 @@ const TestHttpServerContext = struct {
 const ParsedHttpRequest = struct {
     method: []const u8,
     target: []const u8,
+    headers: []const u8,
     body: []const u8,
 };
 
@@ -1008,8 +1262,24 @@ fn parseHttpRequest(request_bytes: []const u8) !ParsedHttpRequest {
     return .{
         .method = method,
         .target = target,
+        .headers = headers[request_line_end + 2 ..],
         .body = body,
     };
+}
+
+fn hasExpectedHeader(headers_blob: []const u8, name: []const u8, expected_value: []const u8) bool {
+    var lines = std.mem.splitSequence(u8, headers_blob, "\r\n");
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+
+        const separator = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const key = std.mem.trim(u8, line[0..separator], " \t");
+        if (!std.ascii.eqlIgnoreCase(key, name)) continue;
+
+        const value = std.mem.trim(u8, line[separator + 1 ..], " \t");
+        if (std.mem.eql(u8, value, expected_value)) return true;
+    }
+    return false;
 }
 
 fn parseHttpContentLength(headers: []const u8) !usize {
@@ -1094,6 +1364,12 @@ fn runTestHttpServer(context: *TestHttpServerContext) void {
             context.failure = error.UnexpectedRequest;
             return;
         }
+        for (expected.headers) |expected_header| {
+            if (!hasExpectedHeader(parsed.headers, expected_header.name, expected_header.value)) {
+                context.failure = error.UnexpectedRequest;
+                return;
+            }
+        }
 
         var response_header_buffer: [256]u8 = undefined;
         const response_header = std.fmt.bufPrint(
@@ -1126,10 +1402,46 @@ test "executeLuaFileCaptureOutputTool supports zoid uri get/post/put/delete" {
     const server = try listen_address.listen(.{ .reuse_address = true });
 
     const expectations = [_]TestHttpExpectation{
-        .{ .method = "GET", .target = "/get", .body = "", .status_code = 200, .response_body = "g" },
-        .{ .method = "POST", .target = "/post", .body = "alpha=1", .status_code = 201, .response_body = "p" },
-        .{ .method = "PUT", .target = "/put", .body = "update-me", .status_code = 202, .response_body = "u" },
-        .{ .method = "DELETE", .target = "/delete", .body = "", .status_code = 200, .response_body = "d" },
+        .{
+            .method = "GET",
+            .target = "/get",
+            .body = "",
+            .headers = &.{
+                .{ .name = "X-Req-Id", .value = "g1" },
+            },
+            .status_code = 200,
+            .response_body = "g",
+        },
+        .{
+            .method = "POST",
+            .target = "/post",
+            .body = "alpha=1",
+            .headers = &.{
+                .{ .name = "Authorization", .value = "Bearer test-token" },
+            },
+            .status_code = 201,
+            .response_body = "p",
+        },
+        .{
+            .method = "PUT",
+            .target = "/put",
+            .body = "update-me",
+            .headers = &.{
+                .{ .name = "Content-Type", .value = "text/plain" },
+            },
+            .status_code = 202,
+            .response_body = "u",
+        },
+        .{
+            .method = "DELETE",
+            .target = "/delete",
+            .body = "",
+            .headers = &.{
+                .{ .name = "X-Req-Id", .value = "d1" },
+            },
+            .status_code = 200,
+            .response_body = "d",
+        },
     };
 
     var context = TestHttpServerContext{
@@ -1147,10 +1459,10 @@ test "executeLuaFileCaptureOutputTool supports zoid uri get/post/put/delete" {
     const script_content = try std.fmt.allocPrint(
         std.testing.allocator,
         \\local base = "http://127.0.0.1:{d}"
-        \\local r1 = zoid.uri(base .. "/get"):get()
-        \\local r2 = zoid.uri(base .. "/post"):post("alpha=1")
-        \\local r3 = zoid.uri(base .. "/put"):put("update-me")
-        \\local r4 = zoid.uri(base .. "/delete"):delete()
+        \\local r1 = zoid.uri(base .. "/get"):get({ headers = { ["X-Req-Id"] = "g1" } })
+        \\local r2 = zoid.uri(base .. "/post"):post("alpha=1", { headers = { Authorization = "Bearer test-token" } })
+        \\local r3 = zoid.uri(base .. "/put"):put("update-me", { headers = { ["Content-Type"] = "text/plain" } })
+        \\local r4 = zoid.uri(base .. "/delete"):delete({ headers = { ["X-Req-Id"] = "d1" } })
         \\print("GET", r1.status, r1.body, r1.ok)
         \\print("POST", r2.status, r2.body, r2.ok)
         \\print("PUT", r3.status, r3.body, r3.ok)
@@ -1209,4 +1521,86 @@ test "executeLuaFileCaptureOutputTool rejects unsupported uri schemes" {
 
     try std.testing.expect(output.status == .runtime_failed);
     try std.testing.expect(std.mem.indexOf(u8, output.stderr, "UnsupportedUriScheme") != null);
+}
+
+test "executeLuaFileCaptureOutputTool rejects invalid uri header values" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script = try tmp.dir.createFile("invalid_header.lua", .{});
+    defer script.close();
+    try script.writeAll(
+        \\zoid.uri("https://example.com"):get({ headers = { ["X-Test"] = "bad\r\nvalue" } })
+        \\
+    );
+
+    const script_path = try tmp.dir.realpathAlloc(std.testing.allocator, "invalid_header.lua");
+    defer std.testing.allocator.free(script_path);
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    var output = try executeLuaFileCaptureOutputTool(std.testing.allocator, script_path, .{
+        .workspace_root = workspace_root,
+    });
+    defer output.deinit(std.testing.allocator);
+
+    try std.testing.expect(output.status == .runtime_failed);
+    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "InvalidHeaderValue") != null);
+}
+
+test "executeLuaFileCaptureOutputTool supports zoid json decode" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script = try tmp.dir.createFile("json_decode.lua", .{});
+    defer script.close();
+    try script.writeAll(
+        \\local value = zoid.json.decode('{"count":3,"nested":{"ok":true},"items":[1,null,{"name":"zoid"}]}')
+        \\print(value.count, value.nested.ok, value.items[1], value.items[2] == zoid.json.null, value.items[3].name)
+        \\local root_null = zoid.json.decode("null")
+        \\print("root_null", root_null == zoid.json.null)
+        \\
+    );
+
+    const script_path = try tmp.dir.realpathAlloc(std.testing.allocator, "json_decode.lua");
+    defer std.testing.allocator.free(script_path);
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    var output = try executeLuaFileCaptureOutputTool(std.testing.allocator, script_path, .{
+        .workspace_root = workspace_root,
+    });
+    defer output.deinit(std.testing.allocator);
+
+    try std.testing.expect(output.status == .ok);
+    try std.testing.expectEqualStrings(
+        "3\ttrue\t1\ttrue\tzoid\nroot_null\ttrue\n",
+        output.stdout,
+    );
+    try std.testing.expectEqualStrings("", output.stderr);
+}
+
+test "executeLuaFileCaptureOutputTool reports json decode parse errors" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script = try tmp.dir.createFile("json_decode_error.lua", .{});
+    defer script.close();
+    try script.writeAll(
+        \\zoid.json.decode("{bad json")
+        \\
+    );
+
+    const script_path = try tmp.dir.realpathAlloc(std.testing.allocator, "json_decode_error.lua");
+    defer std.testing.allocator.free(script_path);
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    var output = try executeLuaFileCaptureOutputTool(std.testing.allocator, script_path, .{
+        .workspace_root = workspace_root,
+    });
+    defer output.deinit(std.testing.allocator);
+
+    try std.testing.expect(output.status == .runtime_failed);
+    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "zoid.json.decode failed") != null);
 }

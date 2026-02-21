@@ -480,6 +480,7 @@ fn executeHttpRequestTool(
         method,
         uri,
         payload,
+        &.{},
         max_allowed_http_response_bytes,
     );
     defer result.deinit(allocator);

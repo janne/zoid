@@ -18,6 +18,7 @@ Lua run through Zoid has a `zoid` global with:
 - `zoid.file(path)` file handles
 - `zoid.uri(uri)` HTTP request handles
 - `zoid.config()` config handles
+- `zoid.json.decode(json_text)` JSON decoder
 
 File example:
 
@@ -32,7 +33,10 @@ URI example:
 
 ```lua
 local endpoint = zoid.uri("https://httpbin.org/anything")
-local res = endpoint:post('{"hello":"world"}')
+local res = endpoint:post(
+  '{"hello":"world"}',
+  { headers = { ["Content-Type"] = "application/json" } }
+)
 print(res.status, res.ok)
 print(res.body)
 ```
@@ -49,19 +53,28 @@ end
 cfg:unset("OPENAI_API_KEY")
 ```
 
+JSON example:
+
+```lua
+local payload = zoid.json.decode('{"ok":true,"count":2,"items":[1,null]}')
+print(payload.ok, payload.count, payload.items[2] == zoid.json.null)
+```
+
 Supported methods and return values:
 
 - `zoid.file(path):read([max_bytes]) -> string`
 - `zoid.file(path):write(content) -> integer` (bytes written)
 - `zoid.file(path):delete() -> boolean` (`true` on success)
-- `zoid.uri(uri):get() -> { status: integer, body: string, ok: boolean }`
-- `zoid.uri(uri):post([body]) -> { status: integer, body: string, ok: boolean }`
-- `zoid.uri(uri):put([body]) -> { status: integer, body: string, ok: boolean }`
-- `zoid.uri(uri):delete() -> { status: integer, body: string, ok: boolean }`
+- `zoid.uri(uri):get([options]) -> { status: integer, body: string, ok: boolean }`
+- `zoid.uri(uri):post([body], [options]) -> { status: integer, body: string, ok: boolean }`
+- `zoid.uri(uri):put([body], [options]) -> { status: integer, body: string, ok: boolean }`
+- `zoid.uri(uri):delete([options]) -> { status: integer, body: string, ok: boolean }`
 - `zoid.config():list() -> { string, ... }` (sorted config keys)
 - `zoid.config():get(key) -> string | nil`
 - `zoid.config():set(key, value) -> boolean` (`true` on success)
 - `zoid.config():unset(key) -> boolean` (`true` if key existed and was removed)
+- `zoid.json.decode(json_text) -> any`
+- `zoid.json.null` sentinel value used when decoded JSON contains `null`
 
 ### APIs Removed or Disabled
 
@@ -104,8 +117,10 @@ Method-specific behavior:
 `zoid.uri(uri)` allows outbound HTTP/HTTPS requests:
 
 - Only `http://` and `https://` URIs are accepted
-- `:get()` and `:delete()` do not accept a request body
-- `:post([body])` and `:put([body])` accept an optional string body
+- `:get([options])` and `:delete([options])` do not accept a request body
+- `:post([body], [options])` and `:put([body], [options])` accept an optional string body
+- `options.headers` accepts a table of string header names to string values
+- Header names/values are validated (invalid bytes and dangerous headers are rejected)
 - Response body size is capped by sandbox policy
 
 ### Read Limits

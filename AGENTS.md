@@ -81,8 +81,10 @@ If you change command behavior, error handling, config format, or Lua execution 
   - `lua_execute` runs scripts via the embedded Lua runtime (`src/lua_runner.zig`) in-process, not via shell process execution, and only accepts `.lua` files under workspace root.
   - `lua_execute` must intercept Lua script output so it is never written to process stdout/stderr in TUI mode; instead surface captured streams in tool JSON (`stdout` and `stderr`, with truncation flags) so the agent can read outputs safely.
   - `http_get`/`http_post`/`http_put`/`http_delete` are direct HTTP(S) tools (no Lua script required); accepted input is a `uri` string plus optional `body` for `post`/`put`, and responses include `status` + `body` with `ok` reflecting 2xx status.
-  - In `lua_execute` tool-mode, remove `os`/`package`/`debug`/`require`/`dofile`/`loadfile`; expose `zoid.file(path):read([max_bytes])`, `zoid.file(path):write(content)`, `zoid.file(path):delete()`, `zoid.uri(uri):get/post/put/delete`, and `zoid.config():list/get/set/unset`.
+  - In `lua_execute` tool-mode, remove `os`/`package`/`debug`/`require`/`dofile`/`loadfile`; expose `zoid.file(path):read([max_bytes])`, `zoid.file(path):write(content)`, `zoid.file(path):delete()`, `zoid.uri(uri):get/post/put/delete`, `zoid.config():list/get/set/unset`, and `zoid.json.decode`.
   - `zoid.uri(uri)` allows only HTTP/HTTPS requests and returns a Lua table with `status`, `body`, and `ok`; response body capture is capped by sandbox policy (currently 1 MiB in `lua_execute`).
+  - `zoid.uri(...):get/delete/post/put` accept optional request options with `headers` table (string->string); header names/values are validated and dangerous overrides such as `Host`/`Content-Length` are rejected.
+  - `zoid.json.decode` maps JSON values to Lua tables/scalars and maps JSON `null` to the sentinel `zoid.json.null`.
   - Tool-mode `io` must be a minimal capture-only table (`io.write` and `io.stderr:write`) so scripts can emit stdout/stderr for agent inspection without gaining general file I/O APIs.
   - `shell_command` and `exec` are intentionally disabled for OpenAI tool calls; unknown/disabled tool calls must return `error.ToolDisabled`.
   - Keep path checks strict: resolve to canonical paths and reject access outside workspace root.
