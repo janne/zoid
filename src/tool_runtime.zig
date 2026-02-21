@@ -5,6 +5,7 @@ pub const sandbox_mode: []const u8 = "workspace-write";
 pub const enabled_tools = [_][]const u8{
     "filesystem_read",
     "filesystem_write",
+    "filesystem_delete",
     "lua_execute",
 };
 pub const disabled_tools = [_][]const u8{};
@@ -67,6 +68,9 @@ pub fn executeToolCall(
     }
     if (std.mem.eql(u8, tool_name, "filesystem_write")) {
         return executeFilesystemWrite(allocator, policy, arguments_json);
+    }
+    if (std.mem.eql(u8, tool_name, "filesystem_delete")) {
+        return executeFilesystemDelete(allocator, policy, arguments_json);
     }
     if (std.mem.eql(u8, tool_name, "lua_execute")) {
         return executeLuaExecute(allocator, policy, arguments_json);
@@ -178,6 +182,40 @@ fn executeFilesystemWrite(
     try writer.writeAll(",\"bytes_written\":");
     try writer.print("{d}", .{content.len});
     try writer.writeAll("}");
+
+    return output.toOwnedSlice();
+}
+
+fn executeFilesystemDelete(
+    allocator: std.mem.Allocator,
+    policy: *const Policy,
+    arguments_json: []const u8,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{});
+    defer parsed.deinit();
+
+    const root_object = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidToolArguments,
+    };
+
+    const requested_path = switch (root_object.get("path") orelse return error.InvalidToolArguments) {
+        .string => |value| value,
+        else => return error.InvalidToolArguments,
+    };
+
+    const resolved_path = try resolveAllowedReadPath(allocator, policy, requested_path);
+    defer allocator.free(resolved_path);
+
+    try std.fs.cwd().deleteFile(resolved_path);
+
+    var output = std.Io.Writer.Allocating.init(allocator);
+    errdefer output.deinit();
+
+    const writer = &output.writer;
+    try writer.writeAll("{\"ok\":true,\"tool\":\"filesystem_delete\",\"path\":");
+    try writeJsonString(allocator, writer, resolved_path);
+    try writer.writeAll(",\"deleted\":true}");
 
     return output.toOwnedSlice();
 }
@@ -347,7 +385,7 @@ test "buildPolicyJson emits required fields" {
     const root_object = parsed.value.object;
     try std.testing.expectEqualStrings("workspace-write", root_object.get("sandbox_mode").?.string);
     try std.testing.expectEqualStrings(policy.workspace_root, root_object.get("writable_roots").?.array.items[0].string);
-    try std.testing.expectEqual(@as(usize, 3), root_object.get("tools_enabled").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 4), root_object.get("tools_enabled").?.array.items.len);
 }
 
 test "filesystem write and read stay within workspace root" {
@@ -401,6 +439,69 @@ test "filesystem write rejects traversal outside workspace root" {
             &policy,
             "filesystem_write",
             "{\"path\":\"../outside.txt\",\"content\":\"blocked\"}",
+        ),
+    );
+}
+
+test "filesystem delete removes file within workspace root" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+
+    const write_result = try executeToolCall(
+        std.testing.allocator,
+        &policy,
+        "filesystem_write",
+        "{\"path\":\"to-delete.txt\",\"content\":\"trash\"}",
+    );
+    defer std.testing.allocator.free(write_result);
+
+    const delete_result = try executeToolCall(
+        std.testing.allocator,
+        &policy,
+        "filesystem_delete",
+        "{\"path\":\"to-delete.txt\"}",
+    );
+    defer std.testing.allocator.free(delete_result);
+
+    var parsed_delete = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, delete_result, .{});
+    defer parsed_delete.deinit();
+
+    const delete_object = parsed_delete.value.object;
+    try std.testing.expect(delete_object.get("ok").?.bool);
+    try std.testing.expectEqualStrings("filesystem_delete", delete_object.get("tool").?.string);
+    try std.testing.expect(delete_object.get("deleted").?.bool);
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(delete_object.get("path").?.string, .{}));
+}
+
+test "filesystem delete rejects traversal outside workspace root" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("workspace");
+
+    const outside_file = try tmp.dir.createFile("outside.txt", .{});
+    defer outside_file.close();
+    try outside_file.writeAll("keep me");
+
+    const workspace_path = try tmp.dir.realpathAlloc(std.testing.allocator, "workspace");
+    defer std.testing.allocator.free(workspace_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, workspace_path);
+    defer policy.deinit(std.testing.allocator);
+
+    try std.testing.expectError(
+        error.PathNotAllowed,
+        executeToolCall(
+            std.testing.allocator,
+            &policy,
+            "filesystem_delete",
+            "{\"path\":\"../outside.txt\"}",
         ),
     );
 }

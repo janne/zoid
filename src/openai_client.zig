@@ -276,6 +276,8 @@ fn buildChatCompletionsPayloadWithTools(
     try writer.writeAll(",");
     try writeFilesystemWriteToolDefinition(allocator, writer, policy.workspace_root);
     try writer.writeAll(",");
+    try writeFilesystemDeleteToolDefinition(allocator, writer, policy.workspace_root);
+    try writer.writeAll(",");
     try writeLuaExecuteToolDefinition(allocator, writer, policy.workspace_root);
     try writer.writeAll("],\"tool_choice\":\"auto\"}");
 
@@ -314,6 +316,23 @@ fn writeFilesystemWriteToolDefinition(
     try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"filesystem_write\",\"description\":");
     try writeJsonString(allocator, writer, description);
     try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"],\"additionalProperties\":false}}}");
+}
+
+fn writeFilesystemDeleteToolDefinition(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    workspace_root: []const u8,
+) !void {
+    const description = try std.fmt.allocPrint(
+        allocator,
+        "Delete a file under workspace root {s}. Path must resolve inside this root.",
+        .{workspace_root},
+    );
+    defer allocator.free(description);
+
+    try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"filesystem_delete\",\"description\":");
+    try writeJsonString(allocator, writer, description);
+    try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false}}}");
 }
 
 fn writeLuaExecuteToolDefinition(
@@ -570,10 +589,11 @@ test "buildChatCompletionsPayload creates valid payload" {
     try std.testing.expectEqualStrings("general kenobi", payload_messages[1].object.get("content").?.string);
 
     const tools = root.get("tools").?.array.items;
-    try std.testing.expectEqual(@as(usize, 3), tools.len);
+    try std.testing.expectEqual(@as(usize, 4), tools.len);
     try std.testing.expectEqualStrings("filesystem_read", tools[0].object.get("function").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("filesystem_write", tools[1].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("lua_execute", tools[2].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("filesystem_delete", tools[2].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("lua_execute", tools[3].object.get("function").?.object.get("name").?.string);
 }
 
 test "parseAssistantReply extracts assistant content" {
