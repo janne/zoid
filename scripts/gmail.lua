@@ -1,12 +1,129 @@
--- gmail_latest_unread.lua
---
--- Reads Gmail OAuth credentials from Zoid config, exchanges refresh token for
--- an access token, and prints the latest unread inbox message.
+-- scripts/gmail.lua
+-- Gmail message listing utility using Zoid's sandboxed HTTP + config APIs.
 --
 -- Required config keys:
 -- - GMAIL_CLIENT_ID
 -- - GMAIL_CLIENT_SECRET
 -- - GMAIL_REFRESH_TOKEN
+--
+-- Usage:
+--   zoid execute scripts/gmail.lua [options]
+--   lua scripts/gmail.lua [options]
+--
+-- Options:
+--   -q, --query <query>      Gmail search query (default: "is:unread in:inbox")
+--   -n, --limit <count>      Number of messages to fetch (1-500, default: 20)
+--   --id <message_id>        Fetch only one specific message id
+--   --labels                 Include label ids in output
+--   -h, --help               Show usage
+
+local function usage()
+  print("Usage: gmail.lua [options]")
+  print("Options:")
+  print("  -q, --query <query>      Gmail search query (default: \"is:unread in:inbox\")")
+  print("  -n, --limit <count>      Number of messages to fetch (1-500, default: 20)")
+  print("  --id <message_id>        Fetch only one specific message id")
+  print("  --labels                 Include label ids in output")
+  print("  -h, --help               Show usage")
+end
+
+local function collect_args()
+  if type(arg) ~= "table" then
+    return {}
+  end
+
+  local indexed = {}
+  for key, value in pairs(arg) do
+    if type(key) == "number" and key > 0 and type(value) == "string" then
+      table.insert(indexed, { key = key, value = value })
+    end
+  end
+
+  table.sort(indexed, function(a, b)
+    return a.key < b.key
+  end)
+
+  local values = {}
+  for _, entry in ipairs(indexed) do
+    table.insert(values, entry.value)
+  end
+  return values
+end
+
+local function parse_positive_integer(raw, flag_name)
+  local value = tonumber(raw)
+  if value == nil or value < 1 or value > 500 or math.floor(value) ~= value then
+    io.stderr:write("Invalid value for ", flag_name, ": ", tostring(raw), " (expected integer in range 1-500)\n")
+    return nil
+  end
+  return value
+end
+
+local function parse_options()
+  local options = {
+    query = "is:unread in:inbox",
+    limit = 20,
+    include_labels = false,
+    message_id = nil,
+  }
+
+  local args = collect_args()
+  local index = 1
+  while index <= #args do
+    local token = args[index]
+
+    if token == "-h" or token == "--help" then
+      usage()
+      return nil, true
+    elseif token == "--labels" then
+      options.include_labels = true
+    elseif token == "-q" or token == "--query" then
+      local value = args[index + 1]
+      if type(value) ~= "string" or value == "" then
+        io.stderr:write("Missing value for ", token, "\n")
+        usage()
+        return nil, false
+      end
+      options.query = value
+      index = index + 1
+    elseif token == "-n" or token == "--limit" then
+      local value = args[index + 1]
+      if type(value) ~= "string" or value == "" then
+        io.stderr:write("Missing value for ", token, "\n")
+        usage()
+        return nil, false
+      end
+      local parsed = parse_positive_integer(value, token)
+      if parsed == nil then
+        usage()
+        return nil, false
+      end
+      options.limit = parsed
+      index = index + 1
+    elseif token == "--id" then
+      local value = args[index + 1]
+      if type(value) ~= "string" or value == "" then
+        io.stderr:write("Missing value for --id\n")
+        usage()
+        return nil, false
+      end
+      options.message_id = value
+      index = index + 1
+    elseif string.sub(token, 1, 1) == "-" then
+      io.stderr:write("Unknown option: ", token, "\n")
+      usage()
+      return nil, false
+    else
+      io.stderr:write("Unexpected argument: ", token, "\n")
+      usage()
+      return nil, false
+    end
+
+    index = index + 1
+  end
+
+  return options, false
+end
 
 local function require_config(cfg, key)
   local value = cfg:get(key)
@@ -101,10 +218,9 @@ local function fetch_access_token(cfg)
   return access_token
 end
 
-local function fetch_unread_message_ids(access_token, limit)
-  local query = url_encode("is:unread in:inbox")
+local function fetch_message_ids(access_token, query, limit)
   local list_uri = "https://gmail.googleapis.com/gmail/v1/users/me/messages?q=" ..
-    query ..
+    url_encode(query) ..
     "&maxResults=" ..
     tostring(limit)
 
@@ -115,10 +231,10 @@ local function fetch_unread_message_ids(access_token, limit)
     },
   })
   if not list_response.ok then
-    fail_http("List unread inbox messages", list_response)
+    fail_http("List messages", list_response)
   end
 
-  local list_payload = decode_json("List unread inbox messages", list_response.body)
+  local list_payload = decode_json("List messages", list_response.body)
   local messages = list_payload.messages
   if messages == nil or #messages == 0 then
     return {}
@@ -136,7 +252,7 @@ end
 
 local function fetch_message_details(access_token, message_id)
   if type(message_id) ~= "string" or message_id == "" then
-    error("Gmail list response did not include a valid message id")
+    error("Message id must be a non-empty string")
   end
 
   local detail_uri = "https://gmail.googleapis.com/gmail/v1/users/me/messages/" ..
@@ -162,7 +278,7 @@ local function fetch_message_details(access_token, message_id)
   local category = detect_category(label_ids)
 
   return {
-    id = message_id,
+    id = detail_payload.id or message_id,
     thread_id = detail_payload.threadId or "",
     from = header_value(headers, "From"),
     subject = header_value(headers, "Subject"),
@@ -176,8 +292,8 @@ local function fetch_message_details(access_token, message_id)
   }
 end
 
-local function fetch_latest_unread_messages(access_token, limit)
-  local ids = fetch_unread_message_ids(access_token, limit)
+local function fetch_messages(access_token, query, limit)
+  local ids = fetch_message_ids(access_token, query, limit)
   local entries = {}
   for _, message_id in ipairs(ids) do
     table.insert(entries, fetch_message_details(access_token, message_id))
@@ -185,17 +301,7 @@ local function fetch_latest_unread_messages(access_token, limit)
   return entries
 end
 
-local config = zoid.config()
-local token = fetch_access_token(config)
-local latest = fetch_latest_unread_messages(token, 50)
-
-if #latest == 0 then
-  print("No unread messages in inbox.")
-  return
-end
-
-print("Latest unread messages (" .. tostring(#latest) .. "):")
-for _, message in ipairs(latest) do
+local function print_message(message, include_labels)
   print("---")
   print("ID:", message.id)
   print("Thread ID:", message.thread_id)
@@ -208,10 +314,39 @@ for _, message in ipairs(latest) do
   if message.category ~= "" then
     print("Category:", message.category)
   end
-  if #message.label_ids > 0 then
+  if include_labels and #message.label_ids > 0 then
     print("Labels:", table.concat(message.label_ids, ","))
   end
   if message.snippet ~= "" then
     print("Snippet:", message.snippet)
   end
+end
+
+local options, did_help = parse_options()
+if options == nil then
+  if did_help then
+    return
+  end
+  error("Invalid arguments")
+end
+
+local config = zoid.config()
+local token = fetch_access_token(config)
+
+if options.message_id ~= nil then
+  print("Message details:")
+  local message = fetch_message_details(token, options.message_id)
+  print_message(message, options.include_labels)
+  return
+end
+
+local messages = fetch_messages(token, options.query, options.limit)
+if #messages == 0 then
+  print("No messages matched query:", options.query)
+  return
+end
+
+print("Messages (" .. tostring(#messages) .. ") for query: " .. options.query)
+for _, message in ipairs(messages) do
+  print_message(message, options.include_labels)
 end

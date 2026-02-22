@@ -3,30 +3,20 @@
 ## Purpose
 Zoid is a Zig CLI project with embedded Lua support.
 
-`README.md` describes the long-term product vision (simple, lightweight, secure OpenClaw alternative). Treat that vision as direction, not as a statement of already shipped features.
-
-## Current Implementation (Source of Truth: `src/`)
-Today the project provides:
+## Implementation
+The project provides:
 - A CLI binary (`zoid`) with command parsing in `src/cli.zig` and app entrypoint in `src/main.zig`.
 - Lua script execution via `zoid execute <file.lua>` in `src/lua_runner.zig`.
 - JSON config key/value storage via `zoid config set|get|unset|list` in `src/config_store.zig`.
-- OpenAI chat + one-shot run flows in `src/openai_client.zig` and `src/chat_session.zig`, including local tools (`filesystem_read`, `filesystem_list`, `filesystem_write`, `filesystem_delete`, `lua_execute`, `config`, `http_get`, `http_post`, `http_put`, `http_delete`) with workspace-root policy handling via `src/tool_runtime.zig`.
 - Service mode via `zoid serve` in `src/telegram_bot.zig` (currently Telegram long-polling), forwarding incoming text messages to OpenAI one-shot responses and replying with `sendMessage`.
+- OpenAI chat + one-shot run flows in `src/openai_client.zig` and `src/chat_session.zig`, including local tools (`filesystem_read`, `filesystem_list`, `filesystem_write`, `filesystem_delete`, `lua_execute`, `config`, `http_get`, `http_post`, `http_put`, `http_delete`) with workspace-root policy handling via `src/tool_runtime.zig`.
 - Shared OpenAI model policy in `src/model_catalog.zig` (default model, picker fallback models, and chat-model ID filtering rules).
 - Build + test pipeline in `build.zig`, including embedded Lua (static library from dependency `lua` in `build.zig.zon`).
 
-Not implemented yet (vision-stage in `README.md`):
-- E2E chat encryption flows.
-- Encrypted key vault + gateway unlock flow.
-- Daemon/gateway product behavior described at a higher level.
-
-When documentation conflicts, prefer:
-1. `src/` and tests for current behavior.
-2. `README.md` for long-term intent.
+When documentation conflicts, prefer: `src/` and tests for current behavior.
 
 ## Engineering Rules
 - Keep all code, commit messages, and user-facing copy in English.
-- Always write commit messages in English.
 - Keep this `AGENTS.md` file updated whenever adding code or changing behavior.
 - Keep `docs/lua_api.md` updated when Lua runtime behavior or Lua sandbox APIs change.
 - Add notable implementation learnings to `AGENTS.md` so future changes can reuse them.
@@ -48,14 +38,16 @@ When documentation conflicts, prefer:
 If you change command behavior, error handling, config format, or Lua execution behavior, add/update tests in the corresponding Zig files.
 
 ## Practical Change Guidance
-- CLI changes:
+
+### CLI changes:
   - Update parsing + help text in `src/cli.zig`.
   - Update execution flow and user-visible errors in `src/main.zig`.
   - `zoid execute <file.lua> [args...]` must forward extra positional args to Lua global `arg` (`arg[0]` script path, `arg[1..]` forwarded args).
   - `zoid execute <file.lua>` must use the same sandbox restrictions and `.lua` path policy as `lua_execute` so local script runs match tool-mode behavior.
   - Default command is `chat` when running `zoid` with no arguments.
   - `zoid serve` is the long-running service entrypoint; currently it requires both `OPENAI_API_KEY` and `TELEGRAM_BOT_TOKEN` in config and runs a Telegram long-polling loop until interrupted.
-- Chat interface changes:
+
+### Chat interface changes:
   - `src/chat_session.zig` now uses fullscreen `libvaxis` UI in the alternate screen when running on a TTY, with `vaxis.widgets.TextInput` handling readline-style editing (`Ctrl+A`, `Ctrl+E`, arrows, backspace/delete).
   - When submitting chat input, snapshot text with `snapshotInputText`/`takeInputText` and then clear the widget; avoid `TextInput.toOwnedSlice()` in the live TUI loop to prevent input buffer corruption/ghost text rendering.
   - Sanitize transcript text before rendering: strip ANSI escape sequences, normalize `\r`/`\r\n` to `\n`, replace tabs with spaces, and replace other control bytes with spaces to avoid terminal state corruption from model/tool output.
@@ -69,13 +61,15 @@ If you change command behavior, error handling, config format, or Lua execution 
   - Assistant/error transcript rendering strips Markdown backtick delimiters and draws inline/fenced code with dedicated styles (no literal `` ` ``/``` fences shown).
   - `build.zig` must import the `vaxis` module into the `zoid` module for `@import("vaxis")` usage inside `src/`.
   - Model picker fallback models come from `src/model_catalog.zig` (`fallback_models`).
-- OpenAI model policy changes:
+
+### OpenAI model policy changes:
   - Keep `src/model_catalog.zig` as the single source of truth for `default_model`, `fallback_models`, and `isChatModelId`.
   - `src/openai_client.zig` should use `model_catalog.isChatModelId` when filtering `/v1/models` results.
   - `src/main.zig` should use `model_catalog.default_model` when `OPENAI_MODEL` is unset.
   - `src/chat_session.zig` should use `model_catalog.fallback_models` for picker fallback choices.
   - Keep model catalog invariants covered by tests (`default_model` included in `fallback_models`, fallback IDs unique, fallback IDs chat-capable).
-- Tool runtime changes:
+
+### Tool runtime changes:
   - `src/tool_runtime.zig` enforces `workspace-write` policy rooted at current working directory and exposes `filesystem_read`, `filesystem_list`, `filesystem_write`, `filesystem_delete`, `lua_execute`, `config`, `http_get`, `http_post`, `http_put`, and `http_delete`.
   - Shared filesystem sandbox/path enforcement and metadata/listing logic lives in `src/workspace_fs.zig`; both `lua_execute` (`zoid.file(...)` / `zoid.dir(...)`) and direct filesystem tools must use this module.
   - Shared outbound HTTP request behavior lives in `src/http_client.zig`; both `lua_execute` (`zoid.uri(...)`) and direct HTTP tools must use this module to avoid divergence.
@@ -91,15 +85,20 @@ If you change command behavior, error handling, config format, or Lua execution 
   - Tool-mode `io` must be a minimal capture-only table (`io.write` and `io.stderr:write`) so scripts can emit stdout/stderr for agent inspection without gaining general file I/O APIs.
   - `shell_command` and `exec` are intentionally disabled for OpenAI tool calls; unknown/disabled tool calls must return `error.ToolDisabled`.
   - Keep path checks strict: resolve to canonical paths and reject access outside workspace root.
-- Config changes:
+
+### Config changes:
   - Preserve valid JSON object format (string keys and string values).
   - Keep deterministic key listing behavior (`list` is currently sorted).
   - Keep OpenAI and Telegram config key names centralized in `src/config_keys.zig` and reuse those constants in command/chat code paths.
-- Lua runner changes:
+
+### Lua runner changes:
   - Keep clear load/runtime error reporting.
   - Preserve current error contract (`LuaStateInitFailed`, `LuaLoadFailed`, `LuaRuntimeFailed`).
-- Lua script examples (`scripts/*.lua`) changes:
+
+### Lua script examples (`scripts/*.lua`) changes:
   - Keep scripts compatible with the sandboxed `zoid` API surface (`zoid.file`, `zoid.dir`, `zoid.uri`, `zoid.config`, `zoid.json`) and do not rely on removed globals like `os`/`package`/`require`.
   - `zoid execute <file.lua> [args...]` exposes Lua global `arg` with `arg[0]` as script path and `arg[1..]` as forwarded positional arguments.
-- Public module surface:
+  - `scripts/gmail.lua` is a CLI-style utility; it supports `--query`, `--limit`, `--id`, and `--labels`, with default query `is:unread in:inbox`.
+
+### Public module surface:
   - Keep `src/root.zig` exports aligned with intended package API.
