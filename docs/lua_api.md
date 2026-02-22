@@ -24,7 +24,7 @@ Lua run through Zoid has a `zoid` global with:
 - `zoid.dir(path)` directory handles with metadata
 - `zoid.uri(uri)` HTTP request handles
 - `zoid.config()` config handles
-- `zoid.schedule` scheduler handles
+- `zoid.jobs` scheduler handles
 - `zoid.json.decode(json_text)` JSON decoder
 
 File example:
@@ -81,20 +81,20 @@ print(payload.ok, payload.count, payload.items[2] == zoid.json.null)
 Scheduler example:
 
 ```lua
-local created = zoid.schedule.create({
+local created = zoid.jobs.create({
   job_type = "lua",
   path = "scripts/clean_up_docs.lua",
   cron = "0 21 * * *"
 })
 
 print(created.id, created.next_run_at)
-for _, job in ipairs(zoid.schedule.list()) do
+for _, job in ipairs(zoid.jobs.list()) do
   print(job.id, job.job_type, job.path, job.paused)
 end
 
-zoid.schedule.pause(created.id)
-zoid.schedule.resume(created.id)
-zoid.schedule.delete(created.id)
+zoid.jobs.pause(created.id)
+zoid.jobs.resume(created.id)
+zoid.jobs.delete(created.id)
 ```
 
 Supported methods and return values:
@@ -113,11 +113,11 @@ Supported methods and return values:
 - `zoid.config():get(key) -> string | nil`
 - `zoid.config():set(key, value) -> boolean` (`true` on success)
 - `zoid.config():unset(key) -> boolean` (`true` if key existed and was removed)
-- `zoid.schedule.create({ job_type, path, run_at?, cron? }) -> job`
-- `zoid.schedule.list() -> { job, ... }`
-- `zoid.schedule.delete(job_id) -> boolean`
-- `zoid.schedule.pause(job_id) -> boolean`
-- `zoid.schedule.resume(job_id) -> boolean`
+- `zoid.jobs.create({ job_type, path, run_at?, cron? }) -> job`
+- `zoid.jobs.list() -> { job, ... }`
+- `zoid.jobs.delete(job_id) -> boolean`
+- `zoid.jobs.pause(job_id) -> boolean`
+- `zoid.jobs.resume(job_id) -> boolean`
 - `zoid.json.decode(json_text) -> any`
 - `zoid.json.null` sentinel value used when decoded JSON contains `null`
 
@@ -187,7 +187,7 @@ Method-specific behavior:
 
 ### Scheduler Rules
 
-`zoid.schedule.create` enforces:
+`zoid.jobs.create` enforces:
 
 - `job_type` must be `"lua"` or `"markdown"`
 - `path` must resolve inside workspace root

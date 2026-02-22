@@ -36,18 +36,18 @@ pub fn main() !void {
                 zoid.cli.printHelp();
                 return;
             },
-            error.MissingScheduleSubcommand => {
-                std.debug.print("Missing subcommand for 'schedule'.\n\n", .{});
+            error.MissingJobsSubcommand => {
+                std.debug.print("Missing subcommand for 'jobs'.\n\n", .{});
                 zoid.cli.printHelp();
                 return;
             },
-            error.MissingScheduleArgument => {
-                std.debug.print("Missing argument for schedule command.\n\n", .{});
+            error.MissingJobsArgument => {
+                std.debug.print("Missing argument for jobs command.\n\n", .{});
                 zoid.cli.printHelp();
                 return;
             },
-            error.InvalidScheduleArguments => {
-                std.debug.print("Invalid arguments for schedule command.\n\n", .{});
+            error.InvalidJobsArguments => {
+                std.debug.print("Invalid arguments for jobs command.\n\n", .{});
                 zoid.cli.printHelp();
                 return;
             },
@@ -56,8 +56,8 @@ pub fn main() !void {
                 zoid.cli.printHelp();
                 return;
             },
-            error.UnknownScheduleSubcommand => {
-                std.debug.print("Unknown schedule command: {s}\n\n", .{args[2]});
+            error.UnknownJobsSubcommand => {
+                std.debug.print("Unknown jobs command: {s}\n\n", .{args[2]});
                 zoid.cli.printHelp();
                 return;
             },
@@ -168,7 +168,7 @@ pub fn main() !void {
                 }
             },
         },
-        .schedule => |schedule_cmd| {
+        .jobs => |jobs_cmd| {
             const workspace_root = getWorkspaceRoot(allocator) catch |err| {
                 std.debug.print("Failed to resolve workspace root: {s}\n", .{@errorName(err)});
                 std.process.exit(1);
@@ -179,7 +179,7 @@ pub fn main() !void {
                 .workspace_root = workspace_root,
             };
 
-            switch (schedule_cmd) {
+            switch (jobs_cmd) {
                 .create => |create_cmd| {
                     var created = zoid.scheduler_runtime.createJob(
                         allocator,

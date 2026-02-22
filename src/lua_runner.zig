@@ -944,12 +944,12 @@ fn pushLuaSchedulerJobTable(state: *c.lua_State, job: *const scheduler_store.Job
     c.lua_setfield(state, -2, "last_run_at");
 }
 
-fn luaZoidScheduleCreate(lua_state: ?*c.lua_State) callconv(.c) c_int {
+fn luaZoidJobsCreate(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
     const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
 
     if (c.lua_type(state, 1) != c.LUA_TTABLE) {
-        return pushLuaErrorMessage(state, "zoid.schedule.create requires a table argument", .{});
+        return pushLuaErrorMessage(state, "zoid.jobs.create requires a table argument", .{});
     }
     const options_index = c.lua_absindex(state, 1);
 
@@ -957,11 +957,11 @@ fn luaZoidScheduleCreate(lua_state: ?*c.lua_State) callconv(.c) c_int {
     var job_type_len: usize = 0;
     const job_type_ptr = c.lua_tolstring(state, -1, &job_type_len) orelse {
         luaPop(state, 1);
-        return pushLuaErrorMessage(state, "zoid.schedule.create requires job_type", .{});
+        return pushLuaErrorMessage(state, "zoid.jobs.create requires job_type", .{});
     };
     const job_type_value = env.allocator.dupe(u8, job_type_ptr[0..job_type_len]) catch |err| {
         luaPop(state, 1);
-        return pushLuaErrorMessage(state, "zoid.schedule.create failed: {s}", .{@errorName(err)});
+        return pushLuaErrorMessage(state, "zoid.jobs.create failed: {s}", .{@errorName(err)});
     };
     defer env.allocator.free(job_type_value);
     luaPop(state, 1);
@@ -970,11 +970,11 @@ fn luaZoidScheduleCreate(lua_state: ?*c.lua_State) callconv(.c) c_int {
     var path_len: usize = 0;
     const path_ptr = c.lua_tolstring(state, -1, &path_len) orelse {
         luaPop(state, 1);
-        return pushLuaErrorMessage(state, "zoid.schedule.create requires path", .{});
+        return pushLuaErrorMessage(state, "zoid.jobs.create requires path", .{});
     };
     const path_value = env.allocator.dupe(u8, path_ptr[0..path_len]) catch |err| {
         luaPop(state, 1);
-        return pushLuaErrorMessage(state, "zoid.schedule.create failed: {s}", .{@errorName(err)});
+        return pushLuaErrorMessage(state, "zoid.jobs.create failed: {s}", .{@errorName(err)});
     };
     defer env.allocator.free(path_value);
     luaPop(state, 1);
@@ -989,12 +989,12 @@ fn luaZoidScheduleCreate(lua_state: ?*c.lua_State) callconv(.c) c_int {
             const run_at_ptr = c.lua_tolstring(state, -1, &run_at_len) orelse unreachable;
             run_at_value = env.allocator.dupe(u8, run_at_ptr[0..run_at_len]) catch |err| {
                 luaPop(state, 1);
-                return pushLuaErrorMessage(state, "zoid.schedule.create failed: {s}", .{@errorName(err)});
+                return pushLuaErrorMessage(state, "zoid.jobs.create failed: {s}", .{@errorName(err)});
             };
         },
         else => {
             luaPop(state, 1);
-            return pushLuaErrorMessage(state, "zoid.schedule.create run_at must be a string", .{});
+            return pushLuaErrorMessage(state, "zoid.jobs.create run_at must be a string", .{});
         },
     }
     luaPop(state, 1);
@@ -1009,18 +1009,18 @@ fn luaZoidScheduleCreate(lua_state: ?*c.lua_State) callconv(.c) c_int {
             const cron_ptr = c.lua_tolstring(state, -1, &cron_len) orelse unreachable;
             cron_value = env.allocator.dupe(u8, cron_ptr[0..cron_len]) catch |err| {
                 luaPop(state, 1);
-                return pushLuaErrorMessage(state, "zoid.schedule.create failed: {s}", .{@errorName(err)});
+                return pushLuaErrorMessage(state, "zoid.jobs.create failed: {s}", .{@errorName(err)});
             };
         },
         else => {
             luaPop(state, 1);
-            return pushLuaErrorMessage(state, "zoid.schedule.create cron must be a string", .{});
+            return pushLuaErrorMessage(state, "zoid.jobs.create cron must be a string", .{});
         },
     }
     luaPop(state, 1);
 
     const job_type = scheduler_store.parseJobType(job_type_value) catch {
-        return pushLuaErrorMessage(state, "zoid.schedule.create job_type must be 'lua' or 'markdown'", .{});
+        return pushLuaErrorMessage(state, "zoid.jobs.create job_type must be 'lua' or 'markdown'", .{});
     };
 
     var job = scheduler_runtime.createJob(
@@ -1033,7 +1033,7 @@ fn luaZoidScheduleCreate(lua_state: ?*c.lua_State) callconv(.c) c_int {
             .cron = cron_value,
         },
     ) catch |err| {
-        return pushLuaErrorMessage(state, "zoid.schedule.create failed: {s}", .{@errorName(err)});
+        return pushLuaErrorMessage(state, "zoid.jobs.create failed: {s}", .{@errorName(err)});
     };
     defer job.deinit(env.allocator);
 
@@ -1041,7 +1041,7 @@ fn luaZoidScheduleCreate(lua_state: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-fn luaZoidScheduleList(lua_state: ?*c.lua_State) callconv(.c) c_int {
+fn luaZoidJobsList(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
     const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
 
@@ -1049,7 +1049,7 @@ fn luaZoidScheduleList(lua_state: ?*c.lua_State) callconv(.c) c_int {
         env.allocator,
         .{ .workspace_root = env.workspace_root },
     ) catch |err| {
-        return pushLuaErrorMessage(state, "zoid.schedule.list failed: {s}", .{@errorName(err)});
+        return pushLuaErrorMessage(state, "zoid.jobs.list failed: {s}", .{@errorName(err)});
     };
     defer scheduler_store.deinitJobs(env.allocator, jobs);
 
@@ -1062,12 +1062,12 @@ fn luaZoidScheduleList(lua_state: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-fn luaZoidScheduleDelete(lua_state: ?*c.lua_State) callconv(.c) c_int {
+fn luaZoidJobsDelete(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
     const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
 
     var job_id_len: usize = 0;
-    const job_id_ptr = c.luaL_checklstring(state, 1, &job_id_len) orelse return pushLuaErrorMessage(state, "zoid.schedule.delete requires job id", .{});
+    const job_id_ptr = c.luaL_checklstring(state, 1, &job_id_len) orelse return pushLuaErrorMessage(state, "zoid.jobs.delete requires job id", .{});
     const job_id = job_id_ptr[0..job_id_len];
 
     const removed = scheduler_runtime.deleteJob(
@@ -1075,19 +1075,19 @@ fn luaZoidScheduleDelete(lua_state: ?*c.lua_State) callconv(.c) c_int {
         .{ .workspace_root = env.workspace_root },
         job_id,
     ) catch |err| {
-        return pushLuaErrorMessage(state, "zoid.schedule.delete failed: {s}", .{@errorName(err)});
+        return pushLuaErrorMessage(state, "zoid.jobs.delete failed: {s}", .{@errorName(err)});
     };
 
     c.lua_pushboolean(state, if (removed) 1 else 0);
     return 1;
 }
 
-fn luaZoidSchedulePause(lua_state: ?*c.lua_State) callconv(.c) c_int {
+fn luaZoidJobsPause(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
     const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
 
     var job_id_len: usize = 0;
-    const job_id_ptr = c.luaL_checklstring(state, 1, &job_id_len) orelse return pushLuaErrorMessage(state, "zoid.schedule.pause requires job id", .{});
+    const job_id_ptr = c.luaL_checklstring(state, 1, &job_id_len) orelse return pushLuaErrorMessage(state, "zoid.jobs.pause requires job id", .{});
     const job_id = job_id_ptr[0..job_id_len];
 
     const updated = scheduler_runtime.pauseJob(
@@ -1095,19 +1095,19 @@ fn luaZoidSchedulePause(lua_state: ?*c.lua_State) callconv(.c) c_int {
         .{ .workspace_root = env.workspace_root },
         job_id,
     ) catch |err| {
-        return pushLuaErrorMessage(state, "zoid.schedule.pause failed: {s}", .{@errorName(err)});
+        return pushLuaErrorMessage(state, "zoid.jobs.pause failed: {s}", .{@errorName(err)});
     };
 
     c.lua_pushboolean(state, if (updated) 1 else 0);
     return 1;
 }
 
-fn luaZoidScheduleResume(lua_state: ?*c.lua_State) callconv(.c) c_int {
+fn luaZoidJobsResume(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
     const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
 
     var job_id_len: usize = 0;
-    const job_id_ptr = c.luaL_checklstring(state, 1, &job_id_len) orelse return pushLuaErrorMessage(state, "zoid.schedule.resume requires job id", .{});
+    const job_id_ptr = c.luaL_checklstring(state, 1, &job_id_len) orelse return pushLuaErrorMessage(state, "zoid.jobs.resume requires job id", .{});
     const job_id = job_id_ptr[0..job_id_len];
 
     const updated = scheduler_runtime.resumeJob(
@@ -1115,26 +1115,26 @@ fn luaZoidScheduleResume(lua_state: ?*c.lua_State) callconv(.c) c_int {
         .{ .workspace_root = env.workspace_root },
         job_id,
     ) catch |err| {
-        return pushLuaErrorMessage(state, "zoid.schedule.resume failed: {s}", .{@errorName(err)});
+        return pushLuaErrorMessage(state, "zoid.jobs.resume failed: {s}", .{@errorName(err)});
     };
 
     c.lua_pushboolean(state, if (updated) 1 else 0);
     return 1;
 }
 
-fn luaZoidSchedule(lua_state: ?*c.lua_State) callconv(.c) c_int {
+fn luaZoidJobs(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
 
     c.lua_newtable(state);
-    c.lua_pushcclosure(state, luaZoidScheduleCreate, 0);
+    c.lua_pushcclosure(state, luaZoidJobsCreate, 0);
     c.lua_setfield(state, -2, "create");
-    c.lua_pushcclosure(state, luaZoidScheduleList, 0);
+    c.lua_pushcclosure(state, luaZoidJobsList, 0);
     c.lua_setfield(state, -2, "list");
-    c.lua_pushcclosure(state, luaZoidScheduleDelete, 0);
+    c.lua_pushcclosure(state, luaZoidJobsDelete, 0);
     c.lua_setfield(state, -2, "delete");
-    c.lua_pushcclosure(state, luaZoidSchedulePause, 0);
+    c.lua_pushcclosure(state, luaZoidJobsPause, 0);
     c.lua_setfield(state, -2, "pause");
-    c.lua_pushcclosure(state, luaZoidScheduleResume, 0);
+    c.lua_pushcclosure(state, luaZoidJobsResume, 0);
     c.lua_setfield(state, -2, "resume");
     return 1;
 }
@@ -1216,8 +1216,8 @@ fn installZoidTable(lua_state: *c.lua_State, sandbox: *ToolLuaEnvironment) void 
     c.lua_setfield(lua_state, -2, "uri");
     c.lua_pushcclosure(lua_state, luaZoidConfig, 0);
     c.lua_setfield(lua_state, -2, "config");
-    c.lua_pushcclosure(lua_state, luaZoidSchedule, 0);
-    c.lua_setfield(lua_state, -2, "schedule");
+    c.lua_pushcclosure(lua_state, luaZoidJobs, 0);
+    c.lua_setfield(lua_state, -2, "jobs");
     _ = luaZoidJson(lua_state);
     c.lua_setfield(lua_state, -2, "json");
     _ = c.lua_setglobal(lua_state, "zoid");
@@ -2064,7 +2064,7 @@ test "executeLuaFileCaptureOutputTool reports json decode parse errors" {
     try std.testing.expect(std.mem.indexOf(u8, output.stderr, "zoid.json.decode failed") != null);
 }
 
-test "executeLuaFileCaptureOutputTool supports zoid schedule api" {
+test "executeLuaFileCaptureOutputTool supports zoid jobs api" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2075,17 +2075,17 @@ test "executeLuaFileCaptureOutputTool supports zoid schedule api" {
     const script = try tmp.dir.createFile("schedule.lua", .{});
     defer script.close();
     try script.writeAll(
-        \\local created = zoid.schedule.create({
+        \\local created = zoid.jobs.create({
         \\  job_type = "markdown",
         \\  path = "note.md",
         \\  run_at = "2026-01-10T10:00:00Z"
         \\})
         \\print(created.job_type)
-        \\print(#zoid.schedule.list())
-        \\print(zoid.schedule.pause(created.id))
-        \\print(zoid.schedule.resume(created.id))
-        \\print(zoid.schedule.delete(created.id))
-        \\print(#zoid.schedule.list())
+        \\print(#zoid.jobs.list())
+        \\print(zoid.jobs.pause(created.id))
+        \\print(zoid.jobs.resume(created.id))
+        \\print(zoid.jobs.delete(created.id))
+        \\print(#zoid.jobs.list())
         \\
     );
 

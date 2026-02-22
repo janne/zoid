@@ -26,25 +26,24 @@ A simple, lightweight, secure alternative to OpenClaw. Built on Zig and Lua.
 
 Zoid includes a shared scheduler backend that can be used from:
 
-- `zoid schedule ...` CLI commands
-- AI tool calls (`scheduler`)
-- Lua (`zoid.schedule.*`)
+- `zoid jobs ...` CLI commands
+- AI tool calls (`jobs`)
+- Lua (`zoid.jobs.*`)
 
 Examples:
 
 ```sh
-zoid schedule create --lua scripts/clean_up_docs.lua --cron "0 21 * * *"
-zoid schedule create --md reminders/pasta.md --run-at "2026-02-22T19:40:00Z"
-zoid schedule list
-zoid schedule pause <job_id>
-zoid schedule resume <job_id>
-zoid schedule delete <job_id>
+zoid jobs create --lua scripts/clean_up_docs.lua --cron "0 21 * * *"
+zoid jobs create --md reminders/pasta.md --run-at "2026-02-22T19:40:00Z"
+zoid jobs list
+zoid jobs pause <job_id>
+zoid jobs resume <job_id>
+zoid jobs delete <job_id>
 ```
 
 Telegram routing for scheduled output:
 
-- Zoid does not bind a Telegram channel when the job is created.
-- When a due job runs, Zoid asks the agent for a reply and then tries Telegram DM delivery using the stored private-chat id.
+- When a due job runs, Zoid passes the output to the agent and asks for a reply, then tries to DM on Telegram using the stored private-chat id.
 - The DM id is updated automatically when `zoid serve` receives a private Telegram message.
 - If no DM id is available at run time, the scheduled reply is ignored.
 

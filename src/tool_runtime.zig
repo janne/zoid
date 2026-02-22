@@ -14,7 +14,7 @@ pub const enabled_tools = [_][]const u8{
     "filesystem_delete",
     "lua_execute",
     "config",
-    "scheduler",
+    "jobs",
     "http_get",
     "http_post",
     "http_put",
@@ -115,7 +115,7 @@ pub fn executeToolCallWithContext(
     if (std.mem.eql(u8, tool_name, "config")) {
         return executeConfig(allocator, policy, arguments_json);
     }
-    if (std.mem.eql(u8, tool_name, "scheduler")) {
+    if (std.mem.eql(u8, tool_name, "jobs")) {
         return executeScheduler(allocator, policy, request_context, arguments_json);
     }
     if (std.mem.eql(u8, tool_name, "http_get")) {
@@ -603,7 +603,7 @@ fn executeScheduler(
         );
         defer created.deinit(allocator);
 
-        try writer.writeAll("{\"ok\":true,\"tool\":\"scheduler\",\"action\":\"create\",\"job\":");
+        try writer.writeAll("{\"ok\":true,\"tool\":\"jobs\",\"action\":\"create\",\"job\":");
         try writeSchedulerJobJson(allocator, writer, &created);
         try writer.writeAll("}");
         return output.toOwnedSlice();
@@ -613,7 +613,7 @@ fn executeScheduler(
         const jobs = try scheduler_runtime.listJobs(allocator, context);
         defer scheduler_store.deinitJobs(allocator, jobs);
 
-        try writer.writeAll("{\"ok\":true,\"tool\":\"scheduler\",\"action\":\"list\",\"jobs\":[");
+        try writer.writeAll("{\"ok\":true,\"tool\":\"jobs\",\"action\":\"list\",\"jobs\":[");
         for (jobs, 0..) |*job, index| {
             if (index > 0) try writer.writeAll(",");
             try writeSchedulerJobJson(allocator, writer, job);
@@ -625,7 +625,7 @@ fn executeScheduler(
     if (std.mem.eql(u8, action, "delete")) {
         const job_id = try requireStringProperty(root_object, "job_id");
         const removed = try scheduler_runtime.deleteJob(allocator, context, job_id);
-        try writer.writeAll("{\"ok\":true,\"tool\":\"scheduler\",\"action\":\"delete\",\"job_id\":");
+        try writer.writeAll("{\"ok\":true,\"tool\":\"jobs\",\"action\":\"delete\",\"job_id\":");
         try writeJsonString(allocator, writer, job_id);
         try writer.writeAll(",\"removed\":");
         try writer.writeAll(if (removed) "true" else "false");
@@ -636,7 +636,7 @@ fn executeScheduler(
     if (std.mem.eql(u8, action, "pause")) {
         const job_id = try requireStringProperty(root_object, "job_id");
         const paused = try scheduler_runtime.pauseJob(allocator, context, job_id);
-        try writer.writeAll("{\"ok\":true,\"tool\":\"scheduler\",\"action\":\"pause\",\"job_id\":");
+        try writer.writeAll("{\"ok\":true,\"tool\":\"jobs\",\"action\":\"pause\",\"job_id\":");
         try writeJsonString(allocator, writer, job_id);
         try writer.writeAll(",\"updated\":");
         try writer.writeAll(if (paused) "true" else "false");
@@ -647,7 +647,7 @@ fn executeScheduler(
     if (std.mem.eql(u8, action, "resume")) {
         const job_id = try requireStringProperty(root_object, "job_id");
         const resumed = try scheduler_runtime.resumeJob(allocator, context, job_id);
-        try writer.writeAll("{\"ok\":true,\"tool\":\"scheduler\",\"action\":\"resume\",\"job_id\":");
+        try writer.writeAll("{\"ok\":true,\"tool\":\"jobs\",\"action\":\"resume\",\"job_id\":");
         try writeJsonString(allocator, writer, job_id);
         try writer.writeAll(",\"updated\":");
         try writer.writeAll(if (resumed) "true" else "false");
@@ -811,7 +811,7 @@ test "buildPolicyJson emits required fields" {
     try std.testing.expectEqual(@as(usize, 11), root_object.get("tools_enabled").?.array.items.len);
 }
 
-test "scheduler tool can create and list jobs" {
+test "jobs tool can create and list jobs" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -831,7 +831,7 @@ test "scheduler tool can create and list jobs" {
         std.testing.allocator,
         &policy,
         .{ .request_chat_id = 777 },
-        "scheduler",
+        "jobs",
         "{\"action\":\"create\",\"job_type\":\"lua\",\"path\":\"task.lua\",\"run_at\":\"2026-01-10T10:00:00Z\"}",
     );
     defer std.testing.allocator.free(create_result);
@@ -840,14 +840,14 @@ test "scheduler tool can create and list jobs" {
     defer parsed_create.deinit();
     const create_object = parsed_create.value.object;
     try std.testing.expect(create_object.get("ok").?.bool);
-    try std.testing.expectEqualStrings("scheduler", create_object.get("tool").?.string);
+    try std.testing.expectEqualStrings("jobs", create_object.get("tool").?.string);
     try std.testing.expectEqualStrings("create", create_object.get("action").?.string);
 
     const list_result = try executeToolCallWithContext(
         std.testing.allocator,
         &policy,
         .{},
-        "scheduler",
+        "jobs",
         "{\"action\":\"list\"}",
     );
     defer std.testing.allocator.free(list_result);

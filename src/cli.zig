@@ -11,15 +11,15 @@ pub const ConfigCommand = union(enum) {
     list,
 };
 
-pub const ScheduleCreateCommand = struct {
+pub const JobsCreateCommand = struct {
     job_type: scheduler_store.JobType,
     path: []const u8,
     run_at: ?[]const u8,
     cron: ?[]const u8,
 };
 
-pub const ScheduleCommand = union(enum) {
-    create: ScheduleCreateCommand,
+pub const JobsCommand = union(enum) {
+    create: JobsCreateCommand,
     list,
     delete: []const u8,
     pause: []const u8,
@@ -36,7 +36,7 @@ pub const Command = union(enum) {
     chat,
     serve,
     config: ConfigCommand,
-    schedule: ScheduleCommand,
+    jobs: JobsCommand,
 };
 
 pub const ParseCommandError = error{
@@ -45,11 +45,11 @@ pub const ParseCommandError = error{
     MissingConfigSubcommand,
     MissingConfigKey,
     MissingConfigValue,
-    MissingScheduleSubcommand,
-    MissingScheduleArgument,
-    InvalidScheduleArguments,
+    MissingJobsSubcommand,
+    MissingJobsArgument,
+    InvalidJobsArguments,
     UnknownConfigSubcommand,
-    UnknownScheduleSubcommand,
+    UnknownJobsSubcommand,
     UnknownCommand,
 };
 
@@ -114,48 +114,48 @@ pub fn parseCommand(args: []const []const u8) ParseCommandError!Command {
         return error.UnknownConfigSubcommand;
     }
 
-    if (std.mem.eql(u8, cmd, "schedule")) {
-        if (args.len < 3) return error.MissingScheduleSubcommand;
-        return .{ .schedule = try parseScheduleCommand(args[2..]) };
+    if (std.mem.eql(u8, cmd, "jobs")) {
+        if (args.len < 3) return error.MissingJobsSubcommand;
+        return .{ .jobs = try parseJobsCommand(args[2..]) };
     }
 
     return error.UnknownCommand;
 }
 
-fn parseScheduleCommand(args: []const []const u8) ParseCommandError!ScheduleCommand {
+fn parseJobsCommand(args: []const []const u8) ParseCommandError!JobsCommand {
     const subcmd = args[0];
 
     if (std.mem.eql(u8, subcmd, "list")) {
-        if (args.len != 1) return error.InvalidScheduleArguments;
+        if (args.len != 1) return error.InvalidJobsArguments;
         return .list;
     }
 
     if (std.mem.eql(u8, subcmd, "delete")) {
-        if (args.len < 2) return error.MissingScheduleArgument;
-        if (args.len > 2) return error.InvalidScheduleArguments;
+        if (args.len < 2) return error.MissingJobsArgument;
+        if (args.len > 2) return error.InvalidJobsArguments;
         return .{ .delete = args[1] };
     }
 
     if (std.mem.eql(u8, subcmd, "pause")) {
-        if (args.len < 2) return error.MissingScheduleArgument;
-        if (args.len > 2) return error.InvalidScheduleArguments;
+        if (args.len < 2) return error.MissingJobsArgument;
+        if (args.len > 2) return error.InvalidJobsArguments;
         return .{ .pause = args[1] };
     }
 
     if (std.mem.eql(u8, subcmd, "resume")) {
-        if (args.len < 2) return error.MissingScheduleArgument;
-        if (args.len > 2) return error.InvalidScheduleArguments;
+        if (args.len < 2) return error.MissingJobsArgument;
+        if (args.len > 2) return error.InvalidJobsArguments;
         return .{ .@"resume" = args[1] };
     }
 
     if (std.mem.eql(u8, subcmd, "create")) {
-        return .{ .create = try parseScheduleCreate(args[1..]) };
+        return .{ .create = try parseJobsCreate(args[1..]) };
     }
 
-    return error.UnknownScheduleSubcommand;
+    return error.UnknownJobsSubcommand;
 }
 
-fn parseScheduleCreate(args: []const []const u8) ParseCommandError!ScheduleCreateCommand {
+fn parseJobsCreate(args: []const []const u8) ParseCommandError!JobsCreateCommand {
     var job_type: ?scheduler_store.JobType = null;
     var path: ?[]const u8 = null;
     var run_at: ?[]const u8 = null;
@@ -166,8 +166,8 @@ fn parseScheduleCreate(args: []const []const u8) ParseCommandError!ScheduleCreat
         const flag = args[index];
 
         if (std.mem.eql(u8, flag, "--lua")) {
-            if (job_type != null or path != null) return error.InvalidScheduleArguments;
-            if (index + 1 >= args.len) return error.MissingScheduleArgument;
+            if (job_type != null or path != null) return error.InvalidJobsArguments;
+            if (index + 1 >= args.len) return error.MissingJobsArgument;
             job_type = .lua;
             path = args[index + 1];
             index += 2;
@@ -175,8 +175,8 @@ fn parseScheduleCreate(args: []const []const u8) ParseCommandError!ScheduleCreat
         }
 
         if (std.mem.eql(u8, flag, "--md")) {
-            if (job_type != null or path != null) return error.InvalidScheduleArguments;
-            if (index + 1 >= args.len) return error.MissingScheduleArgument;
+            if (job_type != null or path != null) return error.InvalidJobsArguments;
+            if (index + 1 >= args.len) return error.MissingJobsArgument;
             job_type = .markdown;
             path = args[index + 1];
             index += 2;
@@ -184,26 +184,26 @@ fn parseScheduleCreate(args: []const []const u8) ParseCommandError!ScheduleCreat
         }
 
         if (std.mem.eql(u8, flag, "--run-at")) {
-            if (run_at != null) return error.InvalidScheduleArguments;
-            if (index + 1 >= args.len) return error.MissingScheduleArgument;
+            if (run_at != null) return error.InvalidJobsArguments;
+            if (index + 1 >= args.len) return error.MissingJobsArgument;
             run_at = args[index + 1];
             index += 2;
             continue;
         }
 
         if (std.mem.eql(u8, flag, "--cron")) {
-            if (cron != null) return error.InvalidScheduleArguments;
-            if (index + 1 >= args.len) return error.MissingScheduleArgument;
+            if (cron != null) return error.InvalidJobsArguments;
+            if (index + 1 >= args.len) return error.MissingJobsArgument;
             cron = args[index + 1];
             index += 2;
             continue;
         }
 
-        return error.InvalidScheduleArguments;
+        return error.InvalidJobsArguments;
     }
 
-    if (job_type == null or path == null) return error.InvalidScheduleArguments;
-    if ((run_at == null and cron == null) or (run_at != null and cron != null)) return error.InvalidScheduleArguments;
+    if (job_type == null or path == null) return error.InvalidJobsArguments;
+    if ((run_at == null and cron == null) or (run_at != null and cron != null)) return error.InvalidJobsArguments;
 
     return .{
         .job_type = job_type.?,
@@ -230,22 +230,22 @@ pub fn printHelp() void {
         \\zoid serve
         \\  Starts long-running service mode.
         \\
-        \\zoid schedule create --lua <path.lua> (--run-at <rfc3339> | --cron "<min hour dom mon dow>")
+        \\zoid jobs create --lua <path.lua> (--run-at <rfc3339> | --cron "<min hour dom mon dow>")
         \\  Creates a scheduled Lua job.
         \\
-        \\zoid schedule create --md <path.md> (--run-at <rfc3339> | --cron "<min hour dom mon dow>")
+        \\zoid jobs create --md <path.md> (--run-at <rfc3339> | --cron "<min hour dom mon dow>")
         \\  Creates a scheduled Markdown job.
         \\
-        \\zoid schedule list
+        \\zoid jobs list
         \\  Lists scheduled jobs.
         \\
-        \\zoid schedule delete <job_id>
+        \\zoid jobs delete <job_id>
         \\  Deletes a scheduled job.
         \\
-        \\zoid schedule pause <job_id>
+        \\zoid jobs pause <job_id>
         \\  Pauses a scheduled job.
         \\
-        \\zoid schedule resume <job_id>
+        \\zoid jobs resume <job_id>
         \\  Resumes a scheduled job.
         \\
         \\zoid config set <key> <value>
@@ -268,12 +268,12 @@ test "default command is chat" {
     try std.testing.expect(command == .chat);
 }
 
-test "schedule create lua with run-at parses" {
-    const args = [_][]const u8{ "zoid", "schedule", "create", "--lua", "scripts/a.lua", "--run-at", "2026-02-22T21:00:00Z" };
+test "jobs create lua with run-at parses" {
+    const args = [_][]const u8{ "zoid", "jobs", "create", "--lua", "scripts/a.lua", "--run-at", "2026-02-22T21:00:00Z" };
     const command = try parseCommand(&args);
 
     switch (command) {
-        .schedule => |schedule_cmd| switch (schedule_cmd) {
+        .jobs => |jobs_cmd| switch (jobs_cmd) {
             .create => |create| {
                 try std.testing.expectEqual(scheduler_store.JobType.lua, create.job_type);
                 try std.testing.expectEqualStrings("scripts/a.lua", create.path);
@@ -286,12 +286,12 @@ test "schedule create lua with run-at parses" {
     }
 }
 
-test "schedule create markdown with cron parses" {
-    const args = [_][]const u8{ "zoid", "schedule", "create", "--md", "note.md", "--cron", "0 21 * * *" };
+test "jobs create markdown with cron parses" {
+    const args = [_][]const u8{ "zoid", "jobs", "create", "--md", "note.md", "--cron", "0 21 * * *" };
     const command = try parseCommand(&args);
 
     switch (command) {
-        .schedule => |schedule_cmd| switch (schedule_cmd) {
+        .jobs => |jobs_cmd| switch (jobs_cmd) {
             .create => |create| {
                 try std.testing.expectEqual(scheduler_store.JobType.markdown, create.job_type);
                 try std.testing.expectEqualStrings("note.md", create.path);
@@ -304,27 +304,27 @@ test "schedule create markdown with cron parses" {
     }
 }
 
-test "schedule list parses" {
-    const args = [_][]const u8{ "zoid", "schedule", "list" };
+test "jobs list parses" {
+    const args = [_][]const u8{ "zoid", "jobs", "list" };
     const command = try parseCommand(&args);
 
     switch (command) {
-        .schedule => |schedule_cmd| try std.testing.expect(schedule_cmd == .list),
+        .jobs => |jobs_cmd| try std.testing.expect(jobs_cmd == .list),
         else => return error.UnexpectedCommand,
     }
 }
 
-test "schedule requires one schedule variant" {
-    const args = [_][]const u8{ "zoid", "schedule", "create", "--lua", "task.lua" };
-    try std.testing.expectError(error.InvalidScheduleArguments, parseCommand(&args));
+test "jobs requires one schedule variant" {
+    const args = [_][]const u8{ "zoid", "jobs", "create", "--lua", "task.lua" };
+    try std.testing.expectError(error.InvalidJobsArguments, parseCommand(&args));
 }
 
-test "schedule rejects duplicate schedule variants" {
-    const args = [_][]const u8{ "zoid", "schedule", "create", "--lua", "task.lua", "--run-at", "2026-01-01T00:00:00Z", "--cron", "0 * * * *" };
-    try std.testing.expectError(error.InvalidScheduleArguments, parseCommand(&args));
+test "jobs rejects duplicate schedule variants" {
+    const args = [_][]const u8{ "zoid", "jobs", "create", "--lua", "task.lua", "--run-at", "2026-01-01T00:00:00Z", "--cron", "0 * * * *" };
+    try std.testing.expectError(error.InvalidJobsArguments, parseCommand(&args));
 }
 
-test "schedule rejects unsupported chat id flag" {
-    const args = [_][]const u8{ "zoid", "schedule", "create", "--lua", "task.lua", "--run-at", "2026-01-01T00:00:00Z", "--chat-id", "123" };
-    try std.testing.expectError(error.InvalidScheduleArguments, parseCommand(&args));
+test "jobs rejects unsupported chat id flag" {
+    const args = [_][]const u8{ "zoid", "jobs", "create", "--lua", "task.lua", "--run-at", "2026-01-01T00:00:00Z", "--chat-id", "123" };
+    try std.testing.expectError(error.InvalidJobsArguments, parseCommand(&args));
 }
