@@ -19,6 +19,37 @@ const InboundMessage = struct {
     text: []u8,
 };
 
+const Conversation = struct {
+    messages: std.ArrayList(openai_client.Message) = .empty,
+
+    fn deinit(self: *Conversation, allocator: std.mem.Allocator) void {
+        for (self.messages.items) |message| allocator.free(message.content);
+        self.messages.deinit(allocator);
+    }
+
+    fn appendMessage(
+        self: *Conversation,
+        allocator: std.mem.Allocator,
+        role: openai_client.Role,
+        content: []const u8,
+    ) !void {
+        const copy = try allocator.dupe(u8, content);
+        errdefer allocator.free(copy);
+        try self.messages.append(allocator, .{
+            .role = role,
+            .content = copy,
+        });
+    }
+
+    fn popLastMessage(self: *Conversation, allocator: std.mem.Allocator) void {
+        if (self.messages.items.len == 0) return;
+        const message = self.messages.pop().?;
+        allocator.free(message.content);
+    }
+};
+
+const ConversationStore = std.AutoHashMap(i64, Conversation);
+
 const PollBatch = struct {
     messages: []InboundMessage,
     next_offset: i64,
@@ -37,6 +68,9 @@ pub fn runLongPolling(allocator: std.mem.Allocator, settings: Settings) !void {
 
     std.debug.print("Starting Telegram long-polling loop.\n", .{});
 
+    var conversations = ConversationStore.init(allocator);
+    defer deinitConversationStore(allocator, &conversations);
+
     var next_offset: i64 = 0;
     while (true) {
         var batch = fetchPollBatch(allocator, settings.bot_token, next_offset) catch |err| {
@@ -50,6 +84,7 @@ pub fn runLongPolling(allocator: std.mem.Allocator, settings: Settings) !void {
         for (batch.messages) |message| {
             processInboundMessage(
                 allocator,
+                &conversations,
                 settings.openai_api_key,
                 settings.openai_model,
                 settings.bot_token,
@@ -78,6 +113,7 @@ pub fn runLongPolling(allocator: std.mem.Allocator, settings: Settings) !void {
 
 fn processInboundMessage(
     allocator: std.mem.Allocator,
+    conversations: *ConversationStore,
     api_key: []const u8,
     model: []const u8,
     bot_token: []const u8,
@@ -90,20 +126,39 @@ fn processInboundMessage(
         return;
     }
 
-    const messages = [_]openai_client.Message{
-        .{ .role = .user, .content = prompt },
-    };
+    if (isResetCommand(prompt)) {
+        _ = clearConversationForChat(allocator, conversations, chat_id);
+        try sendMessageInChunks(
+            allocator,
+            bot_token,
+            chat_id,
+            "Started a new session. Previous context cleared.",
+        );
+        return;
+    }
+
+    const conversation = try getOrCreateConversation(conversations, chat_id);
+    try conversation.appendMessage(allocator, .user, prompt);
+
+    var conversation_turn_committed = false;
+    errdefer {
+        if (!conversation_turn_committed) {
+            conversation.popLastMessage(allocator);
+        }
+    }
 
     const reply = try openai_client.fetchAssistantReply(
         allocator,
         api_key,
         model,
-        &messages,
+        conversation.messages.items,
     );
     defer allocator.free(reply);
 
     const trimmed_reply = std.mem.trim(u8, reply, " \t\r\n");
     if (trimmed_reply.len == 0) {
+        conversation.popLastMessage(allocator);
+        conversation_turn_committed = true;
         try sendMessageInChunks(
             allocator,
             bot_token,
@@ -114,6 +169,45 @@ fn processInboundMessage(
     }
 
     try sendMessageInChunks(allocator, bot_token, chat_id, trimmed_reply);
+    try conversation.appendMessage(allocator, .assistant, trimmed_reply);
+    conversation_turn_committed = true;
+}
+
+fn deinitConversationStore(
+    allocator: std.mem.Allocator,
+    conversations: *ConversationStore,
+) void {
+    var iterator = conversations.iterator();
+    while (iterator.next()) |entry| {
+        entry.value_ptr.deinit(allocator);
+    }
+    conversations.deinit();
+}
+
+fn getOrCreateConversation(
+    conversations: *ConversationStore,
+    chat_id: i64,
+) !*Conversation {
+    const entry = try conversations.getOrPut(chat_id);
+    if (!entry.found_existing) entry.value_ptr.* = .{};
+    return entry.value_ptr;
+}
+
+fn clearConversationForChat(
+    allocator: std.mem.Allocator,
+    conversations: *ConversationStore,
+    chat_id: i64,
+) bool {
+    if (conversations.fetchRemove(chat_id)) |entry| {
+        var conversation = entry.value;
+        conversation.deinit(allocator);
+        return true;
+    }
+    return false;
+}
+
+fn isResetCommand(prompt: []const u8) bool {
+    return std.mem.eql(u8, prompt, "/new") or std.mem.eql(u8, prompt, "/reset");
 }
 
 fn fetchPollBatch(
@@ -417,4 +511,45 @@ test "nextChunkBoundary keeps utf-8 boundaries" {
 
     const third = nextChunkBoundary(text, second, 4);
     try std.testing.expectEqual(text.len, third);
+}
+
+test "conversation store keeps separate history per chat id" {
+    var conversations = ConversationStore.init(std.testing.allocator);
+    defer deinitConversationStore(std.testing.allocator, &conversations);
+
+    const chat_1 = try getOrCreateConversation(&conversations, 111);
+    try chat_1.appendMessage(std.testing.allocator, .user, "hello");
+
+    const chat_1_again = try getOrCreateConversation(&conversations, 111);
+    try std.testing.expectEqual(@as(usize, 1), chat_1_again.messages.items.len);
+    try std.testing.expectEqual(openai_client.Role.user, chat_1_again.messages.items[0].role);
+    try std.testing.expectEqualStrings("hello", chat_1_again.messages.items[0].content);
+
+    const chat_2 = try getOrCreateConversation(&conversations, 222);
+    try std.testing.expectEqual(@as(usize, 0), chat_2.messages.items.len);
+}
+
+test "clearConversationForChat clears only target conversation" {
+    var conversations = ConversationStore.init(std.testing.allocator);
+    defer deinitConversationStore(std.testing.allocator, &conversations);
+
+    const chat_1 = try getOrCreateConversation(&conversations, 1);
+    try chat_1.appendMessage(std.testing.allocator, .user, "one");
+    const chat_2 = try getOrCreateConversation(&conversations, 2);
+    try chat_2.appendMessage(std.testing.allocator, .user, "two");
+
+    try std.testing.expect(clearConversationForChat(std.testing.allocator, &conversations, 1));
+    try std.testing.expect(!clearConversationForChat(std.testing.allocator, &conversations, 1));
+
+    try std.testing.expect(conversations.get(1) == null);
+    const remaining = conversations.get(2) orelse unreachable;
+    try std.testing.expectEqual(@as(usize, 1), remaining.messages.items.len);
+    try std.testing.expectEqualStrings("two", remaining.messages.items[0].content);
+}
+
+test "isResetCommand matches supported telegram commands" {
+    try std.testing.expect(isResetCommand("/new"));
+    try std.testing.expect(isResetCommand("/reset"));
+    try std.testing.expect(!isResetCommand("/help"));
+    try std.testing.expect(!isResetCommand("new"));
 }
