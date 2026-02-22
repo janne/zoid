@@ -13,6 +13,8 @@ const max_poll_response_bytes: usize = 2 * 1024 * 1024;
 const max_send_response_bytes: usize = 512 * 1024;
 const max_telegram_message_bytes: usize = 4000;
 const poll_backoff_ns: u64 = 3 * std.time.ns_per_s;
+const typing_action_refresh_ns: u64 = 4 * std.time.ns_per_s;
+const typing_action_sleep_step_ns: u64 = 200 * std.time.ns_per_ms;
 
 const InboundMessage = struct {
     chat_id: i64,
@@ -58,6 +60,48 @@ const PollBatch = struct {
         for (self.messages) |message| allocator.free(message.text);
         if (self.messages.len > 0) allocator.free(self.messages);
         self.* = undefined;
+    }
+};
+
+const TypingNotifier = struct {
+    stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    thread: ?std.Thread = null,
+    bot_token: []const u8 = "",
+    chat_id: i64 = 0,
+
+    fn start(self: *TypingNotifier, bot_token: []const u8, chat_id: i64) !void {
+        if (self.thread != null) return;
+        self.bot_token = bot_token;
+        self.chat_id = chat_id;
+        self.stop_flag.store(false, .release);
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn stop(self: *TypingNotifier) void {
+        if (self.thread) |thread| {
+            self.stop_flag.store(true, .release);
+            thread.join();
+            self.thread = null;
+        }
+    }
+
+    fn run(self: *TypingNotifier) void {
+        while (!self.stop_flag.load(.acquire)) {
+            sendTypingAction(std.heap.page_allocator, self.bot_token, self.chat_id) catch |err| {
+                std.debug.print(
+                    "Telegram sendChatAction failed for chat {d}: {s}\n",
+                    .{ self.chat_id, @errorName(err) },
+                );
+            };
+
+            var slept_ns: u64 = 0;
+            while (slept_ns < typing_action_refresh_ns and !self.stop_flag.load(.acquire)) {
+                const remaining = typing_action_refresh_ns - slept_ns;
+                const step = @min(typing_action_sleep_step_ns, remaining);
+                std.Thread.sleep(step);
+                slept_ns += step;
+            }
+        }
     }
 };
 
@@ -146,6 +190,15 @@ fn processInboundMessage(
             conversation.popLastMessage(allocator);
         }
     }
+
+    var typing_notifier: TypingNotifier = .{};
+    typing_notifier.start(bot_token, chat_id) catch |err| {
+        std.debug.print(
+            "Failed to start Telegram typing notifier for chat {d}: {s}\n",
+            .{ chat_id, @errorName(err) },
+        );
+    };
+    defer typing_notifier.stop();
 
     const reply = try openai_client.fetchAssistantReply(
         allocator,
@@ -436,6 +489,81 @@ fn sendMessage(
     }
 }
 
+fn sendTypingAction(
+    allocator: std.mem.Allocator,
+    bot_token: []const u8,
+    chat_id: i64,
+) !void {
+    const uri = try std.fmt.allocPrint(
+        allocator,
+        "https://api.telegram.org/bot{s}/sendChatAction",
+        .{bot_token},
+    );
+    defer allocator.free(uri);
+
+    const payload = try buildChatActionPayload(allocator, chat_id, "typing");
+    defer allocator.free(payload);
+
+    const headers = [_]http_client.RequestHeader{
+        .{ .name = "Content-Type", .value = "application/json" },
+    };
+
+    var response = try http_client.executeRequest(
+        allocator,
+        .POST,
+        uri,
+        payload,
+        &headers,
+        max_send_response_bytes,
+    );
+    defer response.deinit(allocator);
+
+    if (response.status_code != 200) {
+        if (try parseTelegramErrorDescription(allocator, response.body)) |description| {
+            defer allocator.free(description);
+            std.debug.print(
+                "Telegram sendChatAction returned status {d}: {s}\n",
+                .{ response.status_code, description },
+            );
+        } else {
+            std.debug.print(
+                "Telegram sendChatAction returned status {d}.\n",
+                .{response.status_code},
+            );
+        }
+        return error.TelegramApiRequestFailed;
+    }
+
+    const ok = parseTelegramOk(allocator, response.body) catch |err| {
+        std.debug.print("Telegram sendChatAction invalid response: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    if (!ok) {
+        if (try parseTelegramErrorDescription(allocator, response.body)) |description| {
+            defer allocator.free(description);
+            std.debug.print("Telegram sendChatAction failed: {s}\n", .{description});
+        } else {
+            std.debug.print("Telegram sendChatAction failed.\n", .{});
+        }
+        return error.TelegramApiRequestFailed;
+    }
+}
+
+fn buildChatActionPayload(
+    allocator: std.mem.Allocator,
+    chat_id: i64,
+    action: []const u8,
+) ![]u8 {
+    const escaped_action = try std.json.Stringify.valueAlloc(allocator, action, .{});
+    defer allocator.free(escaped_action);
+
+    return try std.fmt.allocPrint(
+        allocator,
+        "{{\"chat_id\":{d},\"action\":{s}}}",
+        .{ chat_id, escaped_action },
+    );
+}
+
 fn parseTelegramOk(allocator: std.mem.Allocator, response_body: []const u8) !bool {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response_body, .{});
     defer parsed.deinit();
@@ -552,4 +680,14 @@ test "isResetCommand matches supported telegram commands" {
     try std.testing.expect(isResetCommand("/reset"));
     try std.testing.expect(!isResetCommand("/help"));
     try std.testing.expect(!isResetCommand("new"));
+}
+
+test "buildChatActionPayload encodes chat action request" {
+    const payload = try buildChatActionPayload(std.testing.allocator, 42, "typing");
+    defer std.testing.allocator.free(payload);
+
+    try std.testing.expectEqualStrings(
+        "{\"chat_id\":42,\"action\":\"typing\"}",
+        payload,
+    );
 }

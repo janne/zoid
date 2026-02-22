@@ -47,6 +47,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - Default command is `chat` when running `zoid` with no arguments.
   - `zoid serve` is the long-running service entrypoint; currently it requires both `OPENAI_API_KEY` and `TELEGRAM_BOT_TOKEN` in config and runs a Telegram long-polling loop until interrupted.
   - Telegram service mode keeps conversation history in memory per `chat_id` (similar to local chat session continuity); `/new` or `/reset` clears that chat's stored context.
+  - While generating a reply in Telegram service mode, send the native `sendChatAction` typing indicator periodically so users see Telegram's built-in "typing..." state until `sendMessage` completes.
 
 ### Chat interface changes:
   - `src/chat_session.zig` now uses fullscreen `libvaxis` UI in the alternate screen when running on a TTY, with `vaxis.widgets.TextInput` handling readline-style editing (`Ctrl+A`, `Ctrl+E`, arrows, backspace/delete).

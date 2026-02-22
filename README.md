@@ -48,7 +48,7 @@ zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe
 gcloud compute scp zig-out/bin/zoid ... --zone=us-east1-c
 ```
 
-## Copy to server
+## Connect to server
 ```sh
 gcloud compute ssh ...
 ```
