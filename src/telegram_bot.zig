@@ -13,6 +13,10 @@ const max_poll_response_bytes: usize = 2 * 1024 * 1024;
 const max_send_response_bytes: usize = 512 * 1024;
 const max_telegram_message_bytes: usize = 4000;
 const poll_backoff_ns: u64 = 3 * std.time.ns_per_s;
+const max_conversation_messages_per_chat: usize = 80;
+const max_conversation_state_file_bytes: usize = 8 * 1024 * 1024;
+const conversation_state_file_name = "telegram_context.json";
+const serve_lock_file_name = "telegram_serve.lock";
 const typing_action_refresh_ns: u64 = 4 * std.time.ns_per_s;
 const typing_action_sleep_step_ns: u64 = 200 * std.time.ns_per_ms;
 
@@ -110,10 +114,23 @@ pub fn runLongPolling(allocator: std.mem.Allocator, settings: Settings) !void {
     if (settings.openai_api_key.len == 0) return error.EmptyApiKey;
     if (settings.openai_model.len == 0) return error.EmptyModel;
 
+    var runtime_paths = try RuntimePaths.init(allocator);
+    defer runtime_paths.deinit(allocator);
+
+    const serve_lock = try acquireServeLock(runtime_paths.lock_path);
+    defer serve_lock.close();
+
     std.debug.print("Starting Telegram long-polling loop.\n", .{});
 
     var conversations = ConversationStore.init(allocator);
     defer deinitConversationStore(allocator, &conversations);
+
+    loadConversationStoreAtPath(allocator, runtime_paths.state_path, &conversations) catch |err| {
+        std.debug.print(
+            "Failed to load Telegram conversation state ({s}); continuing with empty state.\n",
+            .{@errorName(err)},
+        );
+    };
 
     var next_offset: i64 = 0;
     while (true) {
@@ -129,6 +146,7 @@ pub fn runLongPolling(allocator: std.mem.Allocator, settings: Settings) !void {
             processInboundMessage(
                 allocator,
                 &conversations,
+                runtime_paths.state_path,
                 settings.openai_api_key,
                 settings.openai_model,
                 settings.bot_token,
@@ -158,6 +176,7 @@ pub fn runLongPolling(allocator: std.mem.Allocator, settings: Settings) !void {
 fn processInboundMessage(
     allocator: std.mem.Allocator,
     conversations: *ConversationStore,
+    state_path: []const u8,
     api_key: []const u8,
     model: []const u8,
     bot_token: []const u8,
@@ -171,7 +190,12 @@ fn processInboundMessage(
     }
 
     if (isResetCommand(prompt)) {
-        _ = clearConversationForChat(allocator, conversations, chat_id);
+        const had_conversation = clearConversationForChat(allocator, conversations, chat_id);
+        if (had_conversation) {
+            persistConversationStoreAtPath(allocator, state_path, conversations) catch |err| {
+                std.debug.print("Failed to persist Telegram conversation state: {s}\n", .{@errorName(err)});
+            };
+        }
         try sendMessageInChunks(
             allocator,
             bot_token,
@@ -223,7 +247,12 @@ fn processInboundMessage(
 
     try sendMessageInChunks(allocator, bot_token, chat_id, trimmed_reply);
     try conversation.appendMessage(allocator, .assistant, trimmed_reply);
+    enforceConversationLimit(conversation, allocator);
     conversation_turn_committed = true;
+
+    persistConversationStoreAtPath(allocator, state_path, conversations) catch |err| {
+        std.debug.print("Failed to persist Telegram conversation state: {s}\n", .{@errorName(err)});
+    };
 }
 
 fn deinitConversationStore(
@@ -261,6 +290,220 @@ fn clearConversationForChat(
 
 fn isResetCommand(prompt: []const u8) bool {
     return std.mem.eql(u8, prompt, "/new") or std.mem.eql(u8, prompt, "/reset");
+}
+
+fn enforceConversationLimit(conversation: *Conversation, allocator: std.mem.Allocator) void {
+    while (conversation.messages.items.len > max_conversation_messages_per_chat) {
+        const removed = conversation.messages.orderedRemove(0);
+        allocator.free(removed.content);
+    }
+}
+
+const RuntimePaths = struct {
+    app_data_dir: []u8,
+    state_path: []u8,
+    lock_path: []u8,
+
+    fn init(allocator: std.mem.Allocator) !RuntimePaths {
+        const app_data_dir = try std.fs.getAppDataDir(allocator, "zoid");
+        errdefer allocator.free(app_data_dir);
+
+        try std.fs.cwd().makePath(app_data_dir);
+
+        const state_path = try std.fs.path.join(allocator, &.{ app_data_dir, conversation_state_file_name });
+        errdefer allocator.free(state_path);
+
+        const lock_path = try std.fs.path.join(allocator, &.{ app_data_dir, serve_lock_file_name });
+        errdefer allocator.free(lock_path);
+
+        return .{
+            .app_data_dir = app_data_dir,
+            .state_path = state_path,
+            .lock_path = lock_path,
+        };
+    }
+
+    fn deinit(self: *RuntimePaths, allocator: std.mem.Allocator) void {
+        allocator.free(self.app_data_dir);
+        allocator.free(self.state_path);
+        allocator.free(self.lock_path);
+    }
+};
+
+fn acquireServeLock(lock_path: []const u8) !std.fs.File {
+    return std.fs.cwd().createFile(lock_path, .{
+        .read = true,
+        .truncate = false,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+    }) catch |err| switch (err) {
+        error.WouldBlock => return error.ServiceAlreadyRunning,
+        else => return err,
+    };
+}
+
+fn persistConversationStoreAtPath(
+    allocator: std.mem.Allocator,
+    state_path: []const u8,
+    conversations: *const ConversationStore,
+) !void {
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{state_path});
+    defer allocator.free(tmp_path);
+
+    const tmp_file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
+    defer tmp_file.close();
+
+    try writeConversationStoreJson(allocator, tmp_file, conversations);
+    try std.fs.cwd().rename(tmp_path, state_path);
+}
+
+const StoredChat = struct {
+    chat_id: i64,
+    messages: []const openai_client.Message,
+};
+
+fn writeConversationStoreJson(
+    allocator: std.mem.Allocator,
+    file: std.fs.File,
+    conversations: *const ConversationStore,
+) !void {
+    var chats = std.ArrayList(StoredChat).empty;
+    defer chats.deinit(allocator);
+
+    var iterator = conversations.iterator();
+    while (iterator.next()) |entry| {
+        if (entry.value_ptr.messages.items.len == 0) continue;
+        try chats.append(allocator, .{
+            .chat_id = entry.key_ptr.*,
+            .messages = entry.value_ptr.messages.items,
+        });
+    }
+
+    std.mem.sort(StoredChat, chats.items, {}, sortStoredChatsAsc);
+
+    try file.writeAll("{\"version\":1,\"chats\":[");
+    for (chats.items, 0..) |chat, chat_index| {
+        if (chat_index > 0) try file.writeAll(",");
+
+        try file.writeAll("{\"chat_id\":");
+        const chat_id_text = try std.fmt.allocPrint(allocator, "{d}", .{chat.chat_id});
+        defer allocator.free(chat_id_text);
+        try file.writeAll(chat_id_text);
+        try file.writeAll(",\"messages\":[");
+
+        for (chat.messages, 0..) |message, message_index| {
+            if (message_index > 0) try file.writeAll(",");
+
+            const role_json = try std.json.Stringify.valueAlloc(allocator, roleToString(message.role), .{});
+            defer allocator.free(role_json);
+            const content_json = try std.json.Stringify.valueAlloc(allocator, message.content, .{});
+            defer allocator.free(content_json);
+
+            try file.writeAll("{\"role\":");
+            try file.writeAll(role_json);
+            try file.writeAll(",\"content\":");
+            try file.writeAll(content_json);
+            try file.writeAll("}");
+        }
+
+        try file.writeAll("]}");
+    }
+    try file.writeAll("]}\n");
+}
+
+fn sortStoredChatsAsc(_: void, lhs: StoredChat, rhs: StoredChat) bool {
+    return lhs.chat_id < rhs.chat_id;
+}
+
+fn loadConversationStoreAtPath(
+    allocator: std.mem.Allocator,
+    state_path: []const u8,
+    conversations: *ConversationStore,
+) !void {
+    const state_file = std.fs.cwd().openFile(state_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer state_file.close();
+
+    const contents = try state_file.readToEndAlloc(allocator, max_conversation_state_file_bytes);
+    defer allocator.free(contents);
+    if (contents.len == 0) return;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, contents, .{});
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidConversationStoreFormat,
+    };
+
+    const chats = switch (root.get("chats") orelse return error.InvalidConversationStoreFormat) {
+        .array => |array| array,
+        else => return error.InvalidConversationStoreFormat,
+    };
+
+    for (chats.items) |chat_value| {
+        const chat_object = switch (chat_value) {
+            .object => |object| object,
+            else => continue,
+        };
+
+        const chat_id = parseJsonI64(chat_object.get("chat_id") orelse continue) orelse continue;
+        const messages_value = switch (chat_object.get("messages") orelse continue) {
+            .array => |array| array,
+            else => continue,
+        };
+
+        var loaded = Conversation{};
+        errdefer loaded.deinit(allocator);
+
+        for (messages_value.items) |message_value| {
+            const message_object = switch (message_value) {
+                .object => |object| object,
+                else => continue,
+            };
+
+            const role_name = switch (message_object.get("role") orelse continue) {
+                .string => |value| value,
+                else => continue,
+            };
+            const role = parseRole(role_name) orelse continue;
+
+            const content = switch (message_object.get("content") orelse continue) {
+                .string => |value| value,
+                else => continue,
+            };
+
+            try loaded.appendMessage(allocator, role, content);
+        }
+
+        if (loaded.messages.items.len == 0) {
+            loaded.deinit(allocator);
+            continue;
+        }
+
+        enforceConversationLimit(&loaded, allocator);
+
+        const entry = try conversations.getOrPut(chat_id);
+        if (entry.found_existing) {
+            entry.value_ptr.deinit(allocator);
+        }
+        entry.value_ptr.* = loaded;
+    }
+}
+
+fn roleToString(role: openai_client.Role) []const u8 {
+    return switch (role) {
+        .user => "user",
+        .assistant => "assistant",
+    };
+}
+
+fn parseRole(name: []const u8) ?openai_client.Role {
+    if (std.mem.eql(u8, name, "user")) return .user;
+    if (std.mem.eql(u8, name, "assistant")) return .assistant;
+    return null;
 }
 
 fn fetchPollBatch(
@@ -689,5 +932,67 @@ test "buildChatActionPayload encodes chat action request" {
     try std.testing.expectEqualStrings(
         "{\"chat_id\":42,\"action\":\"typing\"}",
         payload,
+    );
+}
+
+test "conversation state round-trips through disk persistence" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const state_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, conversation_state_file_name });
+    defer std.testing.allocator.free(state_path);
+
+    var original = ConversationStore.init(std.testing.allocator);
+    defer deinitConversationStore(std.testing.allocator, &original);
+
+    const chat_a = try getOrCreateConversation(&original, 101);
+    try chat_a.appendMessage(std.testing.allocator, .user, "hello");
+    try chat_a.appendMessage(std.testing.allocator, .assistant, "world");
+
+    const chat_b = try getOrCreateConversation(&original, 202);
+    try chat_b.appendMessage(std.testing.allocator, .user, "hej");
+
+    try persistConversationStoreAtPath(std.testing.allocator, state_path, &original);
+
+    var restored = ConversationStore.init(std.testing.allocator);
+    defer deinitConversationStore(std.testing.allocator, &restored);
+    try loadConversationStoreAtPath(std.testing.allocator, state_path, &restored);
+
+    try std.testing.expect(restored.get(101) != null);
+    const restored_a = restored.get(101).?;
+    try std.testing.expectEqual(@as(usize, 2), restored_a.messages.items.len);
+    try std.testing.expectEqual(openai_client.Role.user, restored_a.messages.items[0].role);
+    try std.testing.expectEqualStrings("hello", restored_a.messages.items[0].content);
+    try std.testing.expectEqual(openai_client.Role.assistant, restored_a.messages.items[1].role);
+    try std.testing.expectEqualStrings("world", restored_a.messages.items[1].content);
+
+    try std.testing.expect(restored.get(202) != null);
+    const restored_b = restored.get(202).?;
+    try std.testing.expectEqual(@as(usize, 1), restored_b.messages.items.len);
+    try std.testing.expectEqual(openai_client.Role.user, restored_b.messages.items[0].role);
+    try std.testing.expectEqualStrings("hej", restored_b.messages.items[0].content);
+}
+
+test "enforceConversationLimit removes oldest messages" {
+    var conversation = Conversation{};
+    defer conversation.deinit(std.testing.allocator);
+
+    const overflow = max_conversation_messages_per_chat + 3;
+    for (0..overflow) |index| {
+        const text = try std.fmt.allocPrint(std.testing.allocator, "m{d}", .{index});
+        defer std.testing.allocator.free(text);
+        try conversation.appendMessage(std.testing.allocator, .user, text);
+    }
+
+    enforceConversationLimit(&conversation, std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, max_conversation_messages_per_chat), conversation.messages.items.len);
+    try std.testing.expectEqualStrings("m3", conversation.messages.items[0].content);
+    try std.testing.expectEqualStrings(
+        "m82",
+        conversation.messages.items[conversation.messages.items.len - 1].content,
     );
 }

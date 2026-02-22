@@ -194,7 +194,15 @@ pub fn main() !void {
                 .openai_api_key = openai_settings.api_key,
                 .openai_model = openai_settings.model,
             }) catch |err| {
-                std.debug.print("Telegram bot failed: {s}\n", .{@errorName(err)});
+                switch (err) {
+                    error.ServiceAlreadyRunning => {
+                        std.debug.print(
+                            "Telegram service is already running for this user (lock file is held).\n",
+                            .{},
+                        );
+                    },
+                    else => std.debug.print("Telegram bot failed: {s}\n", .{@errorName(err)}),
+                }
                 std.process.exit(1);
             };
         },
