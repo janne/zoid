@@ -49,6 +49,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - `zoid execute <file.lua>` must use the same sandbox restrictions and `.lua` path policy as `lua_execute` so local script runs match tool-mode behavior.
   - Default command is `chat` when running `zoid` with no arguments.
   - `zoid serve` is the long-running service entrypoint; currently it requires both `OPENAI_API_KEY` and `TELEGRAM_BOT_TOKEN` in config and runs a Telegram long-polling loop until interrupted.
+  - `zoid chat` and `zoid serve` load `ZOID.md` from the workspace root on startup when present, and pass its content as additional agent instructions in OpenAI system context.
   - Telegram service mode keeps conversation history per `chat_id` (similar to local chat session continuity), persists it to app-data (`telegram_context.json` next to `config.json`), and enforces a per-chat history cap (`max_conversation_messages_per_chat` in `src/telegram_bot.zig`).
   - Telegram service mode acquires an app-data lock file (`telegram_serve.lock`) so only one `zoid serve` instance runs per user profile; a second instance fails with `error.ServiceAlreadyRunning`.
   - `/new` or `/reset` clears that chat's stored Telegram context.

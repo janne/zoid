@@ -50,6 +50,7 @@ const RequestWorkerArgs = struct {
     state: *RequestState,
     api_key: []const u8,
     model: []const u8,
+    workspace_instruction: ?[]const u8,
     messages: []openai_client.Message,
 };
 
@@ -155,11 +156,21 @@ const InputHistoryState = struct {
     }
 };
 
-pub fn run(allocator: std.mem.Allocator, api_key: []const u8, model: []const u8) !void {
-    return runFullscreen(allocator, api_key, model);
+pub fn run(
+    allocator: std.mem.Allocator,
+    api_key: []const u8,
+    model: []const u8,
+    workspace_instruction: ?[]const u8,
+) !void {
+    return runFullscreen(allocator, api_key, model, workspace_instruction);
 }
 
-fn runFullscreen(allocator: std.mem.Allocator, api_key: []const u8, model: []const u8) !void {
+fn runFullscreen(
+    allocator: std.mem.Allocator,
+    api_key: []const u8,
+    model: []const u8,
+    workspace_instruction: ?[]const u8,
+) !void {
     var current_model = try allocator.dupe(u8, model);
     defer allocator.free(current_model);
 
@@ -319,6 +330,7 @@ fn runFullscreen(allocator: std.mem.Allocator, api_key: []const u8, model: []con
                                             .state = &request_state,
                                             .api_key = api_key,
                                             .model = current_model,
+                                            .workspace_instruction = workspace_instruction,
                                             .messages = snapshot,
                                         };
 
@@ -562,11 +574,12 @@ fn requestWorkerMain(args: *RequestWorkerArgs) void {
         std.heap.c_allocator.destroy(args);
     }
 
-    const maybe_reply = openai_client.fetchAssistantReply(
+    const maybe_reply = openai_client.fetchAssistantReplyWithContext(
         std.heap.c_allocator,
         args.api_key,
         args.model,
         args.messages,
+        .{ .workspace_instruction = args.workspace_instruction },
     ) catch |err| {
         const err_text = std.fmt.allocPrint(
             std.heap.c_allocator,

@@ -10,6 +10,7 @@ pub const Settings = struct {
     bot_token: []const u8,
     openai_api_key: []const u8,
     openai_model: []const u8,
+    workspace_instruction: ?[]const u8 = null,
 };
 
 const max_poll_timeout_seconds: u16 = 50;
@@ -154,6 +155,7 @@ pub fn runLongPolling(allocator: std.mem.Allocator, settings: Settings) !void {
             settings.bot_token,
             workspace_root,
             runtime_paths.default_dm_chat_id_path,
+            settings.workspace_instruction,
         ) catch |err| {
             std.debug.print("Failed to process scheduled jobs: {s}\n", .{@errorName(err)});
         };
@@ -203,6 +205,7 @@ pub fn runLongPolling(allocator: std.mem.Allocator, settings: Settings) !void {
                 settings.bot_token,
                 message.chat_id,
                 message.text,
+                settings.workspace_instruction,
             ) catch |err| {
                 std.debug.print(
                     "Failed to process Telegram message for chat {d}: {s}\n",
@@ -233,6 +236,7 @@ fn processInboundMessage(
     bot_token: []const u8,
     chat_id: i64,
     raw_text: []const u8,
+    workspace_instruction: ?[]const u8,
 ) !void {
     const prompt = std.mem.trim(u8, raw_text, " \t\r\n");
     if (prompt.len == 0) {
@@ -265,6 +269,7 @@ fn processInboundMessage(
         bot_token,
         chat_id,
         prompt,
+        workspace_instruction,
     );
 }
 
@@ -314,6 +319,7 @@ fn processPromptForChat(
     bot_token: []const u8,
     chat_id: i64,
     prompt: []const u8,
+    workspace_instruction: ?[]const u8,
 ) !void {
     const conversation = try getOrCreateConversation(conversations, chat_id);
     try conversation.appendMessage(allocator, .user, prompt);
@@ -339,7 +345,10 @@ fn processPromptForChat(
         api_key,
         model,
         conversation.messages.items,
-        .{ .request_chat_id = chat_id },
+        .{
+            .request_chat_id = chat_id,
+            .workspace_instruction = workspace_instruction,
+        },
     );
     defer allocator.free(reply);
 
@@ -373,6 +382,7 @@ fn processDueScheduledJobs(
     bot_token: []const u8,
     workspace_root: []const u8,
     default_dm_chat_id_path: []const u8,
+    workspace_instruction: ?[]const u8,
 ) !void {
     const now = std.time.timestamp();
     const due_jobs = try scheduler_runtime.takeDueJobs(
@@ -406,7 +416,7 @@ fn processDueScheduledJobs(
             api_key,
             model,
             &messages,
-            .{},
+            .{ .workspace_instruction = workspace_instruction },
         ) catch |err| {
             std.debug.print(
                 "Failed to process scheduled job {s}: {s}\n",

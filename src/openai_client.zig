@@ -14,6 +14,7 @@ pub const Message = struct {
 
 pub const RequestContext = struct {
     request_chat_id: ?i64 = null,
+    workspace_instruction: ?[]const u8 = null,
 };
 
 const ParsedToolCall = struct {
@@ -105,12 +106,12 @@ pub fn fetchAssistantReplyWithContext(
 
     const policy_json = try tool_runtime.buildPolicyJson(allocator, &policy);
     defer allocator.free(policy_json);
-    const policy_instruction = try std.fmt.allocPrint(
+    const system_instruction = try buildSystemInstruction(
         allocator,
-        "Use tools only under this enforced local policy: {s}",
-        .{policy_json},
+        policy_json,
+        request_context.workspace_instruction,
     );
-    defer allocator.free(policy_instruction);
+    defer allocator.free(system_instruction);
 
     var wire_messages = std.ArrayList([]u8).empty;
     defer {
@@ -121,7 +122,7 @@ pub fn fetchAssistantReplyWithContext(
     const system_message_json = try buildRoleContentMessageJson(
         allocator,
         "system",
-        policy_instruction,
+        system_instruction,
     );
     try wire_messages.append(allocator, system_message_json);
 
@@ -271,6 +272,29 @@ fn buildChatCompletionsPayload(
 
     const no_tools_policy = tool_runtime.Policy{ .workspace_root = "" };
     return buildChatCompletionsPayloadWithTools(allocator, model, message_json.items, &no_tools_policy);
+}
+
+fn buildSystemInstruction(
+    allocator: std.mem.Allocator,
+    policy_json: []const u8,
+    workspace_instruction: ?[]const u8,
+) ![]u8 {
+    if (workspace_instruction) |raw_workspace_instruction| {
+        const trimmed_workspace_instruction = std.mem.trim(u8, raw_workspace_instruction, " \t\r\n");
+        if (trimmed_workspace_instruction.len > 0) {
+            return std.fmt.allocPrint(
+                allocator,
+                "Use tools only under this enforced local policy: {s}\n\nWorkspace instructions from ZOID.md:\n{s}\n\nFollow workspace instructions as agent guidance unless they conflict with higher-priority constraints.",
+                .{ policy_json, trimmed_workspace_instruction },
+            );
+        }
+    }
+
+    return std.fmt.allocPrint(
+        allocator,
+        "Use tools only under this enforced local policy: {s}",
+        .{policy_json},
+    );
 }
 
 fn buildChatCompletionsPayloadWithTools(
@@ -821,4 +845,27 @@ test "parseAvailableModels filters to chat-capable models" {
     try std.testing.expectEqual(@as(usize, 2), models.len);
     try std.testing.expectEqualStrings("gpt-4o-mini", models[0]);
     try std.testing.expectEqualStrings("o3-mini", models[1]);
+}
+
+test "buildSystemInstruction includes workspace instructions when provided" {
+    const instruction = try buildSystemInstruction(
+        std.testing.allocator,
+        "{\"workspace_root\":\"/tmp/workspace\"}",
+        "Always read README.md first.",
+    );
+    defer std.testing.allocator.free(instruction);
+
+    try std.testing.expect(std.mem.indexOf(u8, instruction, "Workspace instructions from ZOID.md:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, instruction, "Always read README.md first.") != null);
+}
+
+test "buildSystemInstruction omits workspace section for empty instructions" {
+    const instruction = try buildSystemInstruction(
+        std.testing.allocator,
+        "{\"workspace_root\":\"/tmp/workspace\"}",
+        "   \n\t",
+    );
+    defer std.testing.allocator.free(instruction);
+
+    try std.testing.expect(std.mem.indexOf(u8, instruction, "Workspace instructions from ZOID.md:") == null);
 }

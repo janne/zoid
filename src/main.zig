@@ -286,10 +286,20 @@ pub fn main() !void {
             const bot_token = loadTelegramBotTokenOrExit(allocator);
             defer allocator.free(bot_token);
 
+            const workspace_instruction = loadWorkspaceAgentInstruction(allocator) catch |err| blk: {
+                std.debug.print(
+                    "Warning: failed to load workspace instructions from ZOID.md: {s}\n",
+                    .{@errorName(err)},
+                );
+                break :blk null;
+            };
+            defer if (workspace_instruction) |value| allocator.free(value);
+
             zoid.telegram_bot.runLongPolling(allocator, .{
                 .bot_token = bot_token,
                 .openai_api_key = openai_settings.api_key,
                 .openai_model = openai_settings.model,
+                .workspace_instruction = workspace_instruction,
             }) catch |err| {
                 switch (err) {
                     error.ServiceAlreadyRunning => {
@@ -312,7 +322,16 @@ pub fn main() !void {
             const settings = loadOpenAISettingsOrExit(allocator);
             defer settings.deinit(allocator);
 
-            zoid.chat_session.run(allocator, settings.api_key, settings.model) catch |err| {
+            const workspace_instruction = loadWorkspaceAgentInstruction(allocator) catch |err| blk: {
+                std.debug.print(
+                    "Warning: failed to load workspace instructions from ZOID.md: {s}\n",
+                    .{@errorName(err)},
+                );
+                break :blk null;
+            };
+            defer if (workspace_instruction) |value| allocator.free(value);
+
+            zoid.chat_session.run(allocator, settings.api_key, settings.model, workspace_instruction) catch |err| {
                 std.debug.print("Chat session failed: {s}\n", .{@errorName(err)});
                 std.process.exit(1);
             };
@@ -425,6 +444,9 @@ const OpenAISettings = struct {
     }
 };
 
+const workspace_agent_instruction_file_name = "ZOID.md";
+const max_workspace_agent_instruction_bytes: usize = 256 * 1024;
+
 fn loadOpenAISettingsOrExit(allocator: std.mem.Allocator) OpenAISettings {
     return loadOpenAISettings(allocator) catch |err| {
         switch (err) {
@@ -472,6 +494,37 @@ fn loadTelegramBotTokenOrExit(allocator: std.mem.Allocator) []u8 {
 fn loadTelegramBotToken(allocator: std.mem.Allocator) ![]u8 {
     const token_value = try zoid.config_store.getValue(allocator, zoid.config_keys.telegram_bot_token);
     return token_value orelse error.MissingTelegramBotToken;
+}
+
+fn loadWorkspaceAgentInstruction(allocator: std.mem.Allocator) !?[]u8 {
+    const workspace_root = try getWorkspaceRoot(allocator);
+    defer allocator.free(workspace_root);
+    return loadWorkspaceAgentInstructionAtPath(allocator, workspace_root);
+}
+
+fn loadWorkspaceAgentInstructionAtPath(
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+) !?[]u8 {
+    const path = try std.fs.path.join(
+        allocator,
+        &.{ workspace_root, workspace_agent_instruction_file_name },
+    );
+    defer allocator.free(path);
+
+    const content = std.fs.cwd().readFileAlloc(
+        allocator,
+        path,
+        max_workspace_agent_instruction_bytes,
+    ) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(content);
+
+    const trimmed = std.mem.trim(u8, content, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return try allocator.dupe(u8, trimmed);
 }
 
 fn getWorkspaceRoot(allocator: std.mem.Allocator) ![]u8 {
@@ -607,4 +660,33 @@ test "executeLuaAsTool forwards script args to Lua arg table" {
     try std.testing.expectEqualStrings("alpha\nbeta\n", outcome.stdout);
     try std.testing.expectEqualStrings("", outcome.stderr);
     try std.testing.expect(outcome.error_name == null);
+}
+
+test "loadWorkspaceAgentInstructionAtPath reads trimmed ZOID.md content" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    const file = try tmp.dir.createFile(workspace_agent_instruction_file_name, .{});
+    defer file.close();
+    try file.writeAll("  agent instructions  \n");
+
+    const content = try loadWorkspaceAgentInstructionAtPath(std.testing.allocator, workspace_root);
+    defer if (content) |value| std.testing.allocator.free(value);
+
+    try std.testing.expect(content != null);
+    try std.testing.expectEqualStrings("agent instructions", content.?);
+}
+
+test "loadWorkspaceAgentInstructionAtPath returns null when ZOID.md is missing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    const content = try loadWorkspaceAgentInstructionAtPath(std.testing.allocator, workspace_root);
+    try std.testing.expect(content == null);
 }
