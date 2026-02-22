@@ -20,7 +20,7 @@ When documentation conflicts, prefer: `src/` and tests for current behavior.
 - Keep all code, commit messages, and user-facing copy in English.
 - Do not preserve backward compatibility for command naming before first release; prefer replacing old names entirely (for example, `zoid schedule` -> `zoid jobs`).
 - Keep this `AGENTS.md` file updated whenever adding code or changing behavior.
-- Keep `docs/lua_api.md` updated when Lua runtime behavior or Lua sandbox APIs change.
+- Keep `API.md` updated when Lua runtime behavior or Lua sandbox APIs change.
 - Add notable implementation learnings to `AGENTS.md` so future changes can reuse them.
 - For adding Zig packages/dependencies, use `https://zigistry.dev/` as an input source.
 - Keep tests updated with behavior changes.
