@@ -470,6 +470,60 @@ fn luaZoidDirList(lua_state: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
+fn luaZoidDirCreate(lua_state: ?*c.lua_State) callconv(.c) c_int {
+    const state = lua_state orelse return 0;
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+
+    if (c.lua_type(state, 1) != c.LUA_TTABLE) {
+        return pushLuaErrorMessage(state, "zoid.dir(path):create requires directory handle", .{});
+    }
+
+    _ = c.lua_getfield(state, 1, "_path");
+    var path_len: usize = 0;
+    const path_ptr = c.lua_tolstring(state, -1, &path_len) orelse return pushLuaErrorMessage(state, "zoid.dir(path):create requires directory handle", .{});
+    const requested_path = path_ptr[0..path_len];
+    luaPop(state, 1);
+
+    const create_result = workspace_fs.createDirectory(
+        env.allocator,
+        env.workspace_root,
+        requested_path,
+    ) catch |err| {
+        return pushLuaErrorMessage(state, "zoid.dir(path):create failed: {s}", .{@errorName(err)});
+    };
+    defer create_result.deinit(env.allocator);
+
+    c.lua_pushboolean(state, 1);
+    return 1;
+}
+
+fn luaZoidDirRemove(lua_state: ?*c.lua_State) callconv(.c) c_int {
+    const state = lua_state orelse return 0;
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+
+    if (c.lua_type(state, 1) != c.LUA_TTABLE) {
+        return pushLuaErrorMessage(state, "zoid.dir(path):remove requires directory handle", .{});
+    }
+
+    _ = c.lua_getfield(state, 1, "_path");
+    var path_len: usize = 0;
+    const path_ptr = c.lua_tolstring(state, -1, &path_len) orelse return pushLuaErrorMessage(state, "zoid.dir(path):remove requires directory handle", .{});
+    const requested_path = path_ptr[0..path_len];
+    luaPop(state, 1);
+
+    const remove_result = workspace_fs.removeDirectory(
+        env.allocator,
+        env.workspace_root,
+        requested_path,
+    ) catch |err| {
+        return pushLuaErrorMessage(state, "zoid.dir(path):remove failed: {s}", .{@errorName(err)});
+    };
+    defer remove_result.deinit(env.allocator);
+
+    c.lua_pushboolean(state, 1);
+    return 1;
+}
+
 fn luaZoidDir(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
     const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
@@ -499,6 +553,10 @@ fn luaZoidDir(lua_state: ?*c.lua_State) callconv(.c) c_int {
 
     c.lua_pushcclosure(state, luaZoidDirList, 0);
     c.lua_setfield(state, -2, "list");
+    c.lua_pushcclosure(state, luaZoidDirCreate, 0);
+    c.lua_setfield(state, -2, "create");
+    c.lua_pushcclosure(state, luaZoidDirRemove, 0);
+    c.lua_setfield(state, -2, "remove");
     return 1;
 }
 
@@ -1563,6 +1621,52 @@ test "executeLuaFileCaptureOutputTool exposes file metadata and dir listing" {
         output.stdout,
     );
     try std.testing.expectEqualStrings("", output.stderr);
+}
+
+test "executeLuaFileCaptureOutputTool supports zoid dir create/remove" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file_path = "dir_create_remove.lua";
+    const script = try tmp.dir.createFile(file_path, .{});
+    defer script.close();
+    try script.writeAll(
+        \\local dir = zoid.dir("memory")
+        \\print("create", dir:create())
+        \\local create_again_ok, create_again_err = pcall(function() dir:create() end)
+        \\print("create_again", create_again_ok, create_again_err ~= nil)
+        \\local note = zoid.file("memory/note.txt")
+        \\note:write("hello")
+        \\local remove_non_empty_ok, remove_non_empty_err = pcall(function() dir:remove() end)
+        \\print("remove_non_empty", remove_non_empty_ok, remove_non_empty_err ~= nil)
+        \\note:delete()
+        \\print("remove_empty", dir:remove())
+        \\
+    );
+
+    const abs_path = try tmp.dir.realpathAlloc(std.testing.allocator, file_path);
+    defer std.testing.allocator.free(abs_path);
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    var output = try executeLuaFileCaptureOutputTool(std.testing.allocator, abs_path, .{
+        .workspace_root = workspace_root,
+    });
+    defer output.deinit(std.testing.allocator);
+
+    try std.testing.expect(output.status == .ok);
+    try std.testing.expectEqualStrings(
+        "create\ttrue\n" ++
+            "create_again\tfalse\ttrue\n" ++
+            "remove_non_empty\tfalse\ttrue\n" ++
+            "remove_empty\ttrue\n",
+        output.stdout,
+    );
+    try std.testing.expectEqualStrings("", output.stderr);
+
+    const removed_dir_path = try std.fs.path.join(std.testing.allocator, &.{ workspace_root, "memory" });
+    defer std.testing.allocator.free(removed_dir_path);
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(removed_dir_path, .{}));
 }
 
 test "executeLuaFileCaptureOutputTool supports zoid config list/get/set/unset" {

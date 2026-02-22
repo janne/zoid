@@ -28,6 +28,22 @@ pub const DeleteResult = struct {
     }
 };
 
+pub const CreateDirectoryResult = struct {
+    path: []u8,
+
+    pub fn deinit(self: CreateDirectoryResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+    }
+};
+
+pub const RemoveDirectoryResult = struct {
+    path: []u8,
+
+    pub fn deinit(self: RemoveDirectoryResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+    }
+};
+
 pub const EntryType = enum {
     file,
     directory,
@@ -127,6 +143,36 @@ pub fn deleteFile(
     errdefer allocator.free(resolved_path);
 
     try std.fs.cwd().deleteFile(resolved_path);
+    return .{
+        .path = resolved_path,
+    };
+}
+
+pub fn createDirectory(
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    requested_path: []const u8,
+) !CreateDirectoryResult {
+    const resolved_path = try resolveAllowedWritePath(allocator, workspace_root, requested_path);
+    errdefer allocator.free(resolved_path);
+
+    try std.fs.cwd().makeDir(resolved_path);
+
+    return .{
+        .path = resolved_path,
+    };
+}
+
+pub fn removeDirectory(
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    requested_path: []const u8,
+) !RemoveDirectoryResult {
+    const resolved_path = try resolveAllowedReadPath(allocator, workspace_root, requested_path);
+    errdefer allocator.free(resolved_path);
+
+    try std.fs.cwd().deleteDir(resolved_path);
+
     return .{
         .path = resolved_path,
     };
@@ -516,4 +562,34 @@ test "listDirectory returns sorted metadata entries" {
     try std.testing.expectEqualStrings("b.txt", listing.entries[1].name);
     try std.testing.expectEqualStrings("z-dir", listing.entries[2].name);
     try std.testing.expectEqualStrings("directory", entryTypeToString(listing.entries[2].entry_type));
+}
+
+test "createDirectory and removeDirectory enforce existence and emptiness rules" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    var created = try createDirectory(std.testing.allocator, workspace_root, "memory");
+    defer created.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.endsWith(u8, created.path, "memory"));
+
+    try std.testing.expectError(
+        error.PathAlreadyExists,
+        createDirectory(std.testing.allocator, workspace_root, "memory"),
+    );
+
+    const file = try tmp.dir.createFile("memory/note.txt", .{});
+    file.close();
+
+    removeDirectory(std.testing.allocator, workspace_root, "memory") catch |err| {
+        const err_name = @errorName(err);
+        const is_non_empty =
+            std.mem.eql(u8, err_name, "DirNotEmpty") or
+            std.mem.eql(u8, err_name, "DirectoryNotEmpty");
+        try std.testing.expect(is_non_empty);
+        return;
+    };
+    return error.TestExpectedError;
 }
