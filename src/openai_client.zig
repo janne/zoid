@@ -425,7 +425,7 @@ fn writeLuaExecuteToolDefinition(
 
     try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"lua_execute\",\"description\":");
     try writeJsonString(allocator, writer, description);
-    try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false}}}");
+    try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"args\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"path\"],\"additionalProperties\":false}}}");
 }
 
 fn writeHttpGetToolDefinition(
@@ -758,6 +758,12 @@ test "buildChatCompletionsPayload creates valid payload" {
     try std.testing.expectEqualStrings("filesystem_write", tools[2].object.get("function").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("filesystem_delete", tools[3].object.get("function").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("lua_execute", tools[4].object.get("function").?.object.get("name").?.string);
+    const lua_parameters = tools[4].object.get("function").?.object.get("parameters").?.object;
+    const lua_properties = lua_parameters.get("properties").?.object;
+    try std.testing.expect(lua_properties.get("path") != null);
+    const args_property = lua_properties.get("args").?.object;
+    try std.testing.expectEqualStrings("array", args_property.get("type").?.string);
+    try std.testing.expectEqualStrings("string", args_property.get("items").?.object.get("type").?.string);
     try std.testing.expectEqualStrings("config", tools[5].object.get("function").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("jobs", tools[6].object.get("function").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("http_get", tools[7].object.get("function").?.object.get("name").?.string);
