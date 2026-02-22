@@ -52,12 +52,17 @@ pub fn main() !void {
 
     switch (command) {
         .help => zoid.cli.printHelp(),
-        .execute => |file_path| {
-            var outcome = executeLuaAsTool(allocator, file_path, null) catch |err| {
+        .execute => |execute_cmd| {
+            var outcome = executeLuaAsTool(
+                allocator,
+                execute_cmd.file_path,
+                execute_cmd.script_args,
+                null,
+            ) catch |err| {
                 switch (err) {
                     error.PathNotAllowed => std.debug.print("Lua script path is outside the current workspace.\n", .{}),
                     error.InvalidToolArguments => std.debug.print("Lua script path must resolve to a .lua file inside the current workspace.\n", .{}),
-                    error.FileNotFound => std.debug.print("Lua script not found: {s}\n", .{file_path}),
+                    error.FileNotFound => std.debug.print("Lua script not found: {s}\n", .{execute_cmd.file_path}),
                     error.OutOfMemory => std.debug.print("Out of memory while preparing Lua execution.\n", .{}),
                     else => std.debug.print("Lua execution failed: {s}\n", .{@errorName(err)}),
                 }
@@ -226,6 +231,7 @@ const LuaExecuteOutcome = struct {
 fn executeLuaAsTool(
     allocator: std.mem.Allocator,
     file_path: []const u8,
+    script_args: []const []const u8,
     workspace_root_override: ?[]const u8,
 ) !LuaExecuteOutcome {
     var policy = if (workspace_root_override) |workspace_root|
@@ -237,14 +243,27 @@ fn executeLuaAsTool(
     const escaped_path = try std.json.Stringify.valueAlloc(allocator, file_path, .{});
     defer allocator.free(escaped_path);
 
-    const arguments_json = try std.fmt.allocPrint(allocator, "{{\"path\":{s}}}", .{escaped_path});
-    defer allocator.free(arguments_json);
+    var arguments_json = std.ArrayList(u8).empty;
+    defer arguments_json.deinit(allocator);
+    try arguments_json.appendSlice(allocator, "{\"path\":");
+    try arguments_json.appendSlice(allocator, escaped_path);
+    if (script_args.len > 0) {
+        try arguments_json.appendSlice(allocator, ",\"args\":[");
+        for (script_args, 0..) |script_arg, arg_index| {
+            if (arg_index > 0) try arguments_json.append(allocator, ',');
+            const escaped_arg = try std.json.Stringify.valueAlloc(allocator, script_arg, .{});
+            defer allocator.free(escaped_arg);
+            try arguments_json.appendSlice(allocator, escaped_arg);
+        }
+        try arguments_json.append(allocator, ']');
+    }
+    try arguments_json.append(allocator, '}');
 
     const result_json = try zoid.tool_runtime.executeToolCall(
         allocator,
         &policy,
         "lua_execute",
-        arguments_json,
+        arguments_json.items,
     );
     defer allocator.free(result_json);
 
@@ -367,7 +386,7 @@ test "executeLuaAsTool runs script with lua_execute sandbox policy" {
     const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace_root);
 
-    var outcome = try executeLuaAsTool(std.testing.allocator, "ok.lua", workspace_root);
+    var outcome = try executeLuaAsTool(std.testing.allocator, "ok.lua", &.{}, workspace_root);
     defer outcome.deinit(std.testing.allocator);
 
     try std.testing.expect(outcome.ok);
@@ -394,7 +413,7 @@ test "executeLuaAsTool rejects traversal outside workspace root" {
 
     try std.testing.expectError(
         error.PathNotAllowed,
-        executeLuaAsTool(std.testing.allocator, "../outside.lua", workspace_root),
+        executeLuaAsTool(std.testing.allocator, "../outside.lua", &.{}, workspace_root),
     );
 }
 
@@ -411,6 +430,31 @@ test "executeLuaAsTool requires lua extension" {
 
     try std.testing.expectError(
         error.InvalidToolArguments,
-        executeLuaAsTool(std.testing.allocator, "not_lua.txt", workspace_root),
+        executeLuaAsTool(std.testing.allocator, "not_lua.txt", &.{}, workspace_root),
     );
+}
+
+test "executeLuaAsTool forwards script args to Lua arg table" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script = try tmp.dir.createFile("argv.lua", .{});
+    defer script.close();
+    try script.writeAll(
+        \\print(arg[1])
+        \\print(arg[2])
+        \\
+    );
+
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    const script_args = [_][]const u8{ "alpha", "beta" };
+    var outcome = try executeLuaAsTool(std.testing.allocator, "argv.lua", &script_args, workspace_root);
+    defer outcome.deinit(std.testing.allocator);
+
+    try std.testing.expect(outcome.ok);
+    try std.testing.expectEqualStrings("alpha\nbeta\n", outcome.stdout);
+    try std.testing.expectEqualStrings("", outcome.stderr);
+    try std.testing.expect(outcome.error_name == null);
 }

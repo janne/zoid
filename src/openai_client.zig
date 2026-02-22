@@ -274,6 +274,8 @@ fn buildChatCompletionsPayloadWithTools(
     try writer.writeAll("],\"tools\":[");
     try writeFilesystemReadToolDefinition(allocator, writer, policy.workspace_root);
     try writer.writeAll(",");
+    try writeFilesystemListToolDefinition(allocator, writer, policy.workspace_root);
+    try writer.writeAll(",");
     try writeFilesystemWriteToolDefinition(allocator, writer, policy.workspace_root);
     try writer.writeAll(",");
     try writeFilesystemDeleteToolDefinition(allocator, writer, policy.workspace_root);
@@ -309,6 +311,23 @@ fn writeFilesystemReadToolDefinition(
     try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"filesystem_read\",\"description\":");
     try writeJsonString(allocator, writer, description);
     try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"max_bytes\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":1048576}},\"required\":[\"path\"],\"additionalProperties\":false}}}");
+}
+
+fn writeFilesystemListToolDefinition(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    workspace_root: []const u8,
+) !void {
+    const description = try std.fmt.allocPrint(
+        allocator,
+        "List entries in a directory under workspace root {s} and return metadata (name, path, type, size, mode, owner, group, modified_at).",
+        .{workspace_root},
+    );
+    defer allocator.free(description);
+
+    try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"filesystem_list\",\"description\":");
+    try writeJsonString(allocator, writer, description);
+    try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"additionalProperties\":false}}}");
 }
 
 fn writeFilesystemWriteToolDefinition(
@@ -673,16 +692,17 @@ test "buildChatCompletionsPayload creates valid payload" {
     try std.testing.expectEqualStrings("general kenobi", payload_messages[1].object.get("content").?.string);
 
     const tools = root.get("tools").?.array.items;
-    try std.testing.expectEqual(@as(usize, 9), tools.len);
+    try std.testing.expectEqual(@as(usize, 10), tools.len);
     try std.testing.expectEqualStrings("filesystem_read", tools[0].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("filesystem_write", tools[1].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("filesystem_delete", tools[2].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("lua_execute", tools[3].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("config", tools[4].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("http_get", tools[5].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("http_post", tools[6].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("http_put", tools[7].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("http_delete", tools[8].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("filesystem_list", tools[1].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("filesystem_write", tools[2].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("filesystem_delete", tools[3].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("lua_execute", tools[4].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("config", tools[5].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("http_get", tools[6].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("http_post", tools[7].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("http_put", tools[8].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("http_delete", tools[9].object.get("function").?.object.get("name").?.string);
 }
 
 test "parseAssistantReply extracts assistant content" {

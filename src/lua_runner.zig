@@ -265,6 +265,37 @@ fn pushLuaJsonValue(state: *c.lua_State, value: std.json.Value, depth: usize) !v
     }
 }
 
+fn setLuaMetadataFields(state: *c.lua_State, metadata: *const workspace_fs.PathMetadata) void {
+    _ = c.lua_pushlstring(state, metadata.name.ptr, metadata.name.len);
+    c.lua_setfield(state, -2, "name");
+
+    _ = c.lua_pushlstring(state, metadata.path.ptr, metadata.path.len);
+    c.lua_setfield(state, -2, "path");
+
+    const type_name = workspace_fs.entryTypeToString(metadata.entry_type);
+    _ = c.lua_pushlstring(state, type_name.ptr, type_name.len);
+    c.lua_setfield(state, -2, "type");
+
+    if (std.math.cast(c.lua_Integer, metadata.size)) |size_value| {
+        c.lua_pushinteger(state, size_value);
+    } else {
+        c.lua_pushnumber(state, @floatFromInt(metadata.size));
+    }
+    c.lua_setfield(state, -2, "size");
+
+    _ = c.lua_pushlstring(state, metadata.mode.ptr, metadata.mode.len);
+    c.lua_setfield(state, -2, "mode");
+
+    _ = c.lua_pushlstring(state, metadata.owner.ptr, metadata.owner.len);
+    c.lua_setfield(state, -2, "owner");
+
+    _ = c.lua_pushlstring(state, metadata.group.ptr, metadata.group.len);
+    c.lua_setfield(state, -2, "group");
+
+    _ = c.lua_pushlstring(state, metadata.modified_at.ptr, metadata.modified_at.len);
+    c.lua_setfield(state, -2, "modified_at");
+}
+
 fn luaZoidFileRead(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
     const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
@@ -374,14 +405,26 @@ fn luaZoidFileDelete(lua_state: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaZoidFile(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
 
     var path_len: usize = 0;
     const path_ptr = c.luaL_checklstring(state, 1, &path_len) orelse return pushLuaErrorMessage(state, "zoid.file requires path", .{});
-    const path = path_ptr[0..path_len];
+    const requested_path = path_ptr[0..path_len];
+
+    const metadata = workspace_fs.getPathMetadata(
+        env.allocator,
+        env.workspace_root,
+        requested_path,
+        .file,
+    ) catch |err| {
+        return pushLuaErrorMessage(state, "zoid.file(path) failed: {s}", .{@errorName(err)});
+    };
+    defer metadata.deinit(env.allocator);
 
     c.lua_newtable(state);
-    _ = c.lua_pushlstring(state, path.ptr, path.len);
+    _ = c.lua_pushlstring(state, metadata.path.ptr, metadata.path.len);
     c.lua_setfield(state, -2, "_path");
+    setLuaMetadataFields(state, &metadata);
 
     c.lua_pushcclosure(state, luaZoidFileRead, 0);
     c.lua_setfield(state, -2, "read");
@@ -389,6 +432,71 @@ fn luaZoidFile(lua_state: ?*c.lua_State) callconv(.c) c_int {
     c.lua_setfield(state, -2, "write");
     c.lua_pushcclosure(state, luaZoidFileDelete, 0);
     c.lua_setfield(state, -2, "delete");
+    return 1;
+}
+
+fn luaZoidDirList(lua_state: ?*c.lua_State) callconv(.c) c_int {
+    const state = lua_state orelse return 0;
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+
+    if (c.lua_type(state, 1) != c.LUA_TTABLE) {
+        return pushLuaErrorMessage(state, "zoid.dir(path):list requires directory handle", .{});
+    }
+
+    _ = c.lua_getfield(state, 1, "_path");
+    var path_len: usize = 0;
+    const path_ptr = c.lua_tolstring(state, -1, &path_len) orelse return pushLuaErrorMessage(state, "zoid.dir(path):list requires directory handle", .{});
+    const requested_path = path_ptr[0..path_len];
+    luaPop(state, 1);
+
+    const list_result = workspace_fs.listDirectory(
+        env.allocator,
+        env.workspace_root,
+        requested_path,
+    ) catch |err| {
+        return pushLuaErrorMessage(state, "zoid.dir(path):list failed: {s}", .{@errorName(err)});
+    };
+    defer list_result.deinit(env.allocator);
+
+    c.lua_newtable(state);
+    for (list_result.entries, 0..) |entry, index| {
+        c.lua_pushinteger(state, @intCast(index + 1));
+        c.lua_newtable(state);
+        setLuaMetadataFields(state, &entry);
+        c.lua_settable(state, -3);
+    }
+    return 1;
+}
+
+fn luaZoidDir(lua_state: ?*c.lua_State) callconv(.c) c_int {
+    const state = lua_state orelse return 0;
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+
+    var path_len: usize = 0;
+    const path_ptr = c.luaL_checklstring(state, 1, &path_len) orelse return pushLuaErrorMessage(state, "zoid.dir requires path", .{});
+    const requested_path = path_ptr[0..path_len];
+
+    const metadata = workspace_fs.getPathMetadata(
+        env.allocator,
+        env.workspace_root,
+        requested_path,
+        .directory,
+    ) catch |err| {
+        return pushLuaErrorMessage(state, "zoid.dir(path) failed: {s}", .{@errorName(err)});
+    };
+    defer metadata.deinit(env.allocator);
+
+    if (metadata.exists and metadata.entry_type != .directory) {
+        return pushLuaErrorMessage(state, "zoid.dir(path) failed: NotDir", .{});
+    }
+
+    c.lua_newtable(state);
+    _ = c.lua_pushlstring(state, metadata.path.ptr, metadata.path.len);
+    c.lua_setfield(state, -2, "_path");
+    setLuaMetadataFields(state, &metadata);
+
+    c.lua_pushcclosure(state, luaZoidDirList, 0);
+    c.lua_setfield(state, -2, "list");
     return 1;
 }
 
@@ -837,6 +945,20 @@ fn installOutputCapture(lua_state: *c.lua_State, capture: *LuaOutputCapture) voi
     _ = c.lua_setglobal(lua_state, "io");
 }
 
+fn installScriptArgs(lua_state: *c.lua_State, file_path: []const u8, script_args: []const []const u8) void {
+    c.lua_newtable(lua_state);
+
+    _ = c.lua_pushlstring(lua_state, file_path.ptr, file_path.len);
+    c.lua_rawseti(lua_state, -2, 0);
+
+    for (script_args, 0..) |script_arg, script_arg_index| {
+        _ = c.lua_pushlstring(lua_state, script_arg.ptr, script_arg.len);
+        c.lua_rawseti(lua_state, -2, @intCast(script_arg_index + 1));
+    }
+
+    _ = c.lua_setglobal(lua_state, "arg");
+}
+
 fn installZoidTable(lua_state: *c.lua_State, sandbox: *ToolLuaEnvironment) void {
     c.lua_pushlightuserdata(lua_state, sandbox);
     _ = c.lua_setglobal(lua_state, tool_sandbox_registry_key);
@@ -844,6 +966,8 @@ fn installZoidTable(lua_state: *c.lua_State, sandbox: *ToolLuaEnvironment) void 
     c.lua_newtable(lua_state);
     c.lua_pushcclosure(lua_state, luaZoidFile, 0);
     c.lua_setfield(lua_state, -2, "file");
+    c.lua_pushcclosure(lua_state, luaZoidDir, 0);
+    c.lua_setfield(lua_state, -2, "dir");
     c.lua_pushcclosure(lua_state, luaZoidUri, 0);
     c.lua_setfield(lua_state, -2, "uri");
     c.lua_pushcclosure(lua_state, luaZoidConfig, 0);
@@ -861,7 +985,7 @@ fn setGlobalNil(lua_state: *c.lua_State, name: [:0]const u8) void {
 fn restrictToolLuaEnvironment(lua_state: *c.lua_State, sandbox: *ToolLuaEnvironment) void {
     installZoidTable(lua_state, sandbox);
 
-    // Remove standard escape hatches; zoid.file(...), zoid.uri(...), zoid.config(), and zoid.json.decode are sandbox APIs.
+    // Remove standard escape hatches; zoid.file(...), zoid.dir(...), zoid.uri(...), zoid.config(), and zoid.json.decode are sandbox APIs.
     setGlobalNil(lua_state, "workspace");
     setGlobalNil(lua_state, "os");
     setGlobalNil(lua_state, "package");
@@ -875,6 +999,7 @@ fn executeLuaFileCaptureOutputInternal(
     allocator: std.mem.Allocator,
     file_path: []const u8,
     sandbox: ?ToolSandbox,
+    script_args: []const []const u8,
 ) CaptureError!CapturedExecution {
     const c_file_path = try allocator.dupeZ(u8, file_path);
     defer allocator.free(c_file_path);
@@ -893,6 +1018,7 @@ fn executeLuaFileCaptureOutputInternal(
     var capture = LuaOutputCapture{ .allocator = allocator };
     defer capture.deinit();
     installOutputCapture(lua_state, &capture);
+    installScriptArgs(lua_state, file_path, script_args);
 
     var tool_env: ToolLuaEnvironment = undefined;
     if (sandbox) |tool_sandbox| {
@@ -961,7 +1087,7 @@ pub fn executeLuaFileCaptureOutput(
     allocator: std.mem.Allocator,
     file_path: []const u8,
 ) CaptureError!CapturedExecution {
-    return executeLuaFileCaptureOutputInternal(allocator, file_path, null);
+    return executeLuaFileCaptureOutputInternal(allocator, file_path, null, &.{});
 }
 
 pub fn executeLuaFileCaptureOutputTool(
@@ -969,7 +1095,16 @@ pub fn executeLuaFileCaptureOutputTool(
     file_path: []const u8,
     sandbox: ToolSandbox,
 ) CaptureError!CapturedExecution {
-    return executeLuaFileCaptureOutputInternal(allocator, file_path, sandbox);
+    return executeLuaFileCaptureOutputInternal(allocator, file_path, sandbox, &.{});
+}
+
+pub fn executeLuaFileCaptureOutputToolWithArgs(
+    allocator: std.mem.Allocator,
+    file_path: []const u8,
+    sandbox: ToolSandbox,
+    script_args: []const []const u8,
+) CaptureError!CapturedExecution {
+    return executeLuaFileCaptureOutputInternal(allocator, file_path, sandbox, script_args);
 }
 
 test "executeLuaFile runs a valid script" {
@@ -1104,6 +1239,84 @@ test "executeLuaFileCaptureOutputTool allows zoid file read/write/delete and cap
     const note_path = try std.fs.path.join(std.testing.allocator, &.{ workspace_root, "note.txt" });
     defer std.testing.allocator.free(note_path);
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(note_path, .{}));
+}
+
+test "executeLuaFileCaptureOutputToolWithArgs sets Lua arg table" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file_path = "argv.lua";
+    const file = try tmp.dir.createFile(file_path, .{});
+    defer file.close();
+    try file.writeAll(
+        \\print(arg[1])
+        \\print(arg[2])
+        \\
+    );
+
+    const abs_path = try tmp.dir.realpathAlloc(std.testing.allocator, file_path);
+    defer std.testing.allocator.free(abs_path);
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    const script_args = [_][]const u8{ "left", "right" };
+    var output = try executeLuaFileCaptureOutputToolWithArgs(
+        std.testing.allocator,
+        abs_path,
+        .{
+            .workspace_root = workspace_root,
+        },
+        &script_args,
+    );
+    defer output.deinit(std.testing.allocator);
+
+    try std.testing.expect(output.status == .ok);
+    try std.testing.expectEqualStrings("left\nright\n", output.stdout);
+    try std.testing.expectEqualStrings("", output.stderr);
+}
+
+test "executeLuaFileCaptureOutputTool exposes file metadata and dir listing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("data/z-sub");
+    {
+        const data_file = try tmp.dir.createFile("data/a.txt", .{});
+        defer data_file.close();
+        try data_file.writeAll("alpha");
+    }
+
+    const file_path = "metadata.lua";
+    const script = try tmp.dir.createFile(file_path, .{});
+    defer script.close();
+    try script.writeAll(
+        \\local note = zoid.file("data/a.txt")
+        \\print("file_meta", note.name, note.type, note.size == 5, #note.mode == 4, #note.owner > 0, #note.group > 0, string.sub(note.modified_at, -1) == "Z")
+        \\local dir = zoid.dir("data")
+        \\print("dir_meta", dir.name, dir.type, #dir.mode == 4, #dir.owner > 0, #dir.group > 0)
+        \\local entries = dir:list()
+        \\print("entries", #entries, entries[1].name, entries[1].type, entries[2].name, entries[2].type)
+        \\
+    );
+
+    const abs_path = try tmp.dir.realpathAlloc(std.testing.allocator, file_path);
+    defer std.testing.allocator.free(abs_path);
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    var output = try executeLuaFileCaptureOutputTool(std.testing.allocator, abs_path, .{
+        .workspace_root = workspace_root,
+    });
+    defer output.deinit(std.testing.allocator);
+
+    try std.testing.expect(output.status == .ok);
+    try std.testing.expectEqualStrings(
+        "file_meta\ta.txt\tfile\ttrue\ttrue\ttrue\ttrue\ttrue\n" ++
+            "dir_meta\tdata\tdirectory\ttrue\ttrue\ttrue\n" ++
+            "entries\t2\ta.txt\tfile\tz-sub\tdirectory\n",
+        output.stdout,
+    );
+    try std.testing.expectEqualStrings("", output.stderr);
 }
 
 test "executeLuaFileCaptureOutputTool supports zoid config list/get/set/unset" {

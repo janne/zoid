@@ -7,6 +7,7 @@ const workspace_fs = @import("workspace_fs.zig");
 pub const sandbox_mode: []const u8 = "workspace-write";
 pub const enabled_tools = [_][]const u8{
     "filesystem_read",
+    "filesystem_list",
     "filesystem_write",
     "filesystem_delete",
     "lua_execute",
@@ -75,6 +76,9 @@ pub fn executeToolCall(
 ) ![]u8 {
     if (std.mem.eql(u8, tool_name, "filesystem_read")) {
         return executeFilesystemRead(allocator, policy, arguments_json);
+    }
+    if (std.mem.eql(u8, tool_name, "filesystem_list")) {
+        return executeFilesystemList(allocator, policy, arguments_json);
     }
     if (std.mem.eql(u8, tool_name, "filesystem_write")) {
         return executeFilesystemWrite(allocator, policy, arguments_json);
@@ -211,6 +215,50 @@ fn executeFilesystemWrite(
     return output.toOwnedSlice();
 }
 
+fn executeFilesystemList(
+    allocator: std.mem.Allocator,
+    policy: *const Policy,
+    arguments_json: []const u8,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{});
+    defer parsed.deinit();
+
+    const root_object = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidToolArguments,
+    };
+
+    var requested_path: []const u8 = ".";
+    if (root_object.get("path")) |path_value| {
+        requested_path = switch (path_value) {
+            .string => |value| value,
+            else => return error.InvalidToolArguments,
+        };
+    }
+
+    var list_result = try workspace_fs.listDirectory(
+        allocator,
+        policy.workspace_root,
+        requested_path,
+    );
+    defer list_result.deinit(allocator);
+
+    var output = std.Io.Writer.Allocating.init(allocator);
+    errdefer output.deinit();
+
+    const writer = &output.writer;
+    try writer.writeAll("{\"ok\":true,\"tool\":\"filesystem_list\",\"path\":");
+    try writeJsonString(allocator, writer, list_result.path);
+    try writer.writeAll(",\"entries\":[");
+    for (list_result.entries, 0..) |entry, index| {
+        if (index != 0) try writer.writeAll(",");
+        try writePathMetadataJson(allocator, writer, &entry);
+    }
+    try writer.writeAll("]}");
+
+    return output.toOwnedSlice();
+}
+
 fn executeFilesystemDelete(
     allocator: std.mem.Allocator,
     policy: *const Policy,
@@ -247,6 +295,30 @@ fn executeFilesystemDelete(
     return output.toOwnedSlice();
 }
 
+fn writePathMetadataJson(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    metadata: *const workspace_fs.PathMetadata,
+) !void {
+    try writer.writeAll("{\"name\":");
+    try writeJsonString(allocator, writer, metadata.name);
+    try writer.writeAll(",\"path\":");
+    try writeJsonString(allocator, writer, metadata.path);
+    try writer.writeAll(",\"type\":");
+    try writeJsonString(allocator, writer, workspace_fs.entryTypeToString(metadata.entry_type));
+    try writer.writeAll(",\"size\":");
+    try writer.print("{d}", .{metadata.size});
+    try writer.writeAll(",\"mode\":");
+    try writeJsonString(allocator, writer, metadata.mode);
+    try writer.writeAll(",\"owner\":");
+    try writeJsonString(allocator, writer, metadata.owner);
+    try writer.writeAll(",\"group\":");
+    try writeJsonString(allocator, writer, metadata.group);
+    try writer.writeAll(",\"modified_at\":");
+    try writeJsonString(allocator, writer, metadata.modified_at);
+    try writer.writeAll("}");
+}
+
 fn executeLuaExecute(
     allocator: std.mem.Allocator,
     policy: *const Policy,
@@ -265,6 +337,23 @@ fn executeLuaExecute(
         else => return error.InvalidToolArguments,
     };
 
+    var script_args = std.ArrayList([]const u8).empty;
+    defer script_args.deinit(allocator);
+    if (root_object.get("args")) |args_value| {
+        const args_array = switch (args_value) {
+            .array => |value| value,
+            else => return error.InvalidToolArguments,
+        };
+
+        for (args_array.items) |arg_value| {
+            const script_arg = switch (arg_value) {
+                .string => |value| value,
+                else => return error.InvalidToolArguments,
+            };
+            try script_args.append(allocator, script_arg);
+        }
+    }
+
     const resolved_path = try workspace_fs.resolveAllowedReadPath(
         allocator,
         policy.workspace_root,
@@ -276,12 +365,17 @@ fn executeLuaExecute(
         return error.InvalidToolArguments;
     }
 
-    var execution = try lua_runner.executeLuaFileCaptureOutputTool(allocator, resolved_path, .{
-        .workspace_root = policy.workspace_root,
-        .max_read_bytes = max_allowed_read_bytes,
-        .max_http_response_bytes = max_allowed_http_response_bytes,
-        .config_path_override = policy.config_path_override,
-    });
+    var execution = try lua_runner.executeLuaFileCaptureOutputToolWithArgs(
+        allocator,
+        resolved_path,
+        .{
+            .workspace_root = policy.workspace_root,
+            .max_read_bytes = max_allowed_read_bytes,
+            .max_http_response_bytes = max_allowed_http_response_bytes,
+            .config_path_override = policy.config_path_override,
+        },
+        script_args.items,
+    );
     defer execution.deinit(allocator);
 
     var output = std.Io.Writer.Allocating.init(allocator);
@@ -530,7 +624,7 @@ test "buildPolicyJson emits required fields" {
     const root_object = parsed.value.object;
     try std.testing.expectEqualStrings("workspace-write", root_object.get("sandbox_mode").?.string);
     try std.testing.expectEqualStrings(policy.workspace_root, root_object.get("writable_roots").?.array.items[0].string);
-    try std.testing.expectEqual(@as(usize, 9), root_object.get("tools_enabled").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 10), root_object.get("tools_enabled").?.array.items.len);
 }
 
 test "filesystem write and read stay within workspace root" {
@@ -565,6 +659,76 @@ test "filesystem write and read stay within workspace root" {
     const read_object = parsed_read.value.object;
     try std.testing.expect(read_object.get("ok").?.bool);
     try std.testing.expectEqualStrings("hello", read_object.get("content").?.string);
+}
+
+test "filesystem list returns metadata entries" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("docs");
+    {
+        const file = try tmp.dir.createFile("alpha.txt", .{});
+        defer file.close();
+        try file.writeAll("hello");
+    }
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+
+    const list_result = try executeToolCall(
+        std.testing.allocator,
+        &policy,
+        "filesystem_list",
+        "{\"path\":\".\"}",
+    );
+    defer std.testing.allocator.free(list_result);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, list_result, .{});
+    defer parsed.deinit();
+
+    const root_object = parsed.value.object;
+    try std.testing.expect(root_object.get("ok").?.bool);
+    try std.testing.expectEqualStrings("filesystem_list", root_object.get("tool").?.string);
+    try std.testing.expectEqualStrings(tmp_path, root_object.get("path").?.string);
+
+    const entries = root_object.get("entries").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqualStrings("alpha.txt", entries[0].object.get("name").?.string);
+    try std.testing.expectEqualStrings("file", entries[0].object.get("type").?.string);
+    try std.testing.expect(entries[0].object.get("size").?.integer > 0);
+    try std.testing.expectEqual(@as(usize, 4), entries[0].object.get("mode").?.string.len);
+    try std.testing.expect(entries[0].object.get("owner").?.string.len > 0);
+    try std.testing.expect(entries[0].object.get("group").?.string.len > 0);
+    try std.testing.expect(std.mem.endsWith(u8, entries[0].object.get("modified_at").?.string, "Z"));
+
+    try std.testing.expectEqualStrings("docs", entries[1].object.get("name").?.string);
+    try std.testing.expectEqualStrings("directory", entries[1].object.get("type").?.string);
+}
+
+test "filesystem list rejects traversal outside workspace root" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("workspace");
+
+    const workspace_path = try tmp.dir.realpathAlloc(std.testing.allocator, "workspace");
+    defer std.testing.allocator.free(workspace_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, workspace_path);
+    defer policy.deinit(std.testing.allocator);
+
+    try std.testing.expectError(
+        error.PathNotAllowed,
+        executeToolCall(
+            std.testing.allocator,
+            &policy,
+            "filesystem_list",
+            "{\"path\":\"../\"}",
+        ),
+    );
 }
 
 test "filesystem write rejects traversal outside workspace root" {
@@ -689,6 +853,66 @@ test "lua execute runs script inside workspace root" {
     try std.testing.expect(!root_object.get("stdout_truncated").?.bool);
     try std.testing.expect(!root_object.get("stderr_truncated").?.bool);
     try std.testing.expect(root_object.get("error") == null);
+}
+
+test "lua execute forwards args to Lua arg table" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("args.lua", .{});
+    defer file.close();
+    try file.writeAll(
+        \\print(arg[1])
+        \\print(arg[2])
+        \\
+    );
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+
+    const result = try executeToolCall(
+        std.testing.allocator,
+        &policy,
+        "lua_execute",
+        "{\"path\":\"args.lua\",\"args\":[\"one\",\"two\"]}",
+    );
+    defer std.testing.allocator.free(result);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+
+    const root_object = parsed.value.object;
+    try std.testing.expect(root_object.get("ok").?.bool);
+    try std.testing.expectEqualStrings("one\ntwo\n", root_object.get("stdout").?.string);
+    try std.testing.expectEqualStrings("", root_object.get("stderr").?.string);
+}
+
+test "lua execute rejects invalid args shape" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("ok.lua", .{});
+    defer file.close();
+    try file.writeAll("print('ok')\n");
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+
+    try std.testing.expectError(
+        error.InvalidToolArguments,
+        executeToolCall(
+            std.testing.allocator,
+            &policy,
+            "lua_execute",
+            "{\"path\":\"ok.lua\",\"args\":[\"ok\",123]}",
+        ),
+    );
 }
 
 test "lua execute sandbox exposes zoid fs and blocks os" {

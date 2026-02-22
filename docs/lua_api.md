@@ -11,11 +11,17 @@ Zoid runs Lua in two ways:
 
 Both modes use sandbox restrictions and Lua API surface.
 
+When invoking `zoid execute`, extra positional arguments are forwarded to Lua global `arg`:
+
+- `arg[0]` = script path
+- `arg[1..n]` = arguments after `<file.lua>`
+
 ### Extra API Added by Zoid
 
 Lua run through Zoid has a `zoid` global with:
 
-- `zoid.file(path)` file handles
+- `zoid.file(path)` file handles with metadata
+- `zoid.dir(path)` directory handles with metadata
 - `zoid.uri(uri)` HTTP request handles
 - `zoid.config()` config handles
 - `zoid.json.decode(json_text)` JSON decoder
@@ -24,9 +30,20 @@ File example:
 
 ```lua
 local f = zoid.file("notes.txt")
+print(f.name, f.path, f.type, f.size, f.mode, f.owner, f.group, f.modified_at)
 f:write("hello")
 local content = f:read()
 local ok = f:delete()
+```
+
+Directory example:
+
+```lua
+local dir = zoid.dir("logs")
+print(dir.name, dir.path, dir.type, dir.modified_at)
+for _, entry in ipairs(dir:list()) do
+  print(entry.name, entry.type, entry.size, entry.modified_at)
+end
 ```
 
 URI example:
@@ -62,9 +79,12 @@ print(payload.ok, payload.count, payload.items[2] == zoid.json.null)
 
 Supported methods and return values:
 
+- `zoid.file(path) -> { name, path, type, size, mode, owner, group, modified_at, read, write, delete }`
 - `zoid.file(path):read([max_bytes]) -> string`
 - `zoid.file(path):write(content) -> integer` (bytes written)
 - `zoid.file(path):delete() -> boolean` (`true` on success)
+- `zoid.dir(path) -> { name, path, type, size, mode, owner, group, modified_at, list }`
+- `zoid.dir(path):list() -> { { name, path, type, size, mode, owner, group, modified_at }, ... }`
 - `zoid.uri(uri):get([options]) -> { status: integer, body: string, ok: boolean }`
 - `zoid.uri(uri):post([body], [options]) -> { status: integer, body: string, ok: boolean }`
 - `zoid.uri(uri):put([body], [options]) -> { status: integer, body: string, ok: boolean }`
@@ -98,9 +118,25 @@ The output APIs are replaced to capture script output safely:
 
 Captured streams are returned in tool JSON fields (`stdout`, `stderr`) instead of writing directly to terminal stdout/stderr.
 
+### `arg` Global
+
+Lua scripts receive an `arg` table:
+
+- `arg[0]` is the script path
+- `arg[1..n]` are positional script arguments
+
+For tool-mode `lua_execute`, positional arguments can be supplied with optional JSON `args`:
+
+```json
+{
+  "path": "scripts/example.lua",
+  "args": ["one", "two"]
+}
+```
+
 ### Filesystem Sandbox Rules
 
-All `zoid.file(path)` operations are enforced to stay inside workspace root:
+All `zoid.file(path)` and `zoid.dir(path)` operations are enforced to stay inside workspace root:
 
 - Relative paths are resolved from workspace root
 - Absolute paths are allowed only if they resolve inside workspace root
@@ -111,6 +147,7 @@ Method-specific behavior:
 - `:read()` requires an existing readable file
 - `:write()` creates or truncates the target file
 - `:delete()` deletes an existing file and fails if it does not exist
+- `zoid.dir(path):list()` requires an existing directory and returns one-level metadata entries sorted by name
 
 ### HTTP Request Rules
 

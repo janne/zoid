@@ -12,7 +12,10 @@ pub const ConfigCommand = union(enum) {
 
 pub const Command = union(enum) {
     help,
-    execute: []const u8,
+    execute: struct {
+        file_path: []const u8,
+        script_args: []const []const u8,
+    },
     run: []const []const u8,
     chat,
     serve,
@@ -40,7 +43,10 @@ pub fn parseCommand(args: []const []const u8) ParseCommandError!Command {
 
     if (std.mem.eql(u8, cmd, "execute")) {
         if (args.len < 3) return error.MissingExecuteArgument;
-        return .{ .execute = args[2] };
+        return .{ .execute = .{
+            .file_path = args[2],
+            .script_args = args[3..],
+        } };
     }
 
     if (std.mem.eql(u8, cmd, "run")) {
@@ -95,17 +101,17 @@ pub fn printHelp() void {
         \\zoid help
         \\  Show this help message.
         \\
-        \\zoid execute <file.lua>
-        \\  Executes the Lua script at <file.lua>.
+        \\zoid execute <file.lua> [args...]
+        \\  Executes the Lua script at <file.lua> and forwards [args...] to Lua `arg`.
         \\
         \\zoid run <prompt...>
         \\  Sends a single prompt to OpenAI and writes the response to stdout.
         \\
         \\zoid chat
-        \\  Starts an interactive full-screen chat session (TTY only).
+        \\  Starts an interactive full-screen chat session.
         \\
         \\zoid serve
-        \\  Starts long-running service mode (currently Telegram bot long-polling).
+        \\  Starts long-running service mode.
         \\
         \\zoid config set <key> <value>
         \\  Creates or updates a config key.
@@ -138,7 +144,25 @@ test "execute command" {
     const command = try parseCommand(&args);
 
     switch (command) {
-        .execute => |value| try std.testing.expectEqualStrings("foo", value),
+        .execute => |execute_cmd| {
+            try std.testing.expectEqualStrings("foo", execute_cmd.file_path);
+            try std.testing.expectEqual(@as(usize, 0), execute_cmd.script_args.len);
+        },
+        else => return error.UnexpectedCommand,
+    }
+}
+
+test "execute command with script args" {
+    const args = [_][]const u8{ "zoid", "execute", "foo.lua", "one", "two" };
+    const command = try parseCommand(&args);
+
+    switch (command) {
+        .execute => |execute_cmd| {
+            try std.testing.expectEqualStrings("foo.lua", execute_cmd.file_path);
+            try std.testing.expectEqual(@as(usize, 2), execute_cmd.script_args.len);
+            try std.testing.expectEqualStrings("one", execute_cmd.script_args[0]);
+            try std.testing.expectEqualStrings("two", execute_cmd.script_args[1]);
+        },
         else => return error.UnexpectedCommand,
     }
 }
