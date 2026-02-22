@@ -1,6 +1,10 @@
 const std = @import("std");
 const http_client = @import("http_client.zig");
+const lua_runner = @import("lua_runner.zig");
 const openai_client = @import("openai_client.zig");
+const scheduler_runtime = @import("scheduler_runtime.zig");
+const scheduler_store = @import("scheduler_store.zig");
+const tool_runtime = @import("tool_runtime.zig");
 
 pub const Settings = struct {
     bot_token: []const u8,
@@ -120,6 +124,9 @@ pub fn runLongPolling(allocator: std.mem.Allocator, settings: Settings) !void {
     const serve_lock = try acquireServeLock(runtime_paths.lock_path);
     defer serve_lock.close();
 
+    const workspace_root = try resolveWorkspaceRoot(allocator);
+    defer allocator.free(workspace_root);
+
     std.debug.print("Starting Telegram long-polling loop.\n", .{});
 
     var conversations = ConversationStore.init(allocator);
@@ -134,7 +141,33 @@ pub fn runLongPolling(allocator: std.mem.Allocator, settings: Settings) !void {
 
     var next_offset: i64 = 0;
     while (true) {
-        var batch = fetchPollBatch(allocator, settings.bot_token, next_offset) catch |err| {
+        processDueScheduledJobs(
+            allocator,
+            &conversations,
+            runtime_paths.state_path,
+            settings.openai_api_key,
+            settings.openai_model,
+            settings.bot_token,
+            workspace_root,
+        ) catch |err| {
+            std.debug.print("Failed to process scheduled jobs: {s}\n", .{@errorName(err)});
+        };
+
+        const now = std.time.timestamp();
+        const poll_timeout_seconds = computePollTimeoutSeconds(
+            scheduler_runtime.secondsUntilNextDue(
+                allocator,
+                .{ .workspace_root = workspace_root },
+                now,
+            ) catch null,
+        );
+
+        var batch = fetchPollBatch(
+            allocator,
+            settings.bot_token,
+            next_offset,
+            poll_timeout_seconds,
+        ) catch |err| {
             std.debug.print("Telegram getUpdates failed: {s}\n", .{@errorName(err)});
             std.Thread.sleep(poll_backoff_ns);
             continue;
@@ -205,54 +238,23 @@ fn processInboundMessage(
         return;
     }
 
-    const conversation = try getOrCreateConversation(conversations, chat_id);
-    try conversation.appendMessage(allocator, .user, prompt);
-
-    var conversation_turn_committed = false;
-    errdefer {
-        if (!conversation_turn_committed) {
-            conversation.popLastMessage(allocator);
-        }
-    }
-
-    var typing_notifier: TypingNotifier = .{};
-    typing_notifier.start(bot_token, chat_id) catch |err| {
-        std.debug.print(
-            "Failed to start Telegram typing notifier for chat {d}: {s}\n",
-            .{ chat_id, @errorName(err) },
-        );
-    };
-    defer typing_notifier.stop();
-
-    const reply = try openai_client.fetchAssistantReply(
-        allocator,
-        api_key,
-        model,
-        conversation.messages.items,
-    );
-    defer allocator.free(reply);
-
-    const trimmed_reply = std.mem.trim(u8, reply, " \t\r\n");
-    if (trimmed_reply.len == 0) {
-        conversation.popLastMessage(allocator);
-        conversation_turn_committed = true;
-        try sendMessageInChunks(
-            allocator,
-            bot_token,
-            chat_id,
-            "Assistant returned an empty response.",
-        );
+    if (isChatIdCommand(prompt)) {
+        const chat_id_text = try std.fmt.allocPrint(allocator, "Current chat_id: {d}", .{chat_id});
+        defer allocator.free(chat_id_text);
+        try sendMessageInChunks(allocator, bot_token, chat_id, chat_id_text);
         return;
     }
 
-    try sendMessageInChunks(allocator, bot_token, chat_id, trimmed_reply);
-    try conversation.appendMessage(allocator, .assistant, trimmed_reply);
-    enforceConversationLimit(conversation, allocator);
-    conversation_turn_committed = true;
-
-    persistConversationStoreAtPath(allocator, state_path, conversations) catch |err| {
-        std.debug.print("Failed to persist Telegram conversation state: {s}\n", .{@errorName(err)});
-    };
+    try processPromptForChat(
+        allocator,
+        conversations,
+        state_path,
+        api_key,
+        model,
+        bot_token,
+        chat_id,
+        prompt,
+    );
 }
 
 fn deinitConversationStore(
@@ -290,6 +292,127 @@ fn clearConversationForChat(
 
 fn isResetCommand(prompt: []const u8) bool {
     return std.mem.eql(u8, prompt, "/new") or std.mem.eql(u8, prompt, "/reset");
+}
+
+fn isChatIdCommand(prompt: []const u8) bool {
+    return std.mem.eql(u8, prompt, "/chatid");
+}
+
+fn processPromptForChat(
+    allocator: std.mem.Allocator,
+    conversations: *ConversationStore,
+    state_path: []const u8,
+    api_key: []const u8,
+    model: []const u8,
+    bot_token: []const u8,
+    chat_id: i64,
+    prompt: []const u8,
+) !void {
+    const conversation = try getOrCreateConversation(conversations, chat_id);
+    try conversation.appendMessage(allocator, .user, prompt);
+
+    var conversation_turn_committed = false;
+    errdefer {
+        if (!conversation_turn_committed) {
+            conversation.popLastMessage(allocator);
+        }
+    }
+
+    var typing_notifier: TypingNotifier = .{};
+    typing_notifier.start(bot_token, chat_id) catch |err| {
+        std.debug.print(
+            "Failed to start Telegram typing notifier for chat {d}: {s}\n",
+            .{ chat_id, @errorName(err) },
+        );
+    };
+    defer typing_notifier.stop();
+
+    const reply = try openai_client.fetchAssistantReplyWithContext(
+        allocator,
+        api_key,
+        model,
+        conversation.messages.items,
+        .{ .request_chat_id = chat_id },
+    );
+    defer allocator.free(reply);
+
+    const trimmed_reply = std.mem.trim(u8, reply, " \t\r\n");
+    if (trimmed_reply.len == 0) {
+        conversation.popLastMessage(allocator);
+        conversation_turn_committed = true;
+        try sendMessageInChunks(
+            allocator,
+            bot_token,
+            chat_id,
+            "Assistant returned an empty response.",
+        );
+        return;
+    }
+
+    try sendMessageInChunks(allocator, bot_token, chat_id, trimmed_reply);
+    try conversation.appendMessage(allocator, .assistant, trimmed_reply);
+    enforceConversationLimit(conversation, allocator);
+    conversation_turn_committed = true;
+
+    persistConversationStoreAtPath(allocator, state_path, conversations) catch |err| {
+        std.debug.print("Failed to persist Telegram conversation state: {s}\n", .{@errorName(err)});
+    };
+}
+
+fn processDueScheduledJobs(
+    allocator: std.mem.Allocator,
+    conversations: *ConversationStore,
+    state_path: []const u8,
+    api_key: []const u8,
+    model: []const u8,
+    bot_token: []const u8,
+    workspace_root: []const u8,
+) !void {
+    const now = std.time.timestamp();
+    const due_jobs = try scheduler_runtime.takeDueJobs(
+        allocator,
+        .{ .workspace_root = workspace_root },
+        now,
+    );
+    defer scheduler_runtime.deinitDueJobs(allocator, due_jobs);
+
+    for (due_jobs) |*due_job| {
+        const scheduled_prompt = buildScheduledPrompt(
+            allocator,
+            workspace_root,
+            due_job,
+            now,
+        ) catch |err| {
+            std.debug.print(
+                "Failed to build scheduled prompt for job {s}: {s}\n",
+                .{ due_job.job.id, @errorName(err) },
+            );
+            continue;
+        };
+        defer allocator.free(scheduled_prompt);
+
+        processPromptForChat(
+            allocator,
+            conversations,
+            state_path,
+            api_key,
+            model,
+            bot_token,
+            due_job.job.chat_id,
+            scheduled_prompt,
+        ) catch |err| {
+            std.debug.print(
+                "Failed to process scheduled job {s} for chat {d}: {s}\n",
+                .{ due_job.job.id, due_job.job.chat_id, @errorName(err) },
+            );
+            sendMessageInChunks(
+                allocator,
+                bot_token,
+                due_job.job.chat_id,
+                "Scheduled job failed while contacting the assistant.",
+            ) catch {};
+        };
+    }
 }
 
 fn enforceConversationLimit(conversation: *Conversation, allocator: std.mem.Allocator) void {
@@ -506,10 +629,156 @@ fn parseRole(name: []const u8) ?openai_client.Role {
     return null;
 }
 
+const MarkdownReadResult = struct {
+    content: []u8,
+    truncated: bool,
+
+    fn deinit(self: *MarkdownReadResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.content);
+    }
+};
+
+fn buildScheduledPrompt(
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    due_job: *const scheduler_runtime.DueJob,
+    triggered_at: i64,
+) ![]u8 {
+    var payload = std.ArrayList(u8).empty;
+    errdefer payload.deinit(allocator);
+
+    try payload.appendSlice(allocator, "A scheduled job has been triggered. Review the structured payload and craft a concise Telegram DM response.\n");
+    try payload.appendSlice(allocator, "{\"event\":\"scheduled_job\",\"job\":{");
+    try payload.appendSlice(allocator, "\"id\":");
+    try appendJsonString(allocator, &payload, due_job.job.id);
+    try payload.appendSlice(allocator, ",\"job_type\":");
+    try appendJsonString(allocator, &payload, scheduler_store.jobTypeToString(due_job.job.job_type));
+    try payload.appendSlice(allocator, ",\"path\":");
+    try appendJsonString(allocator, &payload, due_job.job.path);
+    try payload.appendSlice(allocator, ",\"chat_id\":");
+    try payload.writer(allocator).print("{d}", .{due_job.job.chat_id});
+    try payload.appendSlice(allocator, ",\"scheduled_for\":");
+    try payload.writer(allocator).print("{d}", .{due_job.scheduled_for});
+    try payload.appendSlice(allocator, ",\"triggered_at\":");
+    try payload.writer(allocator).print("{d}", .{triggered_at});
+    try payload.appendSlice(allocator, "},\"result\":{");
+
+    switch (due_job.job.job_type) {
+        .lua => {
+            var execution = try lua_runner.executeLuaFileCaptureOutputTool(
+                allocator,
+                due_job.job.path,
+                .{
+                    .workspace_root = workspace_root,
+                    .max_read_bytes = tool_runtime.max_allowed_read_bytes,
+                    .max_http_response_bytes = tool_runtime.max_allowed_http_response_bytes,
+                },
+            );
+            defer execution.deinit(allocator);
+
+            try payload.appendSlice(allocator, "\"kind\":\"lua\",\"status\":");
+            try appendJsonString(allocator, &payload, executionStatusToString(execution.status));
+            try payload.appendSlice(allocator, ",\"stdout\":");
+            try appendJsonString(allocator, &payload, execution.stdout);
+            try payload.appendSlice(allocator, ",\"stderr\":");
+            try appendJsonString(allocator, &payload, execution.stderr);
+            try payload.appendSlice(allocator, ",\"stdout_truncated\":");
+            try payload.appendSlice(allocator, if (execution.stdout_truncated) "true" else "false");
+            try payload.appendSlice(allocator, ",\"stderr_truncated\":");
+            try payload.appendSlice(allocator, if (execution.stderr_truncated) "true" else "false");
+        },
+        .markdown => {
+            var markdown_read = try readMarkdownWithCap(
+                allocator,
+                due_job.job.path,
+                tool_runtime.max_allowed_read_bytes,
+            );
+            defer markdown_read.deinit(allocator);
+
+            try payload.appendSlice(allocator, "\"kind\":\"markdown\",\"content\":");
+            try appendJsonString(allocator, &payload, markdown_read.content);
+            try payload.appendSlice(allocator, ",\"content_truncated\":");
+            try payload.appendSlice(allocator, if (markdown_read.truncated) "true" else "false");
+        },
+    }
+
+    try payload.appendSlice(allocator, "}}\n");
+    return payload.toOwnedSlice(allocator);
+}
+
+fn readMarkdownWithCap(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    cap_bytes: usize,
+) !MarkdownReadResult {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+
+    var result = std.ArrayList(u8).empty;
+    errdefer result.deinit(allocator);
+
+    var truncated = false;
+    var total: usize = 0;
+    var buffer: [4096]u8 = undefined;
+    while (true) {
+        const read_len = try file.read(&buffer);
+        if (read_len == 0) break;
+
+        const remaining = cap_bytes -| total;
+        if (read_len > remaining) {
+            if (remaining > 0) try result.appendSlice(allocator, buffer[0..remaining]);
+            truncated = true;
+            break;
+        }
+
+        try result.appendSlice(allocator, buffer[0..read_len]);
+        total += read_len;
+        if (total >= cap_bytes) {
+            truncated = true;
+            break;
+        }
+    }
+
+    return .{
+        .content = try result.toOwnedSlice(allocator),
+        .truncated = truncated,
+    };
+}
+
+fn appendJsonString(allocator: std.mem.Allocator, payload: *std.ArrayList(u8), value: []const u8) !void {
+    const escaped = try std.json.Stringify.valueAlloc(allocator, value, .{});
+    defer allocator.free(escaped);
+    try payload.appendSlice(allocator, escaped);
+}
+
+fn executionStatusToString(status: lua_runner.CapturedExecutionStatus) []const u8 {
+    return switch (status) {
+        .ok => "ok",
+        .state_init_failed => "state_init_failed",
+        .load_failed => "load_failed",
+        .runtime_failed => "runtime_failed",
+    };
+}
+
+fn resolveWorkspaceRoot(allocator: std.mem.Allocator) ![]u8 {
+    const cwd = try std.process.getCwdAlloc(allocator);
+    defer allocator.free(cwd);
+    return std.fs.cwd().realpathAlloc(allocator, cwd);
+}
+
+fn computePollTimeoutSeconds(seconds_until_next_due: ?u64) u16 {
+    const fallback: u64 = max_poll_timeout_seconds;
+    const value = seconds_until_next_due orelse fallback;
+    if (value == 0) return 1;
+    const bounded = @min(fallback, value);
+    return std.math.cast(u16, bounded) orelse max_poll_timeout_seconds;
+}
+
 fn fetchPollBatch(
     allocator: std.mem.Allocator,
     bot_token: []const u8,
     current_offset: i64,
+    timeout_seconds: u16,
 ) !PollBatch {
     const uri = try std.fmt.allocPrint(
         allocator,
@@ -521,7 +790,7 @@ fn fetchPollBatch(
     const payload = try std.fmt.allocPrint(
         allocator,
         "{{\"offset\":{d},\"timeout\":{d},\"allowed_updates\":[\"message\"]}}",
-        .{ current_offset, max_poll_timeout_seconds },
+        .{ current_offset, timeout_seconds },
     );
     defer allocator.free(payload);
 
@@ -923,6 +1192,12 @@ test "isResetCommand matches supported telegram commands" {
     try std.testing.expect(isResetCommand("/reset"));
     try std.testing.expect(!isResetCommand("/help"));
     try std.testing.expect(!isResetCommand("new"));
+}
+
+test "isChatIdCommand matches supported command" {
+    try std.testing.expect(isChatIdCommand("/chatid"));
+    try std.testing.expect(!isChatIdCommand("/chat_id"));
+    try std.testing.expect(!isChatIdCommand("chatid"));
 }
 
 test "buildChatActionPayload encodes chat action request" {

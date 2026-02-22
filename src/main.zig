@@ -36,8 +36,33 @@ pub fn main() !void {
                 zoid.cli.printHelp();
                 return;
             },
+            error.MissingScheduleSubcommand => {
+                std.debug.print("Missing subcommand for 'schedule'.\n\n", .{});
+                zoid.cli.printHelp();
+                return;
+            },
+            error.MissingScheduleArgument => {
+                std.debug.print("Missing argument for schedule command.\n\n", .{});
+                zoid.cli.printHelp();
+                return;
+            },
+            error.InvalidScheduleArguments => {
+                std.debug.print("Invalid arguments for schedule command.\n\n", .{});
+                zoid.cli.printHelp();
+                return;
+            },
+            error.InvalidChatId => {
+                std.debug.print("Invalid value for --chat-id (expected integer).\n\n", .{});
+                zoid.cli.printHelp();
+                return;
+            },
             error.UnknownConfigSubcommand => {
                 std.debug.print("Unknown config command: {s}\n\n", .{args[2]});
+                zoid.cli.printHelp();
+                return;
+            },
+            error.UnknownScheduleSubcommand => {
+                std.debug.print("Unknown schedule command: {s}\n\n", .{args[2]});
                 zoid.cli.printHelp();
                 return;
             },
@@ -147,6 +172,84 @@ pub fn main() !void {
                     try std.fs.File.stdout().writeAll("\n");
                 }
             },
+        },
+        .schedule => |schedule_cmd| {
+            const workspace_root = getWorkspaceRoot(allocator) catch |err| {
+                std.debug.print("Failed to resolve workspace root: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            defer allocator.free(workspace_root);
+
+            const scheduler_context = zoid.scheduler_runtime.Context{
+                .workspace_root = workspace_root,
+            };
+
+            switch (schedule_cmd) {
+                .create => |create_cmd| {
+                    var created = zoid.scheduler_runtime.createJob(
+                        allocator,
+                        scheduler_context,
+                        .{
+                            .job_type = create_cmd.job_type,
+                            .path = create_cmd.path,
+                            .run_at = create_cmd.run_at,
+                            .cron = create_cmd.cron,
+                            .chat_id = create_cmd.chat_id,
+                        },
+                    ) catch |err| {
+                        reportScheduleError(err);
+                        std.process.exit(1);
+                    };
+                    defer created.deinit(allocator);
+
+                    try printScheduleJob(allocator, &created);
+                },
+                .list => {
+                    const jobs = zoid.scheduler_runtime.listJobs(allocator, scheduler_context) catch |err| {
+                        reportScheduleError(err);
+                        std.process.exit(1);
+                    };
+                    defer zoid.scheduler_store.deinitJobs(allocator, jobs);
+
+                    if (jobs.len == 0) {
+                        try std.fs.File.stdout().writeAll("No scheduled jobs.\n");
+                    } else {
+                        for (jobs) |*job| {
+                            try printScheduleJob(allocator, job);
+                        }
+                    }
+                },
+                .delete => |job_id| {
+                    const removed = zoid.scheduler_runtime.deleteJob(allocator, scheduler_context, job_id) catch |err| {
+                        reportScheduleError(err);
+                        std.process.exit(1);
+                    };
+                    if (!removed) {
+                        std.debug.print("Scheduled job not found: {s}\n", .{job_id});
+                        std.process.exit(1);
+                    }
+                },
+                .pause => |job_id| {
+                    const updated = zoid.scheduler_runtime.pauseJob(allocator, scheduler_context, job_id) catch |err| {
+                        reportScheduleError(err);
+                        std.process.exit(1);
+                    };
+                    if (!updated) {
+                        std.debug.print("Scheduled job not found: {s}\n", .{job_id});
+                        std.process.exit(1);
+                    }
+                },
+                .@"resume" => |job_id| {
+                    const updated = zoid.scheduler_runtime.resumeJob(allocator, scheduler_context, job_id) catch |err| {
+                        reportScheduleError(err);
+                        std.process.exit(1);
+                    };
+                    if (!updated) {
+                        std.debug.print("Scheduled job not found: {s}\n", .{job_id});
+                        std.process.exit(1);
+                    }
+                },
+            }
         },
         .run => |prompt_parts| {
             const settings = loadOpenAISettingsOrExit(allocator);
@@ -375,6 +478,60 @@ fn loadTelegramBotTokenOrExit(allocator: std.mem.Allocator) []u8 {
 fn loadTelegramBotToken(allocator: std.mem.Allocator) ![]u8 {
     const token_value = try zoid.config_store.getValue(allocator, zoid.config_keys.telegram_bot_token);
     return token_value orelse error.MissingTelegramBotToken;
+}
+
+fn getWorkspaceRoot(allocator: std.mem.Allocator) ![]u8 {
+    const cwd = try std.process.getCwdAlloc(allocator);
+    defer allocator.free(cwd);
+    return std.fs.cwd().realpathAlloc(allocator, cwd);
+}
+
+fn printScheduleJob(allocator: std.mem.Allocator, job: *const zoid.scheduler_store.Job) !void {
+    const line1 = try std.fmt.allocPrint(allocator, "id={s} type={s} path={s} chat_id={d} paused={}\n", .{
+        job.id,
+        zoid.scheduler_store.jobTypeToString(job.job_type),
+        job.path,
+        job.chat_id,
+        job.paused,
+    });
+    defer allocator.free(line1);
+    try std.fs.File.stdout().writeAll(line1);
+
+    var tail = std.ArrayList(u8).empty;
+    defer tail.deinit(allocator);
+    try tail.appendSlice(allocator, "  next_run_at=");
+    try tail.writer(allocator).print("{d}", .{job.next_run_at});
+    if (job.run_at) |run_at| {
+        try tail.writer(allocator).print(" run_at={d}", .{run_at});
+    }
+    if (job.cron) |cron| {
+        try tail.writer(allocator).print(" cron={s}", .{cron});
+    }
+    if (job.last_run_at) |last_run_at| {
+        try tail.writer(allocator).print(" last_run_at={d}", .{last_run_at});
+    }
+    try tail.append(allocator, '\n');
+    try std.fs.File.stdout().writeAll(tail.items);
+}
+
+fn reportScheduleError(err: anyerror) void {
+    switch (err) {
+        error.InvalidSchedule => std.debug.print("Invalid schedule. Provide either --run-at <rfc3339> or --cron \"<min hour dom mon dow>\".\n", .{}),
+        error.InvalidTimestamp => std.debug.print("Invalid run_at timestamp. Expected RFC3339 (for example 2026-02-22T21:00:00Z).\n", .{}),
+        error.InvalidJobPath => std.debug.print("Invalid job path. Lua jobs require .lua and markdown jobs require .md under workspace root.\n", .{}),
+        error.ChatIdRequired => std.debug.print(
+            "No chat_id available. Provide --chat-id or set config {s}.\n",
+            .{zoid.config_keys.telegram_default_chat_id},
+        ),
+        error.InvalidDefaultChatId => std.debug.print(
+            "Config key {s} is invalid (expected integer chat id).\n",
+            .{zoid.config_keys.telegram_default_chat_id},
+        ),
+        error.InvalidExpression, error.InvalidField, error.InvalidRange, error.InvalidStep, error.InvalidValue => {
+            std.debug.print("Invalid cron expression.\n", .{});
+        },
+        else => std.debug.print("Schedule operation failed: {s}\n", .{@errorName(err)}),
+    }
 }
 
 test "executeLuaAsTool runs script with lua_execute sandbox policy" {

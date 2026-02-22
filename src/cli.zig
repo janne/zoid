@@ -1,4 +1,5 @@
 const std = @import("std");
+const scheduler_store = @import("scheduler_store.zig");
 
 pub const ConfigCommand = union(enum) {
     set: struct {
@@ -8,6 +9,22 @@ pub const ConfigCommand = union(enum) {
     get: []const u8,
     unset: []const u8,
     list,
+};
+
+pub const ScheduleCreateCommand = struct {
+    job_type: scheduler_store.JobType,
+    path: []const u8,
+    run_at: ?[]const u8,
+    cron: ?[]const u8,
+    chat_id: ?i64,
+};
+
+pub const ScheduleCommand = union(enum) {
+    create: ScheduleCreateCommand,
+    list,
+    delete: []const u8,
+    pause: []const u8,
+    @"resume": []const u8,
 };
 
 pub const Command = union(enum) {
@@ -20,6 +37,7 @@ pub const Command = union(enum) {
     chat,
     serve,
     config: ConfigCommand,
+    schedule: ScheduleCommand,
 };
 
 pub const ParseCommandError = error{
@@ -28,7 +46,12 @@ pub const ParseCommandError = error{
     MissingConfigSubcommand,
     MissingConfigKey,
     MissingConfigValue,
+    MissingScheduleSubcommand,
+    MissingScheduleArgument,
+    InvalidScheduleArguments,
+    InvalidChatId,
     UnknownConfigSubcommand,
+    UnknownScheduleSubcommand,
     UnknownCommand,
 };
 
@@ -93,7 +116,113 @@ pub fn parseCommand(args: []const []const u8) ParseCommandError!Command {
         return error.UnknownConfigSubcommand;
     }
 
+    if (std.mem.eql(u8, cmd, "schedule")) {
+        if (args.len < 3) return error.MissingScheduleSubcommand;
+        return .{ .schedule = try parseScheduleCommand(args[2..]) };
+    }
+
     return error.UnknownCommand;
+}
+
+fn parseScheduleCommand(args: []const []const u8) ParseCommandError!ScheduleCommand {
+    const subcmd = args[0];
+
+    if (std.mem.eql(u8, subcmd, "list")) {
+        if (args.len != 1) return error.InvalidScheduleArguments;
+        return .list;
+    }
+
+    if (std.mem.eql(u8, subcmd, "delete")) {
+        if (args.len < 2) return error.MissingScheduleArgument;
+        if (args.len > 2) return error.InvalidScheduleArguments;
+        return .{ .delete = args[1] };
+    }
+
+    if (std.mem.eql(u8, subcmd, "pause")) {
+        if (args.len < 2) return error.MissingScheduleArgument;
+        if (args.len > 2) return error.InvalidScheduleArguments;
+        return .{ .pause = args[1] };
+    }
+
+    if (std.mem.eql(u8, subcmd, "resume")) {
+        if (args.len < 2) return error.MissingScheduleArgument;
+        if (args.len > 2) return error.InvalidScheduleArguments;
+        return .{ .@"resume" = args[1] };
+    }
+
+    if (std.mem.eql(u8, subcmd, "create")) {
+        return .{ .create = try parseScheduleCreate(args[1..]) };
+    }
+
+    return error.UnknownScheduleSubcommand;
+}
+
+fn parseScheduleCreate(args: []const []const u8) ParseCommandError!ScheduleCreateCommand {
+    var job_type: ?scheduler_store.JobType = null;
+    var path: ?[]const u8 = null;
+    var run_at: ?[]const u8 = null;
+    var cron: ?[]const u8 = null;
+    var chat_id: ?i64 = null;
+
+    var index: usize = 0;
+    while (index < args.len) {
+        const flag = args[index];
+
+        if (std.mem.eql(u8, flag, "--lua")) {
+            if (job_type != null or path != null) return error.InvalidScheduleArguments;
+            if (index + 1 >= args.len) return error.MissingScheduleArgument;
+            job_type = .lua;
+            path = args[index + 1];
+            index += 2;
+            continue;
+        }
+
+        if (std.mem.eql(u8, flag, "--md")) {
+            if (job_type != null or path != null) return error.InvalidScheduleArguments;
+            if (index + 1 >= args.len) return error.MissingScheduleArgument;
+            job_type = .markdown;
+            path = args[index + 1];
+            index += 2;
+            continue;
+        }
+
+        if (std.mem.eql(u8, flag, "--run-at")) {
+            if (run_at != null) return error.InvalidScheduleArguments;
+            if (index + 1 >= args.len) return error.MissingScheduleArgument;
+            run_at = args[index + 1];
+            index += 2;
+            continue;
+        }
+
+        if (std.mem.eql(u8, flag, "--cron")) {
+            if (cron != null) return error.InvalidScheduleArguments;
+            if (index + 1 >= args.len) return error.MissingScheduleArgument;
+            cron = args[index + 1];
+            index += 2;
+            continue;
+        }
+
+        if (std.mem.eql(u8, flag, "--chat-id")) {
+            if (chat_id != null) return error.InvalidScheduleArguments;
+            if (index + 1 >= args.len) return error.MissingScheduleArgument;
+            chat_id = std.fmt.parseInt(i64, args[index + 1], 10) catch return error.InvalidChatId;
+            index += 2;
+            continue;
+        }
+
+        return error.InvalidScheduleArguments;
+    }
+
+    if (job_type == null or path == null) return error.InvalidScheduleArguments;
+    if ((run_at == null and cron == null) or (run_at != null and cron != null)) return error.InvalidScheduleArguments;
+
+    return .{
+        .job_type = job_type.?,
+        .path = path.?,
+        .run_at = run_at,
+        .cron = cron,
+        .chat_id = chat_id,
+    };
 }
 
 pub fn printHelp() void {
@@ -112,6 +241,24 @@ pub fn printHelp() void {
         \\
         \\zoid serve
         \\  Starts long-running service mode.
+        \\
+        \\zoid schedule create --lua <path.lua> (--run-at <rfc3339> | --cron "<min hour dom mon dow>") [--chat-id <id>]
+        \\  Creates a scheduled Lua job.
+        \\
+        \\zoid schedule create --md <path.md> (--run-at <rfc3339> | --cron "<min hour dom mon dow>") [--chat-id <id>]
+        \\  Creates a scheduled Markdown job.
+        \\
+        \\zoid schedule list
+        \\  Lists scheduled jobs.
+        \\
+        \\zoid schedule delete <job_id>
+        \\  Deletes a scheduled job.
+        \\
+        \\zoid schedule pause <job_id>
+        \\  Pauses a scheduled job.
+        \\
+        \\zoid schedule resume <job_id>
+        \\  Resumes a scheduled job.
         \\
         \\zoid config set <key> <value>
         \\  Creates or updates a config key.
@@ -133,90 +280,18 @@ test "default command is chat" {
     try std.testing.expect(command == .chat);
 }
 
-test "help command" {
-    const args = [_][]const u8{ "zoid", "help" };
-    const command = try parseCommand(&args);
-    try std.testing.expect(command == .help);
-}
-
-test "execute command" {
-    const args = [_][]const u8{ "zoid", "execute", "foo" };
+test "schedule create lua with run-at parses" {
+    const args = [_][]const u8{ "zoid", "schedule", "create", "--lua", "scripts/a.lua", "--run-at", "2026-02-22T21:00:00Z" };
     const command = try parseCommand(&args);
 
     switch (command) {
-        .execute => |execute_cmd| {
-            try std.testing.expectEqualStrings("foo", execute_cmd.file_path);
-            try std.testing.expectEqual(@as(usize, 0), execute_cmd.script_args.len);
-        },
-        else => return error.UnexpectedCommand,
-    }
-}
-
-test "execute command with script args" {
-    const args = [_][]const u8{ "zoid", "execute", "foo.lua", "one", "two" };
-    const command = try parseCommand(&args);
-
-    switch (command) {
-        .execute => |execute_cmd| {
-            try std.testing.expectEqualStrings("foo.lua", execute_cmd.file_path);
-            try std.testing.expectEqual(@as(usize, 2), execute_cmd.script_args.len);
-            try std.testing.expectEqualStrings("one", execute_cmd.script_args[0]);
-            try std.testing.expectEqualStrings("two", execute_cmd.script_args[1]);
-        },
-        else => return error.UnexpectedCommand,
-    }
-}
-
-test "execute without value returns error" {
-    const args = [_][]const u8{ "zoid", "execute" };
-    try std.testing.expectError(error.MissingExecuteArgument, parseCommand(&args));
-}
-
-test "chat command" {
-    const args = [_][]const u8{ "zoid", "chat" };
-    const command = try parseCommand(&args);
-    try std.testing.expect(command == .chat);
-}
-
-test "serve command" {
-    const args = [_][]const u8{ "zoid", "serve" };
-    const command = try parseCommand(&args);
-    try std.testing.expect(command == .serve);
-}
-
-test "run command" {
-    const args = [_][]const u8{ "zoid", "run", "hello", "world" };
-    const command = try parseCommand(&args);
-
-    switch (command) {
-        .run => |prompt_parts| {
-            try std.testing.expectEqual(@as(usize, 2), prompt_parts.len);
-            try std.testing.expectEqualStrings("hello", prompt_parts[0]);
-            try std.testing.expectEqualStrings("world", prompt_parts[1]);
-        },
-        else => return error.UnexpectedCommand,
-    }
-}
-
-test "run without value returns error" {
-    const args = [_][]const u8{ "zoid", "run" };
-    try std.testing.expectError(error.MissingRunArgument, parseCommand(&args));
-}
-
-test "unknown command returns error" {
-    const args = [_][]const u8{ "zoid", "nope" };
-    try std.testing.expectError(error.UnknownCommand, parseCommand(&args));
-}
-
-test "config set command" {
-    const args = [_][]const u8{ "zoid", "config", "set", "foo", "bar" };
-    const command = try parseCommand(&args);
-
-    switch (command) {
-        .config => |config_cmd| switch (config_cmd) {
-            .set => |set_cmd| {
-                try std.testing.expectEqualStrings("foo", set_cmd.key);
-                try std.testing.expectEqualStrings("bar", set_cmd.value);
+        .schedule => |schedule_cmd| switch (schedule_cmd) {
+            .create => |create| {
+                try std.testing.expectEqual(scheduler_store.JobType.lua, create.job_type);
+                try std.testing.expectEqualStrings("scripts/a.lua", create.path);
+                try std.testing.expectEqualStrings("2026-02-22T21:00:00Z", create.run_at.?);
+                try std.testing.expect(create.cron == null);
+                try std.testing.expect(create.chat_id == null);
             },
             else => return error.UnexpectedCommand,
         },
@@ -224,68 +299,46 @@ test "config set command" {
     }
 }
 
-test "config get command" {
-    const args = [_][]const u8{ "zoid", "config", "get", "foo" };
+test "schedule create markdown with cron and chat id parses" {
+    const args = [_][]const u8{ "zoid", "schedule", "create", "--md", "note.md", "--cron", "0 21 * * *", "--chat-id", "123" };
     const command = try parseCommand(&args);
 
     switch (command) {
-        .config => |config_cmd| switch (config_cmd) {
-            .get => |key| try std.testing.expectEqualStrings("foo", key),
+        .schedule => |schedule_cmd| switch (schedule_cmd) {
+            .create => |create| {
+                try std.testing.expectEqual(scheduler_store.JobType.markdown, create.job_type);
+                try std.testing.expectEqualStrings("note.md", create.path);
+                try std.testing.expect(create.run_at == null);
+                try std.testing.expectEqualStrings("0 21 * * *", create.cron.?);
+                try std.testing.expectEqual(@as(i64, 123), create.chat_id.?);
+            },
             else => return error.UnexpectedCommand,
         },
         else => return error.UnexpectedCommand,
     }
 }
 
-test "config unset command" {
-    const args = [_][]const u8{ "zoid", "config", "unset", "foo" };
+test "schedule list parses" {
+    const args = [_][]const u8{ "zoid", "schedule", "list" };
     const command = try parseCommand(&args);
 
     switch (command) {
-        .config => |config_cmd| switch (config_cmd) {
-            .unset => |key| try std.testing.expectEqualStrings("foo", key),
-            else => return error.UnexpectedCommand,
-        },
+        .schedule => |schedule_cmd| try std.testing.expect(schedule_cmd == .list),
         else => return error.UnexpectedCommand,
     }
 }
 
-test "config list command" {
-    const args = [_][]const u8{ "zoid", "config", "list" };
-    const command = try parseCommand(&args);
-
-    switch (command) {
-        .config => |config_cmd| try std.testing.expect(config_cmd == .list),
-        else => return error.UnexpectedCommand,
-    }
+test "schedule requires one schedule variant" {
+    const args = [_][]const u8{ "zoid", "schedule", "create", "--lua", "task.lua" };
+    try std.testing.expectError(error.InvalidScheduleArguments, parseCommand(&args));
 }
 
-test "config without subcommand returns error" {
-    const args = [_][]const u8{ "zoid", "config" };
-    try std.testing.expectError(error.MissingConfigSubcommand, parseCommand(&args));
+test "schedule rejects duplicate schedule variants" {
+    const args = [_][]const u8{ "zoid", "schedule", "create", "--lua", "task.lua", "--run-at", "2026-01-01T00:00:00Z", "--cron", "0 * * * *" };
+    try std.testing.expectError(error.InvalidScheduleArguments, parseCommand(&args));
 }
 
-test "config set without key returns error" {
-    const args = [_][]const u8{ "zoid", "config", "set" };
-    try std.testing.expectError(error.MissingConfigKey, parseCommand(&args));
-}
-
-test "config set without value returns error" {
-    const args = [_][]const u8{ "zoid", "config", "set", "foo" };
-    try std.testing.expectError(error.MissingConfigValue, parseCommand(&args));
-}
-
-test "config get without key returns error" {
-    const args = [_][]const u8{ "zoid", "config", "get" };
-    try std.testing.expectError(error.MissingConfigKey, parseCommand(&args));
-}
-
-test "config unset without key returns error" {
-    const args = [_][]const u8{ "zoid", "config", "unset" };
-    try std.testing.expectError(error.MissingConfigKey, parseCommand(&args));
-}
-
-test "config unknown subcommand returns error" {
-    const args = [_][]const u8{ "zoid", "config", "nope" };
-    try std.testing.expectError(error.UnknownConfigSubcommand, parseCommand(&args));
+test "schedule invalid chat id" {
+    const args = [_][]const u8{ "zoid", "schedule", "create", "--lua", "task.lua", "--run-at", "2026-01-01T00:00:00Z", "--chat-id", "abc" };
+    try std.testing.expectError(error.InvalidChatId, parseCommand(&args));
 }

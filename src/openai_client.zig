@@ -12,6 +12,10 @@ pub const Message = struct {
     content: []const u8,
 };
 
+pub const RequestContext = struct {
+    request_chat_id: ?i64 = null,
+};
+
 const ParsedToolCall = struct {
     id: []u8,
     name: []u8,
@@ -76,6 +80,22 @@ pub fn fetchAssistantReply(
     api_key: []const u8,
     model: []const u8,
     messages: []const Message,
+) ![]u8 {
+    return fetchAssistantReplyWithContext(
+        allocator,
+        api_key,
+        model,
+        messages,
+        .{},
+    );
+}
+
+pub fn fetchAssistantReplyWithContext(
+    allocator: std.mem.Allocator,
+    api_key: []const u8,
+    model: []const u8,
+    messages: []const Message,
+    request_context: RequestContext,
 ) ![]u8 {
     if (api_key.len == 0) return error.EmptyApiKey;
     if (messages.len == 0) return error.EmptyConversation;
@@ -173,9 +193,10 @@ pub fn fetchAssistantReply(
         try wire_messages.append(allocator, assistant_message_json);
 
         for (turn.tool_calls) |tool_call| {
-            const tool_result = tool_runtime.executeToolCall(
+            const tool_result = tool_runtime.executeToolCallWithContext(
                 allocator,
                 &policy,
+                .{ .request_chat_id = request_context.request_chat_id },
                 tool_call.name,
                 tool_call.arguments_json,
             ) catch |err| try tool_runtime.buildErrorResult(allocator, @errorName(err));
@@ -283,6 +304,8 @@ fn buildChatCompletionsPayloadWithTools(
     try writeLuaExecuteToolDefinition(allocator, writer, policy.workspace_root);
     try writer.writeAll(",");
     try writeConfigToolDefinition(allocator, writer);
+    try writer.writeAll(",");
+    try writeSchedulerToolDefinition(allocator, writer);
     try writer.writeAll(",");
     try writeHttpGetToolDefinition(allocator, writer);
     try writer.writeAll(",");
@@ -405,6 +428,19 @@ fn writeConfigToolDefinition(
     try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"config\",\"description\":");
     try writeJsonString(allocator, writer, description);
     try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"list\",\"get\",\"set\",\"unset\"]},\"key\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"action\"],\"additionalProperties\":false}}}");
+}
+
+fn writeSchedulerToolDefinition(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+) !void {
+    const description =
+        "Manage scheduled jobs in the current workspace. action=create|list|delete|pause|resume. " ++
+        "create requires job_type=lua|markdown, path, and exactly one of run_at (RFC3339) or cron (5-field). " ++
+        "Optional chat_id selects Telegram DM destination; fallback is current Telegram chat or TELEGRAM_DEFAULT_CHAT_ID.";
+    try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"scheduler\",\"description\":");
+    try writeJsonString(allocator, writer, description);
+    try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"create\",\"list\",\"delete\",\"pause\",\"resume\"]},\"job_type\":{\"type\":\"string\",\"enum\":[\"lua\",\"markdown\"]},\"path\":{\"type\":\"string\"},\"run_at\":{\"type\":\"string\"},\"cron\":{\"type\":\"string\"},\"chat_id\":{\"type\":\"integer\"},\"job_id\":{\"type\":\"string\"}},\"required\":[\"action\"],\"additionalProperties\":false}}}");
 }
 
 fn writeHttpPostToolDefinition(
@@ -692,17 +728,18 @@ test "buildChatCompletionsPayload creates valid payload" {
     try std.testing.expectEqualStrings("general kenobi", payload_messages[1].object.get("content").?.string);
 
     const tools = root.get("tools").?.array.items;
-    try std.testing.expectEqual(@as(usize, 10), tools.len);
+    try std.testing.expectEqual(@as(usize, 11), tools.len);
     try std.testing.expectEqualStrings("filesystem_read", tools[0].object.get("function").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("filesystem_list", tools[1].object.get("function").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("filesystem_write", tools[2].object.get("function").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("filesystem_delete", tools[3].object.get("function").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("lua_execute", tools[4].object.get("function").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("config", tools[5].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("http_get", tools[6].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("http_post", tools[7].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("http_put", tools[8].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("http_delete", tools[9].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("scheduler", tools[6].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("http_get", tools[7].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("http_post", tools[8].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("http_put", tools[9].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("http_delete", tools[10].object.get("function").?.object.get("name").?.string);
 }
 
 test "parseAssistantReply extracts assistant content" {

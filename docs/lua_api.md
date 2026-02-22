@@ -24,6 +24,7 @@ Lua run through Zoid has a `zoid` global with:
 - `zoid.dir(path)` directory handles with metadata
 - `zoid.uri(uri)` HTTP request handles
 - `zoid.config()` config handles
+- `zoid.schedule` scheduler handles
 - `zoid.json.decode(json_text)` JSON decoder
 
 File example:
@@ -77,6 +78,26 @@ local payload = zoid.json.decode('{"ok":true,"count":2,"items":[1,null]}')
 print(payload.ok, payload.count, payload.items[2] == zoid.json.null)
 ```
 
+Scheduler example:
+
+```lua
+local created = zoid.schedule.create({
+  job_type = "lua",
+  path = "scripts/clean_up_docs.lua",
+  cron = "0 21 * * *",
+  chat_id = 123456789
+})
+
+print(created.id, created.next_run_at)
+for _, job in ipairs(zoid.schedule.list()) do
+  print(job.id, job.job_type, job.path, job.paused)
+end
+
+zoid.schedule.pause(created.id)
+zoid.schedule.resume(created.id)
+zoid.schedule.delete(created.id)
+```
+
 Supported methods and return values:
 
 - `zoid.file(path) -> { name, path, type, size, mode, owner, group, modified_at, read, write, delete }`
@@ -93,6 +114,11 @@ Supported methods and return values:
 - `zoid.config():get(key) -> string | nil`
 - `zoid.config():set(key, value) -> boolean` (`true` on success)
 - `zoid.config():unset(key) -> boolean` (`true` if key existed and was removed)
+- `zoid.schedule.create({ job_type, path, run_at?, cron?, chat_id? }) -> job`
+- `zoid.schedule.list() -> { job, ... }`
+- `zoid.schedule.delete(job_id) -> boolean`
+- `zoid.schedule.pause(job_id) -> boolean`
+- `zoid.schedule.resume(job_id) -> boolean`
 - `zoid.json.decode(json_text) -> any`
 - `zoid.json.null` sentinel value used when decoded JSON contains `null`
 
@@ -159,6 +185,19 @@ Method-specific behavior:
 - `options.headers` accepts a table of string header names to string values
 - Header names/values are validated (invalid bytes and dangerous headers are rejected)
 - Response body size is capped by sandbox policy
+
+### Scheduler Rules
+
+`zoid.schedule.create` enforces:
+
+- `job_type` must be `"lua"` or `"markdown"`
+- `path` must resolve inside workspace root
+- `.lua` jobs require `.lua` extension, markdown jobs require `.md` extension
+- exactly one schedule input is required: `run_at` (RFC3339) or `cron` (5-field cron)
+- output `chat_id` is resolved in order:
+  - explicit `chat_id` on create
+  - Telegram request chat context (tool mode)
+  - config key `TELEGRAM_DEFAULT_CHAT_ID`
 
 ### Read Limits
 

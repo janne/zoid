@@ -107,7 +107,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const cron_dep = b.dependency("cron", .{
+        .target = target,
+        .optimize = optimize,
+    });
     mod.addImport("vaxis", vaxis_dep.module("vaxis"));
+    mod.addImport("cron", cron_dep.module("cron"));
     addLuaSupport(b, mod, target, optimize);
 
     // Here we define an executable. An executable needs to have a root module

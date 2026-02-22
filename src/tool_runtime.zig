@@ -2,6 +2,8 @@ const std = @import("std");
 const config_runtime = @import("config_runtime.zig");
 const http_client = @import("http_client.zig");
 const lua_runner = @import("lua_runner.zig");
+const scheduler_runtime = @import("scheduler_runtime.zig");
+const scheduler_store = @import("scheduler_store.zig");
 const workspace_fs = @import("workspace_fs.zig");
 
 pub const sandbox_mode: []const u8 = "workspace-write";
@@ -12,6 +14,7 @@ pub const enabled_tools = [_][]const u8{
     "filesystem_delete",
     "lua_execute",
     "config",
+    "scheduler",
     "http_get",
     "http_post",
     "http_put",
@@ -44,6 +47,10 @@ pub const Policy = struct {
     }
 };
 
+pub const RequestContext = struct {
+    request_chat_id: ?i64 = null,
+};
+
 pub fn buildPolicyJson(allocator: std.mem.Allocator, policy: *const Policy) ![]u8 {
     var output = std.Io.Writer.Allocating.init(allocator);
     errdefer output.deinit();
@@ -74,6 +81,22 @@ pub fn executeToolCall(
     tool_name: []const u8,
     arguments_json: []const u8,
 ) ![]u8 {
+    return executeToolCallWithContext(
+        allocator,
+        policy,
+        .{},
+        tool_name,
+        arguments_json,
+    );
+}
+
+pub fn executeToolCallWithContext(
+    allocator: std.mem.Allocator,
+    policy: *const Policy,
+    request_context: RequestContext,
+    tool_name: []const u8,
+    arguments_json: []const u8,
+) ![]u8 {
     if (std.mem.eql(u8, tool_name, "filesystem_read")) {
         return executeFilesystemRead(allocator, policy, arguments_json);
     }
@@ -91,6 +114,9 @@ pub fn executeToolCall(
     }
     if (std.mem.eql(u8, tool_name, "config")) {
         return executeConfig(allocator, policy, arguments_json);
+    }
+    if (std.mem.eql(u8, tool_name, "scheduler")) {
+        return executeScheduler(allocator, policy, request_context, arguments_json);
     }
     if (std.mem.eql(u8, tool_name, "http_get")) {
         return executeHttpGet(allocator, arguments_json);
@@ -514,6 +540,177 @@ fn executeConfig(
     return output.toOwnedSlice();
 }
 
+fn executeScheduler(
+    allocator: std.mem.Allocator,
+    policy: *const Policy,
+    request_context: RequestContext,
+    arguments_json: []const u8,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{});
+    defer parsed.deinit();
+
+    const root_object = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidToolArguments,
+    };
+
+    const action = switch (root_object.get("action") orelse return error.InvalidToolArguments) {
+        .string => |value| value,
+        else => return error.InvalidToolArguments,
+    };
+
+    const context = scheduler_runtime.Context{
+        .workspace_root = policy.workspace_root,
+        .request_chat_id = request_context.request_chat_id,
+        .config_path_override = policy.config_path_override,
+    };
+
+    var output = std.Io.Writer.Allocating.init(allocator);
+    errdefer output.deinit();
+    const writer = &output.writer;
+
+    if (std.mem.eql(u8, action, "create")) {
+        const job_type_value = try requireStringProperty(root_object, "job_type");
+        const job_type = scheduler_store.parseJobType(job_type_value) catch return error.InvalidToolArguments;
+        const path = try requireStringProperty(root_object, "path");
+
+        const run_at: ?[]const u8 = if (root_object.get("run_at")) |value|
+            switch (value) {
+                .string => |text| text,
+                .null => null,
+                else => return error.InvalidToolArguments,
+            }
+        else
+            null;
+
+        const cron: ?[]const u8 = if (root_object.get("cron")) |value|
+            switch (value) {
+                .string => |text| text,
+                .null => null,
+                else => return error.InvalidToolArguments,
+            }
+        else
+            null;
+
+        const chat_id: ?i64 = if (root_object.get("chat_id")) |value|
+            switch (value) {
+                .integer => |number| number,
+                .null => null,
+                else => return error.InvalidToolArguments,
+            }
+        else
+            null;
+
+        var created = try scheduler_runtime.createJob(
+            allocator,
+            context,
+            .{
+                .job_type = job_type,
+                .path = path,
+                .run_at = run_at,
+                .cron = cron,
+                .chat_id = chat_id,
+            },
+        );
+        defer created.deinit(allocator);
+
+        try writer.writeAll("{\"ok\":true,\"tool\":\"scheduler\",\"action\":\"create\",\"job\":");
+        try writeSchedulerJobJson(allocator, writer, &created);
+        try writer.writeAll("}");
+        return output.toOwnedSlice();
+    }
+
+    if (std.mem.eql(u8, action, "list")) {
+        const jobs = try scheduler_runtime.listJobs(allocator, context);
+        defer scheduler_store.deinitJobs(allocator, jobs);
+
+        try writer.writeAll("{\"ok\":true,\"tool\":\"scheduler\",\"action\":\"list\",\"jobs\":[");
+        for (jobs, 0..) |*job, index| {
+            if (index > 0) try writer.writeAll(",");
+            try writeSchedulerJobJson(allocator, writer, job);
+        }
+        try writer.writeAll("]}");
+        return output.toOwnedSlice();
+    }
+
+    if (std.mem.eql(u8, action, "delete")) {
+        const job_id = try requireStringProperty(root_object, "job_id");
+        const removed = try scheduler_runtime.deleteJob(allocator, context, job_id);
+        try writer.writeAll("{\"ok\":true,\"tool\":\"scheduler\",\"action\":\"delete\",\"job_id\":");
+        try writeJsonString(allocator, writer, job_id);
+        try writer.writeAll(",\"removed\":");
+        try writer.writeAll(if (removed) "true" else "false");
+        try writer.writeAll("}");
+        return output.toOwnedSlice();
+    }
+
+    if (std.mem.eql(u8, action, "pause")) {
+        const job_id = try requireStringProperty(root_object, "job_id");
+        const paused = try scheduler_runtime.pauseJob(allocator, context, job_id);
+        try writer.writeAll("{\"ok\":true,\"tool\":\"scheduler\",\"action\":\"pause\",\"job_id\":");
+        try writeJsonString(allocator, writer, job_id);
+        try writer.writeAll(",\"updated\":");
+        try writer.writeAll(if (paused) "true" else "false");
+        try writer.writeAll("}");
+        return output.toOwnedSlice();
+    }
+
+    if (std.mem.eql(u8, action, "resume")) {
+        const job_id = try requireStringProperty(root_object, "job_id");
+        const resumed = try scheduler_runtime.resumeJob(allocator, context, job_id);
+        try writer.writeAll("{\"ok\":true,\"tool\":\"scheduler\",\"action\":\"resume\",\"job_id\":");
+        try writeJsonString(allocator, writer, job_id);
+        try writer.writeAll(",\"updated\":");
+        try writer.writeAll(if (resumed) "true" else "false");
+        try writer.writeAll("}");
+        return output.toOwnedSlice();
+    }
+
+    return error.InvalidToolArguments;
+}
+
+fn writeSchedulerJobJson(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    job: *const scheduler_store.Job,
+) !void {
+    try writer.writeAll("{\"id\":");
+    try writeJsonString(allocator, writer, job.id);
+    try writer.writeAll(",\"job_type\":");
+    try writeJsonString(allocator, writer, scheduler_store.jobTypeToString(job.job_type));
+    try writer.writeAll(",\"path\":");
+    try writeJsonString(allocator, writer, job.path);
+    try writer.writeAll(",\"chat_id\":");
+    try writer.print("{d}", .{job.chat_id});
+    try writer.writeAll(",\"paused\":");
+    try writer.writeAll(if (job.paused) "true" else "false");
+    try writer.writeAll(",\"run_at\":");
+    if (job.run_at) |run_at| {
+        try writer.print("{d}", .{run_at});
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll(",\"cron\":");
+    if (job.cron) |cron| {
+        try writeJsonString(allocator, writer, cron);
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll(",\"next_run_at\":");
+    try writer.print("{d}", .{job.next_run_at});
+    try writer.writeAll(",\"created_at\":");
+    try writer.print("{d}", .{job.created_at});
+    try writer.writeAll(",\"updated_at\":");
+    try writer.print("{d}", .{job.updated_at});
+    try writer.writeAll(",\"last_run_at\":");
+    if (job.last_run_at) |last_run_at| {
+        try writer.print("{d}", .{last_run_at});
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll("}");
+}
+
 fn requireStringProperty(
     root_object: std.json.ObjectMap,
     property_name: []const u8,
@@ -624,7 +821,56 @@ test "buildPolicyJson emits required fields" {
     const root_object = parsed.value.object;
     try std.testing.expectEqualStrings("workspace-write", root_object.get("sandbox_mode").?.string);
     try std.testing.expectEqualStrings(policy.workspace_root, root_object.get("writable_roots").?.array.items[0].string);
-    try std.testing.expectEqual(@as(usize, 10), root_object.get("tools_enabled").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 11), root_object.get("tools_enabled").?.array.items.len);
+}
+
+test "scheduler tool can create and list jobs" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    {
+        const file = try tmp.dir.createFile("task.lua", .{});
+        defer file.close();
+        try file.writeAll("print('scheduled')\n");
+    }
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, workspace_root);
+    defer policy.deinit(std.testing.allocator);
+
+    const create_result = try executeToolCallWithContext(
+        std.testing.allocator,
+        &policy,
+        .{ .request_chat_id = 777 },
+        "scheduler",
+        "{\"action\":\"create\",\"job_type\":\"lua\",\"path\":\"task.lua\",\"run_at\":\"2026-01-10T10:00:00Z\"}",
+    );
+    defer std.testing.allocator.free(create_result);
+
+    var parsed_create = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, create_result, .{});
+    defer parsed_create.deinit();
+    const create_object = parsed_create.value.object;
+    try std.testing.expect(create_object.get("ok").?.bool);
+    try std.testing.expectEqualStrings("scheduler", create_object.get("tool").?.string);
+    try std.testing.expectEqualStrings("create", create_object.get("action").?.string);
+
+    const list_result = try executeToolCallWithContext(
+        std.testing.allocator,
+        &policy,
+        .{},
+        "scheduler",
+        "{\"action\":\"list\"}",
+    );
+    defer std.testing.allocator.free(list_result);
+
+    var parsed_list = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, list_result, .{});
+    defer parsed_list.deinit();
+    const list_object = parsed_list.value.object;
+    const jobs = list_object.get("jobs").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), jobs.len);
+    try std.testing.expectEqual(@as(i64, 777), jobs[0].object.get("chat_id").?.integer);
 }
 
 test "filesystem write and read stay within workspace root" {
