@@ -16,7 +16,6 @@ pub const ScheduleCreateCommand = struct {
     path: []const u8,
     run_at: ?[]const u8,
     cron: ?[]const u8,
-    chat_id: ?i64,
 };
 
 pub const ScheduleCommand = union(enum) {
@@ -49,7 +48,6 @@ pub const ParseCommandError = error{
     MissingScheduleSubcommand,
     MissingScheduleArgument,
     InvalidScheduleArguments,
-    InvalidChatId,
     UnknownConfigSubcommand,
     UnknownScheduleSubcommand,
     UnknownCommand,
@@ -162,7 +160,6 @@ fn parseScheduleCreate(args: []const []const u8) ParseCommandError!ScheduleCreat
     var path: ?[]const u8 = null;
     var run_at: ?[]const u8 = null;
     var cron: ?[]const u8 = null;
-    var chat_id: ?i64 = null;
 
     var index: usize = 0;
     while (index < args.len) {
@@ -202,14 +199,6 @@ fn parseScheduleCreate(args: []const []const u8) ParseCommandError!ScheduleCreat
             continue;
         }
 
-        if (std.mem.eql(u8, flag, "--chat-id")) {
-            if (chat_id != null) return error.InvalidScheduleArguments;
-            if (index + 1 >= args.len) return error.MissingScheduleArgument;
-            chat_id = std.fmt.parseInt(i64, args[index + 1], 10) catch return error.InvalidChatId;
-            index += 2;
-            continue;
-        }
-
         return error.InvalidScheduleArguments;
     }
 
@@ -221,7 +210,6 @@ fn parseScheduleCreate(args: []const []const u8) ParseCommandError!ScheduleCreat
         .path = path.?,
         .run_at = run_at,
         .cron = cron,
-        .chat_id = chat_id,
     };
 }
 
@@ -242,10 +230,10 @@ pub fn printHelp() void {
         \\zoid serve
         \\  Starts long-running service mode.
         \\
-        \\zoid schedule create --lua <path.lua> (--run-at <rfc3339> | --cron "<min hour dom mon dow>") [--chat-id <id>]
+        \\zoid schedule create --lua <path.lua> (--run-at <rfc3339> | --cron "<min hour dom mon dow>")
         \\  Creates a scheduled Lua job.
         \\
-        \\zoid schedule create --md <path.md> (--run-at <rfc3339> | --cron "<min hour dom mon dow>") [--chat-id <id>]
+        \\zoid schedule create --md <path.md> (--run-at <rfc3339> | --cron "<min hour dom mon dow>")
         \\  Creates a scheduled Markdown job.
         \\
         \\zoid schedule list
@@ -291,7 +279,6 @@ test "schedule create lua with run-at parses" {
                 try std.testing.expectEqualStrings("scripts/a.lua", create.path);
                 try std.testing.expectEqualStrings("2026-02-22T21:00:00Z", create.run_at.?);
                 try std.testing.expect(create.cron == null);
-                try std.testing.expect(create.chat_id == null);
             },
             else => return error.UnexpectedCommand,
         },
@@ -299,8 +286,8 @@ test "schedule create lua with run-at parses" {
     }
 }
 
-test "schedule create markdown with cron and chat id parses" {
-    const args = [_][]const u8{ "zoid", "schedule", "create", "--md", "note.md", "--cron", "0 21 * * *", "--chat-id", "123" };
+test "schedule create markdown with cron parses" {
+    const args = [_][]const u8{ "zoid", "schedule", "create", "--md", "note.md", "--cron", "0 21 * * *" };
     const command = try parseCommand(&args);
 
     switch (command) {
@@ -310,7 +297,6 @@ test "schedule create markdown with cron and chat id parses" {
                 try std.testing.expectEqualStrings("note.md", create.path);
                 try std.testing.expect(create.run_at == null);
                 try std.testing.expectEqualStrings("0 21 * * *", create.cron.?);
-                try std.testing.expectEqual(@as(i64, 123), create.chat_id.?);
             },
             else => return error.UnexpectedCommand,
         },
@@ -338,7 +324,7 @@ test "schedule rejects duplicate schedule variants" {
     try std.testing.expectError(error.InvalidScheduleArguments, parseCommand(&args));
 }
 
-test "schedule invalid chat id" {
-    const args = [_][]const u8{ "zoid", "schedule", "create", "--lua", "task.lua", "--run-at", "2026-01-01T00:00:00Z", "--chat-id", "abc" };
-    try std.testing.expectError(error.InvalidChatId, parseCommand(&args));
+test "schedule rejects unsupported chat id flag" {
+    const args = [_][]const u8{ "zoid", "schedule", "create", "--lua", "task.lua", "--run-at", "2026-01-01T00:00:00Z", "--chat-id", "123" };
+    try std.testing.expectError(error.InvalidScheduleArguments, parseCommand(&args));
 }

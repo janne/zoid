@@ -24,8 +24,14 @@ const serve_lock_file_name = "telegram_serve.lock";
 const typing_action_refresh_ns: u64 = 4 * std.time.ns_per_s;
 const typing_action_sleep_step_ns: u64 = 200 * std.time.ns_per_ms;
 
+const InboundChatKind = enum {
+    private,
+    group_like,
+};
+
 const InboundMessage = struct {
     chat_id: i64,
+    chat_kind: InboundChatKind,
     text: []u8,
 };
 
@@ -143,12 +149,11 @@ pub fn runLongPolling(allocator: std.mem.Allocator, settings: Settings) !void {
     while (true) {
         processDueScheduledJobs(
             allocator,
-            &conversations,
-            runtime_paths.state_path,
             settings.openai_api_key,
             settings.openai_model,
             settings.bot_token,
             workspace_root,
+            runtime_paths.default_dm_chat_id_path,
         ) catch |err| {
             std.debug.print("Failed to process scheduled jobs: {s}\n", .{@errorName(err)});
         };
@@ -176,6 +181,19 @@ pub fn runLongPolling(allocator: std.mem.Allocator, settings: Settings) !void {
 
         next_offset = batch.next_offset;
         for (batch.messages) |message| {
+            if (message.chat_kind == .private) {
+                scheduler_runtime.persistDefaultDmChatIdAtPath(
+                    allocator,
+                    runtime_paths.default_dm_chat_id_path,
+                    message.chat_id,
+                ) catch |err| {
+                    std.debug.print(
+                        "Failed to persist Telegram default DM chat id ({d}): {s}\n",
+                        .{ message.chat_id, @errorName(err) },
+                    );
+                };
+            }
+
             processInboundMessage(
                 allocator,
                 &conversations,
@@ -238,13 +256,6 @@ fn processInboundMessage(
         return;
     }
 
-    if (isChatIdCommand(prompt)) {
-        const chat_id_text = try std.fmt.allocPrint(allocator, "Current chat_id: {d}", .{chat_id});
-        defer allocator.free(chat_id_text);
-        try sendMessageInChunks(allocator, bot_token, chat_id, chat_id_text);
-        return;
-    }
-
     try processPromptForChat(
         allocator,
         conversations,
@@ -292,10 +303,6 @@ fn clearConversationForChat(
 
 fn isResetCommand(prompt: []const u8) bool {
     return std.mem.eql(u8, prompt, "/new") or std.mem.eql(u8, prompt, "/reset");
-}
-
-fn isChatIdCommand(prompt: []const u8) bool {
-    return std.mem.eql(u8, prompt, "/chatid");
 }
 
 fn processPromptForChat(
@@ -361,12 +368,11 @@ fn processPromptForChat(
 
 fn processDueScheduledJobs(
     allocator: std.mem.Allocator,
-    conversations: *ConversationStore,
-    state_path: []const u8,
     api_key: []const u8,
     model: []const u8,
     bot_token: []const u8,
     workspace_root: []const u8,
+    default_dm_chat_id_path: []const u8,
 ) !void {
     const now = std.time.timestamp();
     const due_jobs = try scheduler_runtime.takeDueJobs(
@@ -377,7 +383,7 @@ fn processDueScheduledJobs(
     defer scheduler_runtime.deinitDueJobs(allocator, due_jobs);
 
     for (due_jobs) |*due_job| {
-        const scheduled_prompt = buildScheduledPrompt(
+        const maybe_scheduled_prompt = buildScheduledPrompt(
             allocator,
             workspace_root,
             due_job,
@@ -389,29 +395,54 @@ fn processDueScheduledJobs(
             );
             continue;
         };
+        const scheduled_prompt = maybe_scheduled_prompt orelse continue;
         defer allocator.free(scheduled_prompt);
 
-        processPromptForChat(
+        const messages = [_]openai_client.Message{
+            .{ .role = .user, .content = scheduled_prompt },
+        };
+        const reply = openai_client.fetchAssistantReplyWithContext(
             allocator,
-            conversations,
-            state_path,
             api_key,
             model,
-            bot_token,
-            due_job.job.chat_id,
-            scheduled_prompt,
+            &messages,
+            .{},
         ) catch |err| {
             std.debug.print(
-                "Failed to process scheduled job {s} for chat {d}: {s}\n",
-                .{ due_job.job.id, due_job.job.chat_id, @errorName(err) },
+                "Failed to process scheduled job {s}: {s}\n",
+                .{ due_job.job.id, @errorName(err) },
             );
-            sendMessageInChunks(
-                allocator,
-                bot_token,
-                due_job.job.chat_id,
-                "Scheduled job failed while contacting the assistant.",
-            ) catch {};
+            continue;
         };
+        defer allocator.free(reply);
+
+        const trimmed_reply = std.mem.trim(u8, reply, " \t\r\n");
+        if (trimmed_reply.len == 0) continue;
+
+        const dm_chat_id = scheduler_runtime.loadDefaultDmChatIdAtPath(
+            allocator,
+            default_dm_chat_id_path,
+        ) catch |err| blk: {
+            std.debug.print(
+                "Scheduled job {s} could not resolve DM chat id: {s}\n",
+                .{ due_job.job.id, @errorName(err) },
+            );
+            break :blk null;
+        };
+        if (dm_chat_id) |chat_id| {
+            sendMessageInChunks(allocator, bot_token, chat_id, trimmed_reply) catch |err| {
+                std.debug.print(
+                    "Failed to send scheduled reply to Telegram DM {d}: {s}\n",
+                    .{ chat_id, @errorName(err) },
+                );
+            };
+            continue;
+        }
+
+        std.debug.print(
+            "Scheduled job {s} produced a reply but no Telegram DM destination was available.\n",
+            .{due_job.job.id},
+        );
     }
 }
 
@@ -426,6 +457,7 @@ const RuntimePaths = struct {
     app_data_dir: []u8,
     state_path: []u8,
     lock_path: []u8,
+    default_dm_chat_id_path: []u8,
 
     fn init(allocator: std.mem.Allocator) !RuntimePaths {
         const app_data_dir = try std.fs.getAppDataDir(allocator, "zoid");
@@ -438,11 +470,17 @@ const RuntimePaths = struct {
 
         const lock_path = try std.fs.path.join(allocator, &.{ app_data_dir, serve_lock_file_name });
         errdefer allocator.free(lock_path);
+        const default_dm_chat_id_path = try std.fs.path.join(
+            allocator,
+            &.{ app_data_dir, scheduler_runtime.telegram_dm_chat_id_state_file_name },
+        );
+        errdefer allocator.free(default_dm_chat_id_path);
 
         return .{
             .app_data_dir = app_data_dir,
             .state_path = state_path,
             .lock_path = lock_path,
+            .default_dm_chat_id_path = default_dm_chat_id_path,
         };
     }
 
@@ -450,6 +488,7 @@ const RuntimePaths = struct {
         allocator.free(self.app_data_dir);
         allocator.free(self.state_path);
         allocator.free(self.lock_path);
+        allocator.free(self.default_dm_chat_id_path);
     }
 };
 
@@ -643,7 +682,7 @@ fn buildScheduledPrompt(
     workspace_root: []const u8,
     due_job: *const scheduler_runtime.DueJob,
     triggered_at: i64,
-) ![]u8 {
+) !?[]u8 {
     var payload = std.ArrayList(u8).empty;
     errdefer payload.deinit(allocator);
 
@@ -655,8 +694,6 @@ fn buildScheduledPrompt(
     try appendJsonString(allocator, &payload, scheduler_store.jobTypeToString(due_job.job.job_type));
     try payload.appendSlice(allocator, ",\"path\":");
     try appendJsonString(allocator, &payload, due_job.job.path);
-    try payload.appendSlice(allocator, ",\"chat_id\":");
-    try payload.writer(allocator).print("{d}", .{due_job.job.chat_id});
     try payload.appendSlice(allocator, ",\"scheduled_for\":");
     try payload.writer(allocator).print("{d}", .{due_job.scheduled_for});
     try payload.appendSlice(allocator, ",\"triggered_at\":");
@@ -675,6 +712,13 @@ fn buildScheduledPrompt(
                 },
             );
             defer execution.deinit(allocator);
+
+            if (std.mem.trim(u8, execution.stdout, " \t\r\n").len == 0 and
+                std.mem.trim(u8, execution.stderr, " \t\r\n").len == 0)
+            {
+                payload.deinit(allocator);
+                return null;
+            }
 
             try payload.appendSlice(allocator, "\"kind\":\"lua\",\"status\":");
             try appendJsonString(allocator, &payload, executionStatusToString(execution.status));
@@ -695,6 +739,11 @@ fn buildScheduledPrompt(
             );
             defer markdown_read.deinit(allocator);
 
+            if (std.mem.trim(u8, markdown_read.content, " \t\r\n").len == 0) {
+                payload.deinit(allocator);
+                return null;
+            }
+
             try payload.appendSlice(allocator, "\"kind\":\"markdown\",\"content\":");
             try appendJsonString(allocator, &payload, markdown_read.content);
             try payload.appendSlice(allocator, ",\"content_truncated\":");
@@ -703,7 +752,7 @@ fn buildScheduledPrompt(
     }
 
     try payload.appendSlice(allocator, "}}\n");
-    return payload.toOwnedSlice(allocator);
+    return try payload.toOwnedSlice(allocator);
 }
 
 fn readMarkdownWithCap(
@@ -789,7 +838,7 @@ fn fetchPollBatch(
 
     const payload = try std.fmt.allocPrint(
         allocator,
-        "{{\"offset\":{d},\"timeout\":{d},\"allowed_updates\":[\"message\"]}}",
+        "{{\"offset\":{d},\"timeout\":{d},\"allowed_updates\":[\"message\",\"channel_post\"]}}",
         .{ current_offset, timeout_seconds },
     );
     defer allocator.free(payload);
@@ -867,7 +916,8 @@ fn parsePollBatch(
         const update_id = parseJsonI64(update.get("update_id") orelse continue) orelse continue;
         if (update_id >= next_offset) next_offset = update_id + 1;
 
-        const message = switch (update.get("message") orelse continue) {
+        const message_value = update.get("message") orelse update.get("channel_post") orelse continue;
+        const message = switch (message_value) {
             .object => |object| object,
             else => continue,
         };
@@ -880,9 +930,11 @@ fn parsePollBatch(
             else => continue,
         };
         const chat_id = parseJsonI64(chat.get("id") orelse continue) orelse continue;
+        const chat_kind = parseInboundChatKind(chat.get("type") orelse .null);
 
         try messages.append(allocator, .{
             .chat_id = chat_id,
+            .chat_kind = chat_kind,
             .text = try allocator.dupe(u8, text),
         });
     }
@@ -1120,12 +1172,21 @@ fn parseJsonI64(value: std.json.Value) ?i64 {
     };
 }
 
+fn parseInboundChatKind(value: std.json.Value) InboundChatKind {
+    const name = switch (value) {
+        .string => |text| text,
+        else => return .group_like,
+    };
+    if (std.mem.eql(u8, name, "private")) return .private;
+    return .group_like;
+}
+
 test "parsePollBatch extracts text messages and advances offset" {
     const response =
         \\{"ok":true,"result":[
-        \\{"update_id":10,"message":{"chat":{"id":111},"text":"hello"}},
-        \\{"update_id":11,"message":{"chat":{"id":111}}},
-        \\{"update_id":12,"message":{"chat":{"id":222},"text":"hej"}}
+        \\{"update_id":10,"message":{"chat":{"id":111,"type":"private"},"text":"hello"}},
+        \\{"update_id":11,"message":{"chat":{"id":111,"type":"private"}}},
+        \\{"update_id":12,"channel_post":{"chat":{"id":-222,"type":"channel"},"text":"hej"}}
         \\]}
     ;
 
@@ -1135,8 +1196,10 @@ test "parsePollBatch extracts text messages and advances offset" {
     try std.testing.expectEqual(@as(i64, 13), batch.next_offset);
     try std.testing.expectEqual(@as(usize, 2), batch.messages.len);
     try std.testing.expectEqual(@as(i64, 111), batch.messages[0].chat_id);
+    try std.testing.expectEqual(InboundChatKind.private, batch.messages[0].chat_kind);
     try std.testing.expectEqualStrings("hello", batch.messages[0].text);
-    try std.testing.expectEqual(@as(i64, 222), batch.messages[1].chat_id);
+    try std.testing.expectEqual(@as(i64, -222), batch.messages[1].chat_id);
+    try std.testing.expectEqual(InboundChatKind.group_like, batch.messages[1].chat_kind);
     try std.testing.expectEqualStrings("hej", batch.messages[1].text);
 }
 
@@ -1194,12 +1257,6 @@ test "isResetCommand matches supported telegram commands" {
     try std.testing.expect(!isResetCommand("new"));
 }
 
-test "isChatIdCommand matches supported command" {
-    try std.testing.expect(isChatIdCommand("/chatid"));
-    try std.testing.expect(!isChatIdCommand("/chat_id"));
-    try std.testing.expect(!isChatIdCommand("chatid"));
-}
-
 test "buildChatActionPayload encodes chat action request" {
     const payload = try buildChatActionPayload(std.testing.allocator, 42, "typing");
     defer std.testing.allocator.free(payload);
@@ -1249,6 +1306,81 @@ test "conversation state round-trips through disk persistence" {
     try std.testing.expectEqual(@as(usize, 1), restored_b.messages.items.len);
     try std.testing.expectEqual(openai_client.Role.user, restored_b.messages.items[0].role);
     try std.testing.expectEqualStrings("hej", restored_b.messages.items[0].content);
+}
+
+test "buildScheduledPrompt skips empty markdown and empty lua output" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    {
+        const file = try tmp.dir.createFile("empty.md", .{});
+        file.close();
+    }
+    {
+        const file = try tmp.dir.createFile("silent.lua", .{});
+        defer file.close();
+        try file.writeAll("-- no output\n");
+    }
+
+    const empty_md_path = try tmp.dir.realpathAlloc(std.testing.allocator, "empty.md");
+    defer std.testing.allocator.free(empty_md_path);
+    const silent_lua_path = try tmp.dir.realpathAlloc(std.testing.allocator, "silent.lua");
+    defer std.testing.allocator.free(silent_lua_path);
+
+    var markdown_due_job = scheduler_runtime.DueJob{
+        .job = .{
+            .id = try std.testing.allocator.dupe(u8, "job-md"),
+            .job_type = .markdown,
+            .path = try std.testing.allocator.dupe(u8, empty_md_path),
+            .chat_id = 1,
+            .paused = false,
+            .run_at = 100,
+            .cron = null,
+            .next_run_at = 100,
+            .created_at = 90,
+            .updated_at = 90,
+            .last_run_at = null,
+        },
+        .scheduled_for = 100,
+    };
+    defer markdown_due_job.deinit(std.testing.allocator);
+
+    const markdown_prompt = try buildScheduledPrompt(
+        std.testing.allocator,
+        workspace_root,
+        &markdown_due_job,
+        101,
+    );
+    try std.testing.expect(markdown_prompt == null);
+
+    var lua_due_job = scheduler_runtime.DueJob{
+        .job = .{
+            .id = try std.testing.allocator.dupe(u8, "job-lua"),
+            .job_type = .lua,
+            .path = try std.testing.allocator.dupe(u8, silent_lua_path),
+            .chat_id = 1,
+            .paused = false,
+            .run_at = 100,
+            .cron = null,
+            .next_run_at = 100,
+            .created_at = 90,
+            .updated_at = 90,
+            .last_run_at = null,
+        },
+        .scheduled_for = 100,
+    };
+    defer lua_due_job.deinit(std.testing.allocator);
+
+    const lua_prompt = try buildScheduledPrompt(
+        std.testing.allocator,
+        workspace_root,
+        &lua_due_job,
+        101,
+    );
+    try std.testing.expect(lua_prompt == null);
 }
 
 test "enforceConversationLimit removes oldest messages" {

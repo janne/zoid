@@ -43,14 +43,10 @@ zoid schedule delete <job_id>
 
 Telegram routing for scheduled output:
 
-- If a job is created from Telegram, that chat is used automatically.
-- Otherwise set a default DM chat id:
-
-```sh
-zoid config set TELEGRAM_DEFAULT_CHAT_ID "<chat_id>"
-```
-
-You can get your DM chat id by sending `/chatid` to the bot.
+- Zoid does not bind a Telegram channel when the job is created.
+- When a due job runs, Zoid asks the agent for a reply and then tries Telegram DM delivery using the stored private-chat id.
+- The DM id is updated automatically when `zoid serve` receives a private Telegram message.
+- If no DM id is available at run time, the scheduled reply is ignored.
 
 # Setup on Linux host
 
@@ -101,7 +97,6 @@ sudo install -m 0755 /path/to/zoid /usr/local/bin/zoid
 sudo zoid config set OPENAI_API_KEY "<...>"
 sudo zoid config set TELEGRAM_BOT_TOKEN "<...>"
 sudo zoid config set OPENAI_MODEL "gpt-5-mini"
-sudo zoid config set TELEGRAM_DEFAULT_CHAT_ID "<optional-dm-chat-id>"
 ```
 
 ## Create `/etc/systemd/system/zoid.service`

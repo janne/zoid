@@ -51,11 +51,6 @@ pub fn main() !void {
                 zoid.cli.printHelp();
                 return;
             },
-            error.InvalidChatId => {
-                std.debug.print("Invalid value for --chat-id (expected integer).\n\n", .{});
-                zoid.cli.printHelp();
-                return;
-            },
             error.UnknownConfigSubcommand => {
                 std.debug.print("Unknown config command: {s}\n\n", .{args[2]});
                 zoid.cli.printHelp();
@@ -194,7 +189,6 @@ pub fn main() !void {
                             .path = create_cmd.path,
                             .run_at = create_cmd.run_at,
                             .cron = create_cmd.cron,
-                            .chat_id = create_cmd.chat_id,
                         },
                     ) catch |err| {
                         reportScheduleError(err);
@@ -487,11 +481,10 @@ fn getWorkspaceRoot(allocator: std.mem.Allocator) ![]u8 {
 }
 
 fn printScheduleJob(allocator: std.mem.Allocator, job: *const zoid.scheduler_store.Job) !void {
-    const line1 = try std.fmt.allocPrint(allocator, "id={s} type={s} path={s} chat_id={d} paused={}\n", .{
+    const line1 = try std.fmt.allocPrint(allocator, "id={s} type={s} path={s} paused={}\n", .{
         job.id,
         zoid.scheduler_store.jobTypeToString(job.job_type),
         job.path,
-        job.chat_id,
         job.paused,
     });
     defer allocator.free(line1);
@@ -519,14 +512,6 @@ fn reportScheduleError(err: anyerror) void {
         error.InvalidSchedule => std.debug.print("Invalid schedule. Provide either --run-at <rfc3339> or --cron \"<min hour dom mon dow>\".\n", .{}),
         error.InvalidTimestamp => std.debug.print("Invalid run_at timestamp. Expected RFC3339 (for example 2026-02-22T21:00:00Z).\n", .{}),
         error.InvalidJobPath => std.debug.print("Invalid job path. Lua jobs require .lua and markdown jobs require .md under workspace root.\n", .{}),
-        error.ChatIdRequired => std.debug.print(
-            "No chat_id available. Provide --chat-id or set config {s}.\n",
-            .{zoid.config_keys.telegram_default_chat_id},
-        ),
-        error.InvalidDefaultChatId => std.debug.print(
-            "Config key {s} is invalid (expected integer chat id).\n",
-            .{zoid.config_keys.telegram_default_chat_id},
-        ),
         error.InvalidExpression, error.InvalidField, error.InvalidRange, error.InvalidStep, error.InvalidValue => {
             std.debug.print("Invalid cron expression.\n", .{});
         },

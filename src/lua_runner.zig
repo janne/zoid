@@ -910,9 +910,6 @@ fn pushLuaSchedulerJobTable(state: *c.lua_State, job: *const scheduler_store.Job
     _ = c.lua_pushlstring(state, job.path.ptr, job.path.len);
     c.lua_setfield(state, -2, "path");
 
-    c.lua_pushinteger(state, @intCast(job.chat_id));
-    c.lua_setfield(state, -2, "chat_id");
-
     c.lua_pushboolean(state, if (job.paused) 1 else 0);
     c.lua_setfield(state, -2, "paused");
 
@@ -1022,43 +1019,18 @@ fn luaZoidScheduleCreate(lua_state: ?*c.lua_State) callconv(.c) c_int {
     }
     luaPop(state, 1);
 
-    var chat_id: ?i64 = null;
-    _ = c.lua_getfield(state, options_index, "chat_id");
-    switch (c.lua_type(state, -1)) {
-        c.LUA_TNIL => {},
-        c.LUA_TNUMBER => {
-            var isnum: c_int = 0;
-            const value = c.lua_tointegerx(state, -1, &isnum);
-            if (isnum == 0) {
-                luaPop(state, 1);
-                return pushLuaErrorMessage(state, "zoid.schedule.create chat_id must be an integer", .{});
-            }
-            chat_id = value;
-        },
-        else => {
-            luaPop(state, 1);
-            return pushLuaErrorMessage(state, "zoid.schedule.create chat_id must be an integer", .{});
-        },
-    }
-    luaPop(state, 1);
-
     const job_type = scheduler_store.parseJobType(job_type_value) catch {
         return pushLuaErrorMessage(state, "zoid.schedule.create job_type must be 'lua' or 'markdown'", .{});
     };
 
     var job = scheduler_runtime.createJob(
         env.allocator,
-        .{
-            .workspace_root = env.workspace_root,
-            .request_chat_id = null,
-            .config_path_override = env.config_path_override,
-        },
+        .{ .workspace_root = env.workspace_root },
         .{
             .job_type = job_type,
             .path = path_value,
             .run_at = run_at_value,
             .cron = cron_value,
-            .chat_id = chat_id,
         },
     ) catch |err| {
         return pushLuaErrorMessage(state, "zoid.schedule.create failed: {s}", .{@errorName(err)});
@@ -1075,11 +1047,7 @@ fn luaZoidScheduleList(lua_state: ?*c.lua_State) callconv(.c) c_int {
 
     const jobs = scheduler_runtime.listJobs(
         env.allocator,
-        .{
-            .workspace_root = env.workspace_root,
-            .request_chat_id = null,
-            .config_path_override = env.config_path_override,
-        },
+        .{ .workspace_root = env.workspace_root },
     ) catch |err| {
         return pushLuaErrorMessage(state, "zoid.schedule.list failed: {s}", .{@errorName(err)});
     };
@@ -1104,11 +1072,7 @@ fn luaZoidScheduleDelete(lua_state: ?*c.lua_State) callconv(.c) c_int {
 
     const removed = scheduler_runtime.deleteJob(
         env.allocator,
-        .{
-            .workspace_root = env.workspace_root,
-            .request_chat_id = null,
-            .config_path_override = env.config_path_override,
-        },
+        .{ .workspace_root = env.workspace_root },
         job_id,
     ) catch |err| {
         return pushLuaErrorMessage(state, "zoid.schedule.delete failed: {s}", .{@errorName(err)});
@@ -1128,11 +1092,7 @@ fn luaZoidSchedulePause(lua_state: ?*c.lua_State) callconv(.c) c_int {
 
     const updated = scheduler_runtime.pauseJob(
         env.allocator,
-        .{
-            .workspace_root = env.workspace_root,
-            .request_chat_id = null,
-            .config_path_override = env.config_path_override,
-        },
+        .{ .workspace_root = env.workspace_root },
         job_id,
     ) catch |err| {
         return pushLuaErrorMessage(state, "zoid.schedule.pause failed: {s}", .{@errorName(err)});
@@ -1152,11 +1112,7 @@ fn luaZoidScheduleResume(lua_state: ?*c.lua_State) callconv(.c) c_int {
 
     const updated = scheduler_runtime.resumeJob(
         env.allocator,
-        .{
-            .workspace_root = env.workspace_root,
-            .request_chat_id = null,
-            .config_path_override = env.config_path_override,
-        },
+        .{ .workspace_root = env.workspace_root },
         job_id,
     ) catch |err| {
         return pushLuaErrorMessage(state, "zoid.schedule.resume failed: {s}", .{@errorName(err)});
@@ -2122,10 +2078,9 @@ test "executeLuaFileCaptureOutputTool supports zoid schedule api" {
         \\local created = zoid.schedule.create({
         \\  job_type = "markdown",
         \\  path = "note.md",
-        \\  run_at = "2026-01-10T10:00:00Z",
-        \\  chat_id = 999
+        \\  run_at = "2026-01-10T10:00:00Z"
         \\})
-        \\print(created.job_type, created.chat_id)
+        \\print(created.job_type)
         \\print(#zoid.schedule.list())
         \\print(zoid.schedule.pause(created.id))
         \\print(zoid.schedule.resume(created.id))
@@ -2146,7 +2101,7 @@ test "executeLuaFileCaptureOutputTool supports zoid schedule api" {
 
     try std.testing.expect(output.status == .ok);
     try std.testing.expectEqualStrings(
-        "markdown\t999\n1\ntrue\ntrue\ntrue\n0\n",
+        "markdown\n1\ntrue\ntrue\ntrue\n0\n",
         output.stdout,
     );
     try std.testing.expectEqualStrings("", output.stderr);

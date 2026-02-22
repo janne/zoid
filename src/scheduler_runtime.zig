@@ -1,14 +1,12 @@
 const std = @import("std");
-const config_keys = @import("config_keys.zig");
-const config_runtime = @import("config_runtime.zig");
 const cron_adapter = @import("cron_adapter.zig");
 const scheduler_store = @import("scheduler_store.zig");
 const workspace_fs = @import("workspace_fs.zig");
 
+pub const telegram_dm_chat_id_state_file_name = "telegram_dm_chat_id.txt";
+
 pub const Context = struct {
     workspace_root: []const u8,
-    request_chat_id: ?i64 = null,
-    config_path_override: ?[]const u8 = null,
 };
 
 pub const CreateRequest = struct {
@@ -16,7 +14,6 @@ pub const CreateRequest = struct {
     path: []const u8,
     run_at: ?[]const u8 = null,
     cron: ?[]const u8 = null,
-    chat_id: ?i64 = null,
 };
 
 pub const DueJob = struct {
@@ -65,8 +62,6 @@ pub fn createJob(allocator: std.mem.Allocator, context: Context, request: Create
         unreachable;
     }
 
-    const chat_id = try resolveChatId(allocator, context, request.chat_id);
-
     var lock = try scheduler_store.acquireLock(allocator, context.workspace_root);
     defer lock.release(allocator);
 
@@ -83,7 +78,7 @@ pub fn createJob(allocator: std.mem.Allocator, context: Context, request: Create
         .id = id,
         .job_type = request.job_type,
         .path = resolved_path,
-        .chat_id = chat_id,
+        .chat_id = 0,
         .paused = false,
         .run_at = run_at_epoch,
         .cron = cron_text,
@@ -310,27 +305,48 @@ fn validateJobPath(job_type: scheduler_store.JobType, resolved_path: []const u8)
     }
 }
 
-fn resolveChatId(allocator: std.mem.Allocator, context: Context, explicit_chat_id: ?i64) !i64 {
-    if (explicit_chat_id) |value| return value;
-    if (context.request_chat_id) |value| return value;
-
-    var config_response = try config_runtime.execute(
-        allocator,
-        .{ .config_path_override = context.config_path_override },
-        .{ .get = config_keys.telegram_default_chat_id },
-    );
-    defer config_response.deinit(allocator);
-
-    const raw = switch (config_response) {
-        .get => |value| value,
-        else => unreachable,
+pub fn loadDefaultDmChatIdAtPath(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) !?i64 {
+    const file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
     };
+    defer file.close();
 
-    if (raw) |chat_id_text| {
-        return std.fmt.parseInt(i64, chat_id_text, 10) catch return error.InvalidDefaultChatId;
+    const raw = try file.readToEndAlloc(allocator, 128);
+    defer allocator.free(raw);
+
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return null;
+
+    return std.fmt.parseInt(i64, trimmed, 10) catch return error.InvalidDefaultDmChatId;
+}
+
+fn defaultDmChatIdStatePath(allocator: std.mem.Allocator) ![]u8 {
+    const app_data_dir = try std.fs.getAppDataDir(allocator, "zoid");
+    defer allocator.free(app_data_dir);
+    return std.fs.path.join(allocator, &.{ app_data_dir, telegram_dm_chat_id_state_file_name });
+}
+
+pub fn persistDefaultDmChatIdAtPath(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    chat_id: i64,
+) !void {
+    if (std.fs.path.dirname(path)) |parent| {
+        try std.fs.cwd().makePath(parent);
     }
+    const content = try std.fmt.allocPrint(allocator, "{d}\n", .{chat_id});
+    defer allocator.free(content);
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = content });
+}
 
-    return error.ChatIdRequired;
+pub fn loadDefaultDmChatId(allocator: std.mem.Allocator) !?i64 {
+    const state_path = try defaultDmChatIdStatePath(allocator);
+    defer allocator.free(state_path);
+    return loadDefaultDmChatIdAtPath(allocator, state_path);
 }
 
 fn generateJobId(allocator: std.mem.Allocator) ![]u8 {
@@ -383,7 +399,7 @@ test "create/list/delete/pause/resume lifecycle" {
         try file.writeAll("print('ok')\n");
     }
 
-    const context = Context{ .workspace_root = workspace_root, .request_chat_id = 777 };
+    const context = Context{ .workspace_root = workspace_root };
 
     const created = try createJob(std.testing.allocator, context, .{
         .job_type = .lua,
@@ -404,7 +420,7 @@ test "create/list/delete/pause/resume lifecycle" {
     try std.testing.expect(try deleteJob(std.testing.allocator, context, created.id));
 }
 
-test "resolveChatId prefers explicit over request and config" {
+test "createJob no longer requires chat context" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -417,26 +433,30 @@ test "resolveChatId prefers explicit over request and config" {
         try file.writeAll("hello\n");
     }
 
-    const config_path = try std.fs.path.join(std.testing.allocator, &.{ workspace_root, "config.json" });
-    defer std.testing.allocator.free(config_path);
-    try std.fs.cwd().writeFile(.{ .sub_path = config_path, .data = "{\"TELEGRAM_DEFAULT_CHAT_ID\":\"555\"}" });
-
-    const context = Context{
-        .workspace_root = workspace_root,
-        .request_chat_id = 444,
-        .config_path_override = config_path,
-    };
-
-    const created = try createJob(std.testing.allocator, context, .{
+    const created = try createJob(std.testing.allocator, .{ .workspace_root = workspace_root }, .{
         .job_type = .markdown,
         .path = "task.md",
         .run_at = "2026-01-10T10:00:00Z",
-        .chat_id = 333,
     });
     defer {
         var copy = created;
         copy.deinit(std.testing.allocator);
     }
 
-    try std.testing.expectEqual(@as(i64, 333), created.chat_id);
+    try std.testing.expectEqual(@as(i64, 0), created.chat_id);
+}
+
+test "loadDefaultDmChatIdAtPath parses stored id" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    const dm_state_path = try std.fs.path.join(std.testing.allocator, &.{ workspace_root, "dm_chat_id.txt" });
+    defer std.testing.allocator.free(dm_state_path);
+    try persistDefaultDmChatIdAtPath(std.testing.allocator, dm_state_path, 555);
+
+    const loaded = try loadDefaultDmChatIdAtPath(std.testing.allocator, dm_state_path);
+    try std.testing.expectEqual(@as(i64, 555), loaded.?);
 }

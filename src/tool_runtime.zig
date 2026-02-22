@@ -110,7 +110,7 @@ pub fn executeToolCallWithContext(
         return executeFilesystemDelete(allocator, policy, arguments_json);
     }
     if (std.mem.eql(u8, tool_name, "lua_execute")) {
-        return executeLuaExecute(allocator, policy, arguments_json);
+        return executeLuaExecute(allocator, policy, request_context, arguments_json);
     }
     if (std.mem.eql(u8, tool_name, "config")) {
         return executeConfig(allocator, policy, arguments_json);
@@ -348,8 +348,10 @@ fn writePathMetadataJson(
 fn executeLuaExecute(
     allocator: std.mem.Allocator,
     policy: *const Policy,
+    request_context: RequestContext,
     arguments_json: []const u8,
 ) ![]u8 {
+    _ = request_context;
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{});
     defer parsed.deinit();
 
@@ -546,6 +548,7 @@ fn executeScheduler(
     request_context: RequestContext,
     arguments_json: []const u8,
 ) ![]u8 {
+    _ = request_context;
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{});
     defer parsed.deinit();
 
@@ -559,11 +562,7 @@ fn executeScheduler(
         else => return error.InvalidToolArguments,
     };
 
-    const context = scheduler_runtime.Context{
-        .workspace_root = policy.workspace_root,
-        .request_chat_id = request_context.request_chat_id,
-        .config_path_override = policy.config_path_override,
-    };
+    const context = scheduler_runtime.Context{ .workspace_root = policy.workspace_root };
 
     var output = std.Io.Writer.Allocating.init(allocator);
     errdefer output.deinit();
@@ -592,15 +591,6 @@ fn executeScheduler(
         else
             null;
 
-        const chat_id: ?i64 = if (root_object.get("chat_id")) |value|
-            switch (value) {
-                .integer => |number| number,
-                .null => null,
-                else => return error.InvalidToolArguments,
-            }
-        else
-            null;
-
         var created = try scheduler_runtime.createJob(
             allocator,
             context,
@@ -609,7 +599,6 @@ fn executeScheduler(
                 .path = path,
                 .run_at = run_at,
                 .cron = cron,
-                .chat_id = chat_id,
             },
         );
         defer created.deinit(allocator);
@@ -680,8 +669,6 @@ fn writeSchedulerJobJson(
     try writeJsonString(allocator, writer, scheduler_store.jobTypeToString(job.job_type));
     try writer.writeAll(",\"path\":");
     try writeJsonString(allocator, writer, job.path);
-    try writer.writeAll(",\"chat_id\":");
-    try writer.print("{d}", .{job.chat_id});
     try writer.writeAll(",\"paused\":");
     try writer.writeAll(if (job.paused) "true" else "false");
     try writer.writeAll(",\"run_at\":");
@@ -870,7 +857,6 @@ test "scheduler tool can create and list jobs" {
     const list_object = parsed_list.value.object;
     const jobs = list_object.get("jobs").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), jobs.len);
-    try std.testing.expectEqual(@as(i64, 777), jobs[0].object.get("chat_id").?.integer);
 }
 
 test "filesystem write and read stay within workspace root" {

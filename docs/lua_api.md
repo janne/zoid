@@ -84,8 +84,7 @@ Scheduler example:
 local created = zoid.schedule.create({
   job_type = "lua",
   path = "scripts/clean_up_docs.lua",
-  cron = "0 21 * * *",
-  chat_id = 123456789
+  cron = "0 21 * * *"
 })
 
 print(created.id, created.next_run_at)
@@ -114,7 +113,7 @@ Supported methods and return values:
 - `zoid.config():get(key) -> string | nil`
 - `zoid.config():set(key, value) -> boolean` (`true` on success)
 - `zoid.config():unset(key) -> boolean` (`true` if key existed and was removed)
-- `zoid.schedule.create({ job_type, path, run_at?, cron?, chat_id? }) -> job`
+- `zoid.schedule.create({ job_type, path, run_at?, cron? }) -> job`
 - `zoid.schedule.list() -> { job, ... }`
 - `zoid.schedule.delete(job_id) -> boolean`
 - `zoid.schedule.pause(job_id) -> boolean`
@@ -194,10 +193,8 @@ Method-specific behavior:
 - `path` must resolve inside workspace root
 - `.lua` jobs require `.lua` extension, markdown jobs require `.md` extension
 - exactly one schedule input is required: `run_at` (RFC3339) or `cron` (5-field cron)
-- output `chat_id` is resolved in order:
-  - explicit `chat_id` on create
-  - Telegram request chat context (tool mode)
-  - config key `TELEGRAM_DEFAULT_CHAT_ID`
+- no Telegram destination is resolved at create time
+- destination is resolved when the job runs: Telegram DM (if available), otherwise the reply is dropped
 
 ### Read Limits
 

@@ -51,9 +51,9 @@ If you change command behavior, error handling, config format, or Lua execution 
   - Telegram service mode keeps conversation history per `chat_id` (similar to local chat session continuity), persists it to app-data (`telegram_context.json` next to `config.json`), and enforces a per-chat history cap (`max_conversation_messages_per_chat` in `src/telegram_bot.zig`).
   - Telegram service mode acquires an app-data lock file (`telegram_serve.lock`) so only one `zoid serve` instance runs per user profile; a second instance fails with `error.ServiceAlreadyRunning`.
   - `/new` or `/reset` clears that chat's stored Telegram context.
-  - `/chatid` replies with the current Telegram `chat_id` so users can set `TELEGRAM_DEFAULT_CHAT_ID`.
   - While generating a reply in Telegram service mode, send the native `sendChatAction` typing indicator periodically so users see Telegram's built-in "typing..." state until `sendMessage` completes.
-  - Service mode processes due scheduled jobs before polling updates; scheduler output is sent to the assistant and assistant replies are delivered to the job's Telegram DM.
+  - Service mode processes due scheduled jobs before polling updates; scheduler output is sent to the assistant and assistant replies are delivered to Telegram DM when a DM chat id is available.
+  - Service mode persists the latest private-chat `chat_id` to app-data (`telegram_dm_chat_id.txt`), which is used as runtime DM fallback when scheduled jobs execute.
 
 ### Chat interface changes:
   - `src/chat_session.zig` now uses fullscreen `libvaxis` UI in the alternate screen when running on a TTY, with `vaxis.widgets.TextInput` handling readline-style editing (`Ctrl+A`, `Ctrl+E`, arrows, backspace/delete).
@@ -90,7 +90,8 @@ If you change command behavior, error handling, config format, or Lua execution 
   - `zoid.uri(uri)` allows only HTTP/HTTPS requests and returns a Lua table with `status`, `body`, and `ok`; response body capture is capped by sandbox policy (currently 1 MiB in `lua_execute`).
   - `zoid.uri(...):get/delete/post/put` accept optional request options with `headers` table (string->string); header names/values are validated and dangerous overrides such as `Host`/`Content-Length` are rejected.
   - `zoid.json.decode` maps JSON values to Lua tables/scalars and maps JSON `null` to the sentinel `zoid.json.null`.
-  - `scheduler` tool supports `create/list/delete/pause/resume`; create supports `.lua` and `.md` paths with exactly one schedule input (`run_at` RFC3339 or 5-field `cron`), and resolves chat destination in precedence: explicit `chat_id` -> request `chat_id` -> `TELEGRAM_DEFAULT_CHAT_ID`.
+  - `scheduler` tool supports `create/list/delete/pause/resume`; create supports `.lua` and `.md` paths with exactly one schedule input (`run_at` RFC3339 or 5-field `cron`), and does not resolve Telegram destination at create time.
+  - In `telegram_bot` scheduled processing, skip agent dispatch when Lua stdout+stderr are both empty (after trim), or when markdown content is empty (after trim).
   - Tool-mode `io` must be a minimal capture-only table (`io.write` and `io.stderr:write`) so scripts can emit stdout/stderr for agent inspection without gaining general file I/O APIs.
   - `shell_command` and `exec` are intentionally disabled for OpenAI tool calls; unknown/disabled tool calls must return `error.ToolDisabled`.
   - Keep path checks strict: resolve to canonical paths and reject access outside workspace root.
@@ -98,7 +99,7 @@ If you change command behavior, error handling, config format, or Lua execution 
 ### Config changes:
   - Preserve valid JSON object format (string keys and string values).
   - Keep deterministic key listing behavior (`list` is currently sorted).
-  - Keep OpenAI and Telegram config key names centralized in `src/config_keys.zig` and reuse those constants in command/chat code paths (`TELEGRAM_DEFAULT_CHAT_ID` included).
+  - Keep OpenAI and Telegram config key names centralized in `src/config_keys.zig` and reuse those constants in command/chat code paths.
 
 ### Lua runner changes:
   - Keep clear load/runtime error reporting.
@@ -109,6 +110,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - Keep scripts compatible with the sandboxed `zoid` API surface (`zoid.file`, `zoid.dir`, `zoid.uri`, `zoid.config`, `zoid.schedule`, `zoid.json`) and do not rely on removed globals like `os`/`package`/`require`.
   - `zoid execute <file.lua> [args...]` exposes Lua global `arg` with `arg[0]` as script path and `arg[1..]` as forwarded positional arguments.
   - `scripts/gmail.lua` is a CLI-style utility; it supports `--query`, `--limit`, `--id`, and `--labels`, with default query `is:unread in:inbox`.
+  - `scripts/counter.lua` creates `counter.txt` with `1` when missing; otherwise it reads the current integer value, increments by `1`, and writes it back.
 
 ### Public module surface:
   - Keep `src/root.zig` exports aligned with intended package API.
