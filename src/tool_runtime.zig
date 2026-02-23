@@ -410,7 +410,11 @@ fn executeLuaExecute(
     errdefer output.deinit();
 
     const writer = &output.writer;
-    const ok = execution.status == .ok;
+    const ok = switch (execution.status) {
+        .ok => true,
+        .exited => (execution.exit_code orelse 0) == 0,
+        .state_init_failed, .load_failed, .runtime_failed => false,
+    };
     try writer.writeAll("{\"ok\":");
     try writer.writeAll(if (ok) "true" else "false");
     try writer.writeAll(",\"tool\":\"lua_execute\",\"path\":");
@@ -423,9 +427,16 @@ fn executeLuaExecute(
     try writer.writeAll(if (execution.stdout_truncated) "true" else "false");
     try writer.writeAll(",\"stderr_truncated\":");
     try writer.writeAll(if (execution.stderr_truncated) "true" else "false");
+    try writer.writeAll(",\"exit_code\":");
+    if (execution.exit_code) |exit_code| {
+        try writer.print("{d}", .{exit_code});
+    } else {
+        try writer.writeAll("null");
+    }
     if (!ok) {
         const error_name = switch (execution.status) {
             .ok => unreachable,
+            .exited => "LuaExit",
             .state_init_failed => "LuaStateInitFailed",
             .load_failed => "LuaLoadFailed",
             .runtime_failed => "LuaRuntimeFailed",
@@ -1120,6 +1131,76 @@ test "lua execute forwards args to Lua arg table" {
     try std.testing.expect(root_object.get("ok").?.bool);
     try std.testing.expectEqualStrings("one\ntwo\n", root_object.get("stdout").?.string);
     try std.testing.expectEqualStrings("", root_object.get("stderr").?.string);
+    try std.testing.expect(root_object.get("exit_code").? == .null);
+}
+
+test "lua execute supports zoid exit codes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const file = try tmp.dir.createFile("exit_nonzero.lua", .{});
+        defer file.close();
+        try file.writeAll(
+            \\print("before")
+            \\zoid.exit(9)
+            \\print("after")
+            \\
+        );
+    }
+
+    {
+        const file = try tmp.dir.createFile("exit_zero.lua", .{});
+        defer file.close();
+        try file.writeAll(
+            \\print("ok")
+            \\zoid.exit(0)
+            \\print("after")
+            \\
+        );
+    }
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+
+    const nonzero_result = try executeToolCall(
+        std.testing.allocator,
+        &policy,
+        "lua_execute",
+        "{\"path\":\"exit_nonzero.lua\"}",
+    );
+    defer std.testing.allocator.free(nonzero_result);
+
+    var nonzero_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, nonzero_result, .{});
+    defer nonzero_parsed.deinit();
+
+    const nonzero_root = nonzero_parsed.value.object;
+    try std.testing.expect(!nonzero_root.get("ok").?.bool);
+    try std.testing.expectEqualStrings("before\n", nonzero_root.get("stdout").?.string);
+    try std.testing.expectEqualStrings("", nonzero_root.get("stderr").?.string);
+    try std.testing.expectEqualStrings("LuaExit", nonzero_root.get("error").?.string);
+    try std.testing.expectEqual(@as(i64, 9), nonzero_root.get("exit_code").?.integer);
+
+    const zero_result = try executeToolCall(
+        std.testing.allocator,
+        &policy,
+        "lua_execute",
+        "{\"path\":\"exit_zero.lua\"}",
+    );
+    defer std.testing.allocator.free(zero_result);
+
+    var zero_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, zero_result, .{});
+    defer zero_parsed.deinit();
+
+    const zero_root = zero_parsed.value.object;
+    try std.testing.expect(zero_root.get("ok").?.bool);
+    try std.testing.expectEqualStrings("ok\n", zero_root.get("stdout").?.string);
+    try std.testing.expectEqualStrings("", zero_root.get("stderr").?.string);
+    try std.testing.expect(zero_root.get("error") == null);
+    try std.testing.expectEqual(@as(i64, 0), zero_root.get("exit_code").?.integer);
 }
 
 test "lua execute rejects invalid args shape" {

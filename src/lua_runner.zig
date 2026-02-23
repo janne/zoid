@@ -23,6 +23,7 @@ pub const default_tool_max_http_response_bytes: usize = 1024 * 1024;
 
 pub const CapturedExecutionStatus = enum {
     ok,
+    exited,
     state_init_failed,
     load_failed,
     runtime_failed,
@@ -30,6 +31,7 @@ pub const CapturedExecutionStatus = enum {
 
 pub const CapturedExecution = struct {
     status: CapturedExecutionStatus,
+    exit_code: ?i64,
     stdout: []u8,
     stderr: []u8,
     stdout_truncated: bool,
@@ -1227,6 +1229,44 @@ fn luaZoidJson(lua_state: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
+fn luaZoidExit(lua_state: ?*c.lua_State) callconv(.c) c_int {
+    const state = lua_state orelse return 0;
+    const nargs = c.lua_gettop(state);
+
+    var exit_code: c.lua_Integer = 0;
+    if (nargs >= 1 and c.lua_type(state, 1) != c.LUA_TNIL) {
+        var isnum: c_int = 0;
+        exit_code = c.lua_tointegerx(state, 1, &isnum);
+        if (isnum == 0) {
+            return pushLuaErrorMessage(state, "zoid.exit([code]) code must be an integer", .{});
+        }
+    }
+
+    c.lua_newtable(state);
+    c.lua_pushboolean(state, 1);
+    c.lua_setfield(state, -2, "__zoid_exit");
+    c.lua_pushinteger(state, exit_code);
+    c.lua_setfield(state, -2, "code");
+    return c.lua_error(state);
+}
+
+fn parseLuaExitCode(state: *c.lua_State) ?i64 {
+    if (c.lua_type(state, -1) != c.LUA_TTABLE) return null;
+
+    _ = c.lua_getfield(state, -1, "__zoid_exit");
+    const is_exit = c.lua_toboolean(state, -1) != 0;
+    luaPop(state, 1);
+    if (!is_exit) return null;
+
+    _ = c.lua_getfield(state, -1, "code");
+    var isnum: c_int = 0;
+    const code = c.lua_tointegerx(state, -1, &isnum);
+    luaPop(state, 1);
+    if (isnum == 0) return null;
+
+    return std.math.cast(i64, code) orelse return null;
+}
+
 fn installOutputCapture(lua_state: *c.lua_State, capture: *LuaOutputCapture) void {
     c.lua_pushlightuserdata(lua_state, capture);
     _ = c.lua_setglobal(lua_state, capture_registry_key);
@@ -1278,6 +1318,8 @@ fn installZoidTable(lua_state: *c.lua_State, sandbox: *ToolLuaEnvironment) void 
     c.lua_setfield(lua_state, -2, "jobs");
     _ = luaZoidJson(lua_state);
     c.lua_setfield(lua_state, -2, "json");
+    c.lua_pushcclosure(lua_state, luaZoidExit, 0);
+    c.lua_setfield(lua_state, -2, "exit");
     _ = c.lua_setglobal(lua_state, "zoid");
 }
 
@@ -1310,6 +1352,7 @@ fn executeLuaFileCaptureOutputInternal(
 
     const lua_state = c.luaL_newstate() orelse return .{
         .status = .state_init_failed,
+        .exit_code = null,
         .stdout = try allocator.dupe(u8, ""),
         .stderr = try allocator.dupe(u8, "Unable to initialize Lua runtime."),
         .stdout_truncated = false,
@@ -1338,21 +1381,25 @@ fn executeLuaFileCaptureOutputInternal(
 
     if (c.luaL_loadfilex(lua_state, c_file_path.ptr, null) != c.LUA_OK) {
         capture.appendStderrSlice(luaErrorMessage(lua_state));
-        return finalizeCapture(allocator, &capture, .load_failed);
+        return finalizeCapture(allocator, &capture, .load_failed, null);
     }
 
     if (c.lua_pcallk(lua_state, 0, c.LUA_MULTRET, 0, 0, null) != c.LUA_OK) {
+        if (parseLuaExitCode(lua_state)) |exit_code| {
+            return finalizeCapture(allocator, &capture, .exited, exit_code);
+        }
         capture.appendStderrSlice(luaErrorMessage(lua_state));
-        return finalizeCapture(allocator, &capture, .runtime_failed);
+        return finalizeCapture(allocator, &capture, .runtime_failed, null);
     }
 
-    return finalizeCapture(allocator, &capture, .ok);
+    return finalizeCapture(allocator, &capture, .ok, null);
 }
 
 fn finalizeCapture(
     allocator: std.mem.Allocator,
     capture: *LuaOutputCapture,
     status: CapturedExecutionStatus,
+    exit_code: ?i64,
 ) CaptureError!CapturedExecution {
     const stdout = try capture.stdout.toOwnedSlice(allocator);
     errdefer allocator.free(stdout);
@@ -1360,6 +1407,7 @@ fn finalizeCapture(
 
     return .{
         .status = status,
+        .exit_code = exit_code,
         .stdout = stdout,
         .stderr = stderr,
         .stdout_truncated = capture.stdout_truncated,
@@ -1575,7 +1623,68 @@ test "executeLuaFileCaptureOutputToolWithArgs sets Lua arg table" {
     defer output.deinit(std.testing.allocator);
 
     try std.testing.expect(output.status == .ok);
+    try std.testing.expect(output.exit_code == null);
     try std.testing.expectEqualStrings("left\nright\n", output.stdout);
+    try std.testing.expectEqualStrings("", output.stderr);
+}
+
+test "executeLuaFileCaptureOutputTool supports zoid.exit with explicit exit code" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file_path = "exit_nonzero.lua";
+    const file = try tmp.dir.createFile(file_path, .{});
+    defer file.close();
+    try file.writeAll(
+        \\print("before")
+        \\zoid.exit(7)
+        \\print("after")
+        \\
+    );
+
+    const abs_path = try tmp.dir.realpathAlloc(std.testing.allocator, file_path);
+    defer std.testing.allocator.free(abs_path);
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    var output = try executeLuaFileCaptureOutputTool(std.testing.allocator, abs_path, .{
+        .workspace_root = workspace_root,
+    });
+    defer output.deinit(std.testing.allocator);
+
+    try std.testing.expect(output.status == .exited);
+    try std.testing.expectEqual(@as(?i64, 7), output.exit_code);
+    try std.testing.expectEqualStrings("before\n", output.stdout);
+    try std.testing.expectEqualStrings("", output.stderr);
+}
+
+test "executeLuaFileCaptureOutputTool supports zoid.exit default code zero" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file_path = "exit_zero.lua";
+    const file = try tmp.dir.createFile(file_path, .{});
+    defer file.close();
+    try file.writeAll(
+        \\print("start")
+        \\zoid.exit()
+        \\print("after")
+        \\
+    );
+
+    const abs_path = try tmp.dir.realpathAlloc(std.testing.allocator, file_path);
+    defer std.testing.allocator.free(abs_path);
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    var output = try executeLuaFileCaptureOutputTool(std.testing.allocator, abs_path, .{
+        .workspace_root = workspace_root,
+    });
+    defer output.deinit(std.testing.allocator);
+
+    try std.testing.expect(output.status == .exited);
+    try std.testing.expectEqual(@as(?i64, 0), output.exit_code);
+    try std.testing.expectEqualStrings("start\n", output.stdout);
     try std.testing.expectEqualStrings("", output.stderr);
 }
 

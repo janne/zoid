@@ -99,10 +99,12 @@ pub fn main() !void {
             if (!outcome.ok) {
                 if (outcome.stderr.len == 0) {
                     if (outcome.error_name) |error_name| {
-                        std.debug.print("{s}\n", .{error_name});
+                        if (!std.mem.eql(u8, error_name, "LuaExit")) {
+                            std.debug.print("{s}\n", .{error_name});
+                        }
                     }
                 }
-                std.process.exit(1);
+                std.process.exit(outcome.exit_code orelse 1);
             }
         },
         .config => |config_cmd| switch (config_cmd) {
@@ -341,6 +343,7 @@ pub fn main() !void {
 
 const LuaExecuteOutcome = struct {
     ok: bool,
+    exit_code: ?u8,
     stdout: []u8,
     stderr: []u8,
     error_name: ?[]u8,
@@ -417,6 +420,12 @@ fn executeLuaAsTool(
     const stderr = try allocator.dupe(u8, stderr_value);
     errdefer allocator.free(stderr);
 
+    const exit_code = if (root_object.get("exit_code")) |exit_value| switch (exit_value) {
+        .null => null,
+        .integer => |value| @as(u8, @intCast(std.math.clamp(value, 0, 255))),
+        else => return error.InvalidToolResult,
+    } else null;
+
     const error_name = if (root_object.get("error")) |error_value|
         switch (error_value) {
             .string => |value| try allocator.dupe(u8, value),
@@ -428,6 +437,7 @@ fn executeLuaAsTool(
 
     return .{
         .ok = ok,
+        .exit_code = exit_code,
         .stdout = stdout,
         .stderr = stderr,
         .error_name = error_name,
@@ -659,7 +669,34 @@ test "executeLuaAsTool forwards script args to Lua arg table" {
     try std.testing.expect(outcome.ok);
     try std.testing.expectEqualStrings("alpha\nbeta\n", outcome.stdout);
     try std.testing.expectEqualStrings("", outcome.stderr);
+    try std.testing.expect(outcome.exit_code == null);
     try std.testing.expect(outcome.error_name == null);
+}
+
+test "executeLuaAsTool surfaces zoid exit code" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script = try tmp.dir.createFile("exit.lua", .{});
+    defer script.close();
+    try script.writeAll(
+        \\print("before")
+        \\zoid.exit(7)
+        \\print("after")
+        \\
+    );
+
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    var outcome = try executeLuaAsTool(std.testing.allocator, "exit.lua", &.{}, workspace_root);
+    defer outcome.deinit(std.testing.allocator);
+
+    try std.testing.expect(!outcome.ok);
+    try std.testing.expectEqual(@as(?u8, 7), outcome.exit_code);
+    try std.testing.expectEqualStrings("before\n", outcome.stdout);
+    try std.testing.expectEqualStrings("", outcome.stderr);
+    try std.testing.expectEqualStrings("LuaExit", outcome.error_name.?);
 }
 
 test "loadWorkspaceAgentInstructionAtPath reads trimmed ZOID.md content" {

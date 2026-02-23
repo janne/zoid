@@ -26,6 +26,7 @@ Lua run through Zoid has a `zoid` global with:
 - `zoid.config()` config handles
 - `zoid.jobs` scheduler handles
 - `zoid.json.decode(json_text)` JSON decoder
+- `zoid.exit([code])` script exit helper
 
 File example:
 
@@ -124,6 +125,7 @@ Supported methods and return values:
 - `zoid.jobs.resume(job_id) -> boolean`
 - `zoid.json.decode(json_text) -> any`
 - `zoid.json.null` sentinel value used when decoded JSON contains `null`
+- `zoid.exit([code]) -> never` (stops Lua script execution; defaults to exit code `0`)
 
 ### APIs Removed or Disabled
 
@@ -145,7 +147,7 @@ The output APIs are replaced to capture script output safely:
 - `io.stderr:write(...)` is captured to `stderr`
 - Other standard `io` functions are not available
 
-Captured streams are returned in tool JSON fields (`stdout`, `stderr`) instead of writing directly to terminal stdout/stderr.
+Captured streams are returned in tool JSON fields (`stdout`, `stderr`) instead of writing directly to terminal stdout/stderr. Tool-mode results also include `exit_code` (`null` unless the script called `zoid.exit`).
 
 ### `arg` Global
 

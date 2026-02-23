@@ -732,6 +732,12 @@ fn buildScheduledPrompt(
 
             try payload.appendSlice(allocator, "\"kind\":\"lua\",\"status\":");
             try appendJsonString(allocator, &payload, executionStatusToString(execution.status));
+            try payload.appendSlice(allocator, ",\"exit_code\":");
+            if (execution.exit_code) |exit_code| {
+                try payload.writer(allocator).print("{d}", .{exit_code});
+            } else {
+                try payload.appendSlice(allocator, "null");
+            }
             try payload.appendSlice(allocator, ",\"stdout\":");
             try appendJsonString(allocator, &payload, execution.stdout);
             try payload.appendSlice(allocator, ",\"stderr\":");
@@ -813,6 +819,7 @@ fn appendJsonString(allocator: std.mem.Allocator, payload: *std.ArrayList(u8), v
 fn executionStatusToString(status: lua_runner.CapturedExecutionStatus) []const u8 {
     return switch (status) {
         .ok => "ok",
+        .exited => "exited",
         .state_init_failed => "state_init_failed",
         .load_failed => "load_failed",
         .runtime_failed => "runtime_failed",
