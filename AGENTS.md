@@ -79,6 +79,7 @@ If you change command behavior, error handling, config format, or Lua execution 
 ### OpenAI model policy changes:
   - Keep `src/model_catalog.zig` as the single source of truth for `default_model`, `fallback_models`, and `isChatModelId`.
   - `src/openai_client.zig` should use `model_catalog.isChatModelId` when filtering `/v1/models` results.
+  - When writing OpenAI tool-definition JSON in `src/openai_client.zig`, prefer `writeAll` segments plus targeted `writer.print` for numeric inserts instead of one large escaped-brace format string; malformed formatting can trigger OpenAI `400` with `We could not parse the JSON body`.
   - `src/main.zig` should use `model_catalog.default_model` when `OPENAI_MODEL` is unset.
   - `src/chat_session.zig` should use `model_catalog.fallback_models` for picker fallback choices.
   - Keep model catalog invariants covered by tests (`default_model` included in `fallback_models`, fallback IDs unique, fallback IDs chat-capable).

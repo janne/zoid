@@ -446,10 +446,9 @@ fn writeLuaExecuteToolDefinition(
 
     try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"lua_execute\",\"description\":");
     try writeJsonString(allocator, writer, description);
-    try writer.print(
-        ",\"parameters\":{{\"type\":\"object\",\"properties\":{{\"path\":{{\"type\":\"string\"}},\"args\":{{\"type\":\"array\",\"items\":{{\"type\":\"string\"}}}},\"timeout\":{{\"type\":\"integer\",\"minimum\":1,\"maximum\":{d}}}}},\"required\":[\"path\"],\"additionalProperties\":false}}}}",
-        .{tool_runtime.max_allowed_lua_timeout_seconds},
-    );
+    try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"args\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"timeout\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":");
+    try writer.print("{d}", .{tool_runtime.max_allowed_lua_timeout_seconds});
+    try writer.writeAll("}},\"required\":[\"path\"],\"additionalProperties\":false}}}");
 }
 
 fn writeHttpGetToolDefinition(
