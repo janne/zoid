@@ -20,6 +20,7 @@ Lua run through Zoid has a `zoid` global with:
 - `zoid.uri(uri)` HTTP request handles
 - `zoid.config()` config handles
 - `zoid.jobs` scheduler handles
+- `zoid.import(path)` Lua module imports
 - `zoid.json.decode(json_text)` JSON decoder
 - `zoid.exit([code])` script exit helper
 
@@ -98,6 +99,36 @@ zoid.jobs.resume(created.id)
 zoid.jobs.delete(created.id)
 ```
 
+Import example:
+
+```lua
+local util = zoid.import("lib/util.lua")
+local features = zoid.import("lib/features.lua")
+print(util.version, features.enabled)
+```
+
+Alternative module patterns:
+
+```lua
+-- Global side-effect style (works, but less explicit)
+myLib = myLib or {}
+
+function myLib.hello(name)
+  return "Hello " .. (name or "world")
+end
+```
+
+```lua
+-- Return-value style (recommended)
+local myLib = {}
+
+function myLib.hello(name)
+  return "Hello " .. (name or "world")
+end
+
+return myLib
+```
+
 Supported methods and return values:
 
 - `zoid.file(path) -> { name, path, type, size, mode, owner, group, modified_at, read, write, delete }`
@@ -124,6 +155,7 @@ Supported methods and return values:
 - `zoid.jobs.delete(job_id) -> boolean`
 - `zoid.jobs.pause(job_id) -> boolean`
 - `zoid.jobs.resume(job_id) -> boolean`
+- `zoid.import(path) -> any` (module return value; repeated imports return the cached module value; if module returns `nil`, import returns `true`)
 - `zoid.json.decode(json_text) -> any`
 - `zoid.json.null` sentinel value used when decoded JSON contains `null`
 - `zoid.exit([code]) -> never` (stops Lua script execution; defaults to exit code `0`)
@@ -138,6 +170,8 @@ The following standard Lua escape hatches are removed:
 - `require`
 - `dofile`
 - `loadfile`
+
+Use `zoid.import(path)` for sandboxed module loading instead.
 
 ### `io` and `print` Behavior
 
@@ -197,6 +231,15 @@ Method-specific behavior:
 - `zoid.dir(path):create()` creates a directory and fails if it already exists
 - `zoid.dir(path):remove()` removes an existing empty directory and fails if it is missing or non-empty
 - `zoid.dir(path):grep(pattern, [options])` searches file content under the directory and can recurse into subdirectories
+
+### Import Rules
+
+`zoid.import(path)` enforces sandboxed module loading rules:
+
+- path must resolve to a `.lua` file under workspace root
+- relative paths are resolved from the importing module's directory
+- repeated imports use a module cache and do not re-execute module top-level code
+- cyclic imports fail with a runtime error
 
 ### HTTP Request Rules
 
