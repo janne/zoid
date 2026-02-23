@@ -42,6 +42,9 @@ dir:create()
 for _, entry in ipairs(dir:list()) do
   print(entry.name, entry.type, entry.size, entry.modified_at)
 end
+for _, match in ipairs(dir:grep("error", { recursive = true })) do
+  print(match.path, match.line, match.column, match.text)
+end
 dir:remove()
 ```
 
@@ -101,10 +104,13 @@ Supported methods and return values:
 - `zoid.file(path):read([max_bytes]) -> string`
 - `zoid.file(path):write(content) -> integer` (bytes written)
 - `zoid.file(path):delete() -> boolean` (`true` on success)
-- `zoid.dir(path) -> { name, path, type, size, mode, owner, group, modified_at, list, create, remove }`
+- `zoid.dir(path) -> { name, path, type, size, mode, owner, group, modified_at, list, create, remove, grep }`
 - `zoid.dir(path):list() -> { { name, path, type, size, mode, owner, group, modified_at }, ... }`
 - `zoid.dir(path):create() -> boolean` (`true` on success)
 - `zoid.dir(path):remove() -> boolean` (`true` on success)
+- `zoid.dir(path):grep(pattern, [options]) -> { { path, line, column, text }, ... }`
+  - `options.recursive` (boolean, default `true`)
+  - `options.max_matches` (integer, default `200`, max `5000`)
 - `zoid.uri(uri):get([options]) -> { status: integer, body: string, ok: boolean }`
 - `zoid.uri(uri):post([body], [options]) -> { status: integer, body: string, ok: boolean }`
 - `zoid.uri(uri):put([body], [options]) -> { status: integer, body: string, ok: boolean }`
@@ -190,6 +196,7 @@ Method-specific behavior:
 - `zoid.dir(path):list()` requires an existing directory and returns one-level metadata entries sorted by name
 - `zoid.dir(path):create()` creates a directory and fails if it already exists
 - `zoid.dir(path):remove()` removes an existing empty directory and fails if it is missing or non-empty
+- `zoid.dir(path):grep(pattern, [options])` searches file content under the directory and can recurse into subdirectories
 
 ### HTTP Request Rules
 

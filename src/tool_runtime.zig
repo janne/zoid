@@ -10,6 +10,7 @@ pub const sandbox_mode: []const u8 = "workspace-write";
 pub const enabled_tools = [_][]const u8{
     "filesystem_read",
     "filesystem_list",
+    "filesystem_grep",
     "filesystem_write",
     "filesystem_delete",
     "lua_execute",
@@ -23,6 +24,8 @@ pub const enabled_tools = [_][]const u8{
 pub const disabled_tools = [_][]const u8{};
 pub const default_max_read_bytes: usize = 128 * 1024;
 pub const max_allowed_read_bytes: usize = 1024 * 1024;
+pub const default_grep_max_matches: usize = workspace_fs.default_max_grep_matches;
+pub const max_allowed_grep_matches: usize = workspace_fs.max_allowed_grep_matches;
 pub const max_allowed_http_response_bytes: usize = 1024 * 1024;
 pub const default_lua_timeout_seconds: u32 = lua_runner.default_tool_execution_timeout_seconds;
 pub const max_allowed_lua_timeout_seconds: u32 = lua_runner.max_tool_execution_timeout_seconds;
@@ -104,6 +107,9 @@ pub fn executeToolCallWithContext(
     }
     if (std.mem.eql(u8, tool_name, "filesystem_list")) {
         return executeFilesystemList(allocator, policy, arguments_json);
+    }
+    if (std.mem.eql(u8, tool_name, "filesystem_grep")) {
+        return executeFilesystemGrep(allocator, policy, arguments_json);
     }
     if (std.mem.eql(u8, tool_name, "filesystem_write")) {
         return executeFilesystemWrite(allocator, policy, arguments_json);
@@ -323,6 +329,87 @@ fn executeFilesystemDelete(
     return output.toOwnedSlice();
 }
 
+fn executeFilesystemGrep(
+    allocator: std.mem.Allocator,
+    policy: *const Policy,
+    arguments_json: []const u8,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{});
+    defer parsed.deinit();
+
+    const root_object = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidToolArguments,
+    };
+
+    var requested_path: []const u8 = ".";
+    if (root_object.get("path")) |path_value| {
+        requested_path = switch (path_value) {
+            .string => |value| value,
+            else => return error.InvalidToolArguments,
+        };
+    }
+
+    const pattern = switch (root_object.get("pattern") orelse return error.InvalidToolArguments) {
+        .string => |value| value,
+        else => return error.InvalidToolArguments,
+    };
+
+    var recursive = true;
+    if (root_object.get("recursive")) |recursive_value| {
+        recursive = switch (recursive_value) {
+            .bool => |value| value,
+            else => return error.InvalidToolArguments,
+        };
+    }
+
+    var max_matches: usize = default_grep_max_matches;
+    if (root_object.get("max_matches")) |max_matches_value| {
+        max_matches = switch (max_matches_value) {
+            .integer => |value| blk: {
+                if (value <= 0) return error.InvalidToolArguments;
+                const converted = std.math.cast(usize, value) orelse return error.InvalidToolArguments;
+                break :blk converted;
+            },
+            else => return error.InvalidToolArguments,
+        };
+        if (max_matches > max_allowed_grep_matches) return error.InvalidToolArguments;
+    }
+
+    var grep_result = try workspace_fs.grep(
+        allocator,
+        policy.workspace_root,
+        requested_path,
+        pattern,
+        recursive,
+        max_matches,
+    );
+    defer grep_result.deinit(allocator);
+
+    var output = std.Io.Writer.Allocating.init(allocator);
+    errdefer output.deinit();
+
+    const writer = &output.writer;
+    try writer.writeAll("{\"ok\":true,\"tool\":\"filesystem_grep\",\"path\":");
+    try writeJsonString(allocator, writer, grep_result.path);
+    try writer.writeAll(",\"pattern\":");
+    try writeJsonString(allocator, writer, pattern);
+    try writer.writeAll(",\"recursive\":");
+    try writer.writeAll(if (recursive) "true" else "false");
+    try writer.writeAll(",\"files_scanned\":");
+    try writer.print("{d}", .{grep_result.files_scanned});
+    try writer.writeAll(",\"truncated\":");
+    try writer.writeAll(if (grep_result.truncated) "true" else "false");
+    try writer.writeAll(",\"matches\":[");
+    for (grep_result.matches, 0..) |match, index| {
+        if (index != 0) try writer.writeAll(",");
+        try writeGrepMatchJson(allocator, writer, &match);
+    }
+    try writer.writeAll("]}");
+
+    return output.toOwnedSlice();
+}
+
 fn writePathMetadataJson(
     allocator: std.mem.Allocator,
     writer: *std.Io.Writer,
@@ -344,6 +431,22 @@ fn writePathMetadataJson(
     try writeJsonString(allocator, writer, metadata.group);
     try writer.writeAll(",\"modified_at\":");
     try writeJsonString(allocator, writer, metadata.modified_at);
+    try writer.writeAll("}");
+}
+
+fn writeGrepMatchJson(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    match: *const workspace_fs.GrepMatch,
+) !void {
+    try writer.writeAll("{\"path\":");
+    try writeJsonString(allocator, writer, match.path);
+    try writer.writeAll(",\"line\":");
+    try writer.print("{d}", .{match.line});
+    try writer.writeAll(",\"column\":");
+    try writer.print("{d}", .{match.column});
+    try writer.writeAll(",\"text\":");
+    try writeJsonString(allocator, writer, match.text);
     try writer.writeAll("}");
 }
 
@@ -838,7 +941,7 @@ test "buildPolicyJson emits required fields" {
     const root_object = parsed.value.object;
     try std.testing.expectEqualStrings("workspace-write", root_object.get("sandbox_mode").?.string);
     try std.testing.expectEqualStrings(policy.workspace_root, root_object.get("writable_roots").?.array.items[0].string);
-    try std.testing.expectEqual(@as(usize, 11), root_object.get("tools_enabled").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 12), root_object.get("tools_enabled").?.array.items.len);
 }
 
 test "jobs tool can create and list jobs" {
@@ -989,6 +1092,85 @@ test "filesystem list rejects traversal outside workspace root" {
             &policy,
             "filesystem_list",
             "{\"path\":\"../\"}",
+        ),
+    );
+}
+
+test "filesystem grep returns recursive matches" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("logs/nested");
+    {
+        const top_file = try tmp.dir.createFile("logs/top.txt", .{});
+        defer top_file.close();
+        try top_file.writeAll("needle top\n");
+    }
+    {
+        const nested_file = try tmp.dir.createFile("logs/nested/deep.txt", .{});
+        defer nested_file.close();
+        try nested_file.writeAll("needle deep\n");
+    }
+    {
+        const unrelated = try tmp.dir.createFile("logs/nested/skip.txt", .{});
+        defer unrelated.close();
+        try unrelated.writeAll("unrelated\n");
+    }
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+
+    const grep_result = try executeToolCall(
+        std.testing.allocator,
+        &policy,
+        "filesystem_grep",
+        "{\"path\":\"logs\",\"pattern\":\"needle\",\"recursive\":true}",
+    );
+    defer std.testing.allocator.free(grep_result);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, grep_result, .{});
+    defer parsed.deinit();
+
+    const root_object = parsed.value.object;
+    try std.testing.expect(root_object.get("ok").?.bool);
+    try std.testing.expectEqualStrings("filesystem_grep", root_object.get("tool").?.string);
+    try std.testing.expect(root_object.get("recursive").?.bool);
+    try std.testing.expectEqual(@as(i64, 3), root_object.get("files_scanned").?.integer);
+    try std.testing.expect(!root_object.get("truncated").?.bool);
+
+    const matches = root_object.get("matches").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), matches.len);
+    try std.testing.expectEqual(@as(i64, 1), matches[0].object.get("line").?.integer);
+    try std.testing.expectEqualStrings("needle deep", matches[0].object.get("text").?.string);
+    try std.testing.expectEqualStrings("needle top", matches[1].object.get("text").?.string);
+}
+
+test "filesystem grep rejects traversal outside workspace root" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("workspace");
+
+    const outside_file = try tmp.dir.createFile("outside.txt", .{});
+    defer outside_file.close();
+    try outside_file.writeAll("needle");
+
+    const workspace_path = try tmp.dir.realpathAlloc(std.testing.allocator, "workspace");
+    defer std.testing.allocator.free(workspace_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, workspace_path);
+    defer policy.deinit(std.testing.allocator);
+
+    try std.testing.expectError(
+        error.PathNotAllowed,
+        executeToolCall(
+            std.testing.allocator,
+            &policy,
+            "filesystem_grep",
+            "{\"path\":\"../\",\"pattern\":\"needle\"}",
         ),
     );
 }

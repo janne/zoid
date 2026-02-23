@@ -9,7 +9,7 @@ The project provides:
 - Lua script execution via `zoid execute <file.lua>` in `src/lua_runner.zig`.
 - JSON config key/value storage via `zoid config set|get|unset|list` in `src/config_store.zig`.
 - Service mode via `zoid serve` in `src/telegram_bot.zig` (currently Telegram long-polling), maintaining conversation context per Telegram `chat_id`, persisting it under the app-data directory, forwarding messages to OpenAI, replying with `sendMessage`, and running scheduled jobs from app-data scheduler storage (workspace-scoped namespace).
-- OpenAI chat + one-shot run flows in `src/openai_client.zig` and `src/chat_session.zig`, including local tools (`filesystem_read`, `filesystem_list`, `filesystem_write`, `filesystem_delete`, `lua_execute`, `config`, `jobs`, `http_get`, `http_post`, `http_put`, `http_delete`) with workspace-root policy handling via `src/tool_runtime.zig`.
+- OpenAI chat + one-shot run flows in `src/openai_client.zig` and `src/chat_session.zig`, including local tools (`filesystem_read`, `filesystem_list`, `filesystem_grep`, `filesystem_write`, `filesystem_delete`, `lua_execute`, `config`, `jobs`, `http_get`, `http_post`, `http_put`, `http_delete`) with workspace-root policy handling via `src/tool_runtime.zig`.
 - Shared scheduler persistence/runtime in `src/scheduler_store.zig` + `src/scheduler_runtime.zig` with cron helper logic in `src/cron_adapter.zig`.
 - Shared OpenAI model policy in `src/model_catalog.zig` (default model, picker fallback models, and chat-model ID filtering rules).
 - Build + test pipeline in `build.zig`, including embedded Lua (static library from dependency `lua` in `build.zig.zon`).
@@ -84,7 +84,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - Keep model catalog invariants covered by tests (`default_model` included in `fallback_models`, fallback IDs unique, fallback IDs chat-capable).
 
 ### Tool runtime changes:
-  - `src/tool_runtime.zig` enforces `workspace-write` policy rooted at current working directory and exposes `filesystem_read`, `filesystem_list`, `filesystem_write`, `filesystem_delete`, `lua_execute`, `config`, `jobs`, `http_get`, `http_post`, `http_put`, and `http_delete`.
+  - `src/tool_runtime.zig` enforces `workspace-write` policy rooted at current working directory and exposes `filesystem_read`, `filesystem_list`, `filesystem_grep`, `filesystem_write`, `filesystem_delete`, `lua_execute`, `config`, `jobs`, `http_get`, `http_post`, `http_put`, and `http_delete`.
   - Shared filesystem sandbox/path enforcement and metadata/listing logic lives in `src/workspace_fs.zig`; both `lua_execute` (`zoid.file(...)` / `zoid.dir(...)`) and direct filesystem tools must use this module.
   - Shared outbound HTTP request behavior lives in `src/http_client.zig`; both `lua_execute` (`zoid.uri(...)`) and direct HTTP tools must use this module to avoid divergence.
   - Shared config mutation/read behavior lives in `src/config_runtime.zig`; both `lua_execute` (`zoid.config():list/get/set/unset`) and direct `config` tool calls must use this module to avoid divergence.
@@ -94,9 +94,11 @@ If you change command behavior, error handling, config format, or Lua execution 
   - `lua_execute` enforces runtime timeout (default 10s) and accepts optional `timeout` override in seconds (`1..600`).
   - `lua_execute` must intercept Lua script output so it is never written to process stdout/stderr in TUI mode; instead surface captured streams in tool JSON (`stdout` and `stderr`, with truncation flags) so the agent can read outputs safely.
   - `http_get`/`http_post`/`http_put`/`http_delete` are direct HTTP(S) tools (no Lua script required); accepted input is a `uri` string plus optional `body` for `post`/`put`, and responses include `status` + `body` with `ok` reflecting 2xx status.
-  - In `lua_execute` tool-mode, remove `os`/`package`/`debug`/`require`/`dofile`/`loadfile`; expose `zoid.file(path)` metadata handles with `:read([max_bytes])/:write(content)/:delete()`, `zoid.dir(path)` metadata handles with `:list()/:create()/:remove()`, `zoid.uri(uri):get/post/put/delete`, `zoid.config():list/get/set/unset`, `zoid.json.decode`, and `zoid.exit([code])`.
+  - In `lua_execute` tool-mode, remove `os`/`package`/`debug`/`require`/`dofile`/`loadfile`; expose `zoid.file(path)` metadata handles with `:read([max_bytes])/:write(content)/:delete()`, `zoid.dir(path)` metadata handles with `:list()/:create()/:remove()/:grep(pattern, [options])`, `zoid.uri(uri):get/post/put/delete`, `zoid.config():list/get/set/unset`, `zoid.json.decode`, and `zoid.exit([code])`.
   - `zoid.exit([code])` must stop only the current Lua script execution and never terminate the hosting `zoid` process; tool JSON should surface `exit_code` and report non-zero exits as `LuaExit`.
   - `zoid.dir(path):create()` must fail when the target directory already exists, and `zoid.dir(path):remove()` must fail when the target directory is non-empty.
+  - `filesystem_grep` searches file content under a workspace path with optional recursion and match limits; tool result includes match path/line/column/text, files scanned, and truncation status.
+  - `zoid.dir(path):grep(pattern, [options])` uses the same workspace sandbox/path rules as filesystem tools and supports `options.recursive` (default `true`) and `options.max_matches` (default `200`, max `5000`).
   - `zoid.uri(uri)` allows only HTTP/HTTPS requests and returns a Lua table with `status`, `body`, and `ok`; response body capture is capped by sandbox policy (currently 1 MiB in `lua_execute`).
   - `zoid.uri(...):get/delete/post/put` accept optional request options with `headers` table (string->string); header names/values are validated and dangerous overrides such as `Host`/`Content-Length` are rejected.
   - `zoid.json.decode` maps JSON values to Lua tables/scalars and maps JSON `null` to the sentinel `zoid.json.null`.

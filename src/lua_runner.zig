@@ -581,6 +581,121 @@ fn luaZoidDirRemove(lua_state: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
+fn luaZoidDirGrep(lua_state: ?*c.lua_State) callconv(.c) c_int {
+    const state = lua_state orelse return 0;
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+    const nargs = c.lua_gettop(state);
+
+    if (c.lua_type(state, 1) != c.LUA_TTABLE) {
+        return pushLuaErrorMessage(state, "zoid.dir(path):grep requires directory handle", .{});
+    }
+
+    _ = c.lua_getfield(state, 1, "_path");
+    var path_len: usize = 0;
+    const path_ptr = c.lua_tolstring(state, -1, &path_len) orelse return pushLuaErrorMessage(state, "zoid.dir(path):grep requires directory handle", .{});
+    const requested_path = path_ptr[0..path_len];
+    luaPop(state, 1);
+
+    var pattern_len: usize = 0;
+    const pattern_ptr = c.luaL_checklstring(state, 2, &pattern_len) orelse return pushLuaErrorMessage(state, "zoid.dir(path):grep requires pattern", .{});
+    const pattern = pattern_ptr[0..pattern_len];
+
+    var recursive = true;
+    var max_matches = workspace_fs.default_max_grep_matches;
+
+    if (nargs >= 3 and c.lua_type(state, 3) != c.LUA_TNIL) {
+        if (c.lua_type(state, 3) != c.LUA_TTABLE) {
+            return pushLuaErrorMessage(state, "zoid.dir(path):grep options must be a table", .{});
+        }
+
+        const options_table = c.lua_absindex(state, 3);
+        c.lua_pushnil(state);
+        while (c.lua_next(state, options_table) != 0) {
+            if (c.lua_type(state, -2) != c.LUA_TSTRING) {
+                c.lua_settop(state, options_table);
+                return pushLuaErrorMessage(state, "zoid.dir(path):grep option keys must be strings", .{});
+            }
+
+            var option_key_len: usize = 0;
+            const option_key_ptr = c.lua_tolstring(state, -2, &option_key_len) orelse {
+                c.lua_settop(state, options_table);
+                return pushLuaErrorMessage(state, "zoid.dir(path):grep option keys must be strings", .{});
+            };
+            const option_key = option_key_ptr[0..option_key_len];
+
+            if (std.mem.eql(u8, option_key, "recursive")) {
+                if (c.lua_type(state, -1) != c.LUA_TBOOLEAN) {
+                    c.lua_settop(state, options_table);
+                    return pushLuaErrorMessage(state, "zoid.dir(path):grep option recursive must be boolean", .{});
+                }
+                recursive = c.lua_toboolean(state, -1) != 0;
+                luaPop(state, 1);
+                continue;
+            }
+
+            if (std.mem.eql(u8, option_key, "max_matches")) {
+                var isnum: c_int = 0;
+                const value = c.lua_tointegerx(state, -1, &isnum);
+                if (isnum == 0 or value <= 0) {
+                    c.lua_settop(state, options_table);
+                    return pushLuaErrorMessage(state, "zoid.dir(path):grep option max_matches must be a positive integer", .{});
+                }
+                max_matches = std.math.cast(usize, value) orelse {
+                    c.lua_settop(state, options_table);
+                    return pushLuaErrorMessage(state, "zoid.dir(path):grep option max_matches is too large", .{});
+                };
+                if (max_matches > workspace_fs.max_allowed_grep_matches) {
+                    c.lua_settop(state, options_table);
+                    return pushLuaErrorMessage(
+                        state,
+                        "zoid.dir(path):grep option max_matches exceeds sandbox limit ({d})",
+                        .{workspace_fs.max_allowed_grep_matches},
+                    );
+                }
+                luaPop(state, 1);
+                continue;
+            }
+
+            c.lua_settop(state, options_table);
+            return pushLuaErrorMessage(state, "zoid.dir(path):grep unsupported option '{s}'", .{option_key});
+        }
+    }
+
+    var grep_result = workspace_fs.grep(
+        env.allocator,
+        env.workspace_root,
+        requested_path,
+        pattern,
+        recursive,
+        max_matches,
+    ) catch |err| {
+        return pushLuaErrorMessage(state, "zoid.dir(path):grep failed: {s}", .{@errorName(err)});
+    };
+    defer grep_result.deinit(env.allocator);
+
+    c.lua_newtable(state);
+    for (grep_result.matches, 0..) |match, index| {
+        c.lua_pushinteger(state, @intCast(index + 1));
+        c.lua_newtable(state);
+
+        _ = c.lua_pushlstring(state, match.path.ptr, match.path.len);
+        c.lua_setfield(state, -2, "path");
+
+        c.lua_pushinteger(state, @intCast(match.line));
+        c.lua_setfield(state, -2, "line");
+
+        c.lua_pushinteger(state, @intCast(match.column));
+        c.lua_setfield(state, -2, "column");
+
+        _ = c.lua_pushlstring(state, match.text.ptr, match.text.len);
+        c.lua_setfield(state, -2, "text");
+
+        c.lua_settable(state, -3);
+    }
+
+    return 1;
+}
+
 fn luaZoidDir(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
     const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
@@ -614,6 +729,8 @@ fn luaZoidDir(lua_state: ?*c.lua_State) callconv(.c) c_int {
     c.lua_setfield(state, -2, "create");
     c.lua_pushcclosure(state, luaZoidDirRemove, 0);
     c.lua_setfield(state, -2, "remove");
+    c.lua_pushcclosure(state, luaZoidDirGrep, 0);
+    c.lua_setfield(state, -2, "grep");
     return 1;
 }
 
@@ -1880,6 +1997,56 @@ test "executeLuaFileCaptureOutputTool supports zoid dir create/remove" {
     const removed_dir_path = try std.fs.path.join(std.testing.allocator, &.{ workspace_root, "memory" });
     defer std.testing.allocator.free(removed_dir_path);
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(removed_dir_path, .{}));
+}
+
+test "executeLuaFileCaptureOutputTool supports zoid dir grep" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("logs/nested");
+    {
+        const top_file = try tmp.dir.createFile("logs/top.txt", .{});
+        defer top_file.close();
+        try top_file.writeAll("needle-top\n");
+    }
+    {
+        const nested_file = try tmp.dir.createFile("logs/nested/deep.txt", .{});
+        defer nested_file.close();
+        try nested_file.writeAll("needle-deep\n");
+    }
+
+    const file_path = "dir_grep.lua";
+    const script = try tmp.dir.createFile(file_path, .{});
+    defer script.close();
+    try script.writeAll(
+        \\local dir = zoid.dir("logs")
+        \\local recursive = dir:grep("needle")
+        \\print("recursive", #recursive, recursive[1].text, recursive[2].text)
+        \\local top_only = dir:grep("needle", { recursive = false })
+        \\print("top_only", #top_only, top_only[1].text)
+        \\local limited = dir:grep("needle", { max_matches = 1 })
+        \\print("limited", #limited, limited[1].text)
+        \\
+    );
+
+    const abs_path = try tmp.dir.realpathAlloc(std.testing.allocator, file_path);
+    defer std.testing.allocator.free(abs_path);
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    var output = try executeLuaFileCaptureOutputTool(std.testing.allocator, abs_path, .{
+        .workspace_root = workspace_root,
+    });
+    defer output.deinit(std.testing.allocator);
+
+    try std.testing.expect(output.status == .ok);
+    try std.testing.expectEqualStrings(
+        "recursive\t2\tneedle-deep\tneedle-top\n" ++
+            "top_only\t1\tneedle-top\n" ++
+            "limited\t1\tneedle-deep\n",
+        output.stdout,
+    );
+    try std.testing.expectEqualStrings("", output.stderr);
 }
 
 test "executeLuaFileCaptureOutputTool supports zoid config list/get/set/unset" {

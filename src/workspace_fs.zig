@@ -83,7 +83,35 @@ pub const ListDirectoryResult = struct {
     }
 };
 
+pub const GrepMatch = struct {
+    path: []u8,
+    line: usize,
+    column: usize,
+    text: []u8,
+
+    pub fn deinit(self: GrepMatch, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        allocator.free(self.text);
+    }
+};
+
+pub const GrepResult = struct {
+    path: []u8,
+    matches: []GrepMatch,
+    files_scanned: usize,
+    truncated: bool,
+
+    pub fn deinit(self: GrepResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        for (self.matches) |match| match.deinit(allocator);
+        allocator.free(self.matches);
+    }
+};
+
 const default_missing_modified_at = "1970-01-01T00:00:00Z";
+pub const default_max_grep_matches: usize = 200;
+pub const max_allowed_grep_matches: usize = 5_000;
+const max_grep_line_bytes: usize = 256 * 1024;
 
 const NativeStat = struct {
     size: u64,
@@ -245,6 +273,157 @@ pub fn listDirectory(
         .path = resolved_path,
         .entries = try entries.toOwnedSlice(allocator),
     };
+}
+
+pub fn grep(
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    requested_path: []const u8,
+    needle: []const u8,
+    recursive: bool,
+    max_matches: usize,
+) !GrepResult {
+    if (needle.len == 0 or max_matches == 0) return error.InvalidToolArguments;
+
+    const resolved_path = try resolveAllowedReadPath(allocator, workspace_root, requested_path);
+    errdefer allocator.free(resolved_path);
+
+    const stat_data = try statPath(resolved_path);
+
+    var matches = std.ArrayList(GrepMatch).empty;
+    errdefer {
+        for (matches.items) |match| match.deinit(allocator);
+        matches.deinit(allocator);
+    }
+
+    var files_scanned: usize = 0;
+    var truncated = false;
+
+    switch (stat_data.kind) {
+        .file => try grepFileResolvedPath(
+            allocator,
+            resolved_path,
+            needle,
+            max_matches,
+            &matches,
+            &files_scanned,
+            &truncated,
+        ),
+        .directory => try grepDirectoryResolvedPath(
+            allocator,
+            workspace_root,
+            resolved_path,
+            needle,
+            recursive,
+            max_matches,
+            &matches,
+            &files_scanned,
+            &truncated,
+        ),
+        else => return error.InvalidToolArguments,
+    }
+
+    return .{
+        .path = resolved_path,
+        .matches = try matches.toOwnedSlice(allocator),
+        .files_scanned = files_scanned,
+        .truncated = truncated,
+    };
+}
+
+fn grepDirectoryResolvedPath(
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    directory_path: []const u8,
+    needle: []const u8,
+    recursive: bool,
+    max_matches: usize,
+    matches: *std.ArrayList(GrepMatch),
+    files_scanned: *usize,
+    truncated: *bool,
+) !void {
+    if (truncated.*) return;
+
+    var list_result = try listDirectory(allocator, workspace_root, directory_path);
+    defer list_result.deinit(allocator);
+
+    for (list_result.entries) |entry| {
+        if (truncated.*) return;
+
+        switch (entry.entry_type) {
+            .file => try grepFileResolvedPath(
+                allocator,
+                entry.path,
+                needle,
+                max_matches,
+                matches,
+                files_scanned,
+                truncated,
+            ),
+            .directory => if (recursive) {
+                try grepDirectoryResolvedPath(
+                    allocator,
+                    workspace_root,
+                    entry.path,
+                    needle,
+                    recursive,
+                    max_matches,
+                    matches,
+                    files_scanned,
+                    truncated,
+                );
+            },
+            else => {},
+        }
+    }
+}
+
+fn grepFileResolvedPath(
+    allocator: std.mem.Allocator,
+    file_path: []const u8,
+    needle: []const u8,
+    max_matches: usize,
+    matches: *std.ArrayList(GrepMatch),
+    files_scanned: *usize,
+    truncated: *bool,
+) !void {
+    if (truncated.*) return;
+
+    const file = try std.fs.cwd().openFile(file_path, .{});
+    defer file.close();
+    files_scanned.* += 1;
+
+    var reader = file.deprecatedReader();
+
+    var line_number: usize = 0;
+    while (try reader.readUntilDelimiterOrEofAlloc(allocator, '\n', max_grep_line_bytes)) |line| {
+        defer allocator.free(line);
+        line_number += 1;
+
+        const line_without_cr = std.mem.trimRight(u8, line, "\r");
+        var search_index: usize = 0;
+        while (std.mem.indexOfPos(u8, line_without_cr, search_index, needle)) |match_index| {
+            if (matches.items.len >= max_matches) {
+                truncated.* = true;
+                return;
+            }
+
+            const owned_path = try allocator.dupe(u8, file_path);
+            errdefer allocator.free(owned_path);
+
+            const owned_text = try allocator.dupe(u8, line_without_cr);
+            errdefer allocator.free(owned_text);
+
+            try matches.append(allocator, .{
+                .path = owned_path,
+                .line = line_number,
+                .column = match_index + 1,
+                .text = owned_text,
+            });
+
+            search_index = match_index + needle.len;
+        }
+    }
 }
 
 pub fn resolveAllowedReadPath(
@@ -592,4 +771,62 @@ test "createDirectory and removeDirectory enforce existence and emptiness rules"
         return;
     };
     return error.TestExpectedError;
+}
+
+test "grep supports recursive and non-recursive search" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    try tmp.dir.makePath("logs/nested");
+    {
+        const top_file = try tmp.dir.createFile("logs/top.txt", .{});
+        defer top_file.close();
+        try top_file.writeAll("hello needle\nskip\n");
+    }
+    {
+        const nested_file = try tmp.dir.createFile("logs/nested/deep.txt", .{});
+        defer nested_file.close();
+        try nested_file.writeAll("needle here too\n");
+    }
+    {
+        const unrelated = try tmp.dir.createFile("logs/nested/other.txt", .{});
+        defer unrelated.close();
+        try unrelated.writeAll("no match\n");
+    }
+
+    var non_recursive = try grep(
+        std.testing.allocator,
+        workspace_root,
+        "logs",
+        "needle",
+        false,
+        100,
+    );
+    defer non_recursive.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), non_recursive.matches.len);
+    try std.testing.expectEqual(@as(usize, 1), non_recursive.files_scanned);
+    try std.testing.expect(!non_recursive.truncated);
+    try std.testing.expectEqualStrings("top.txt", std.fs.path.basename(non_recursive.matches[0].path));
+    try std.testing.expectEqual(@as(usize, 1), non_recursive.matches[0].line);
+    try std.testing.expectEqual(@as(usize, 7), non_recursive.matches[0].column);
+
+    var recursive = try grep(
+        std.testing.allocator,
+        workspace_root,
+        "logs",
+        "needle",
+        true,
+        100,
+    );
+    defer recursive.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), recursive.matches.len);
+    try std.testing.expectEqual(@as(usize, 3), recursive.files_scanned);
+    try std.testing.expect(!recursive.truncated);
+    try std.testing.expectEqualStrings("deep.txt", std.fs.path.basename(recursive.matches[0].path));
+    try std.testing.expectEqualStrings("top.txt", std.fs.path.basename(recursive.matches[1].path));
 }
