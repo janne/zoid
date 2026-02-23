@@ -584,11 +584,18 @@ fn requestWorkerMain(args: *RequestWorkerArgs) void {
         args.messages,
         .{ .workspace_instruction = args.workspace_instruction },
     ) catch |err| {
-        const err_text = std.fmt.allocPrint(
-            std.heap.c_allocator,
-            "OpenAI error: {s}",
-            .{@errorName(err)},
-        ) catch null;
+        const err_text = switch (err) {
+            error.ToolCallLimitExceeded => std.fmt.allocPrint(
+                std.heap.c_allocator,
+                "OpenAI error: ToolCallLimitExceeded (agent used too many tool steps; try a narrower request or split it into smaller steps).",
+                .{},
+            ) catch null,
+            else => std.fmt.allocPrint(
+                std.heap.c_allocator,
+                "OpenAI error: {s}",
+                .{@errorName(err)},
+            ) catch null,
+        };
 
         args.state.mutex.lock();
         args.state.reply = null;

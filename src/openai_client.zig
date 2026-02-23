@@ -38,7 +38,7 @@ const ParsedAssistantTurn = struct {
     }
 };
 
-const max_tool_rounds: usize = 8;
+const max_tool_rounds: usize = 16;
 
 pub fn fetchAvailableModels(allocator: std.mem.Allocator, api_key: []const u8) ![][]u8 {
     if (api_key.len == 0) return error.EmptyApiKey;
@@ -142,40 +142,11 @@ pub fn fetchAssistantReplyWithContext(
             model,
             wire_messages.items,
             &policy,
+            "auto",
         );
         defer allocator.free(payload);
-
-        const auth_header = try std.mem.concat(allocator, u8, &.{ "Bearer ", api_key });
-        defer allocator.free(auth_header);
-
-        var response_buffer = std.Io.Writer.Allocating.init(allocator);
-        defer response_buffer.deinit();
-
-        var client: std.http.Client = .{ .allocator = allocator };
-        defer client.deinit();
-
-        const response = try client.fetch(.{
-            .location = .{ .url = "https://api.openai.com/v1/chat/completions" },
-            .method = .POST,
-            .payload = payload,
-            .extra_headers = &.{
-                .{ .name = "Authorization", .value = auth_header },
-                .{ .name = "Content-Type", .value = "application/json" },
-            },
-            .response_writer = &response_buffer.writer,
-        });
-
-        const status_code = @intFromEnum(response.status);
-        const response_body = response_buffer.written();
-        if (status_code != 200) {
-            if (try parseApiErrorMessage(allocator, response_body)) |message| {
-                defer allocator.free(message);
-                std.debug.print("OpenAI API request failed ({d}): {s}\n", .{ status_code, message });
-            } else {
-                std.debug.print("OpenAI API request failed with status {d}.\n", .{status_code});
-            }
-            return error.ApiRequestFailed;
-        }
+        const response_body = try sendChatCompletionsRequest(allocator, api_key, payload);
+        defer allocator.free(response_body);
 
         var turn = try parseAssistantTurn(allocator, response_body);
         defer turn.deinit(allocator);
@@ -212,7 +183,64 @@ pub fn fetchAssistantReplyWithContext(
         }
     }
 
-    return error.ToolCallLimitExceeded;
+    const final_payload = try buildChatCompletionsPayloadWithTools(
+        allocator,
+        model,
+        wire_messages.items,
+        &policy,
+        "none",
+    );
+    defer allocator.free(final_payload);
+
+    const final_response_body = try sendChatCompletionsRequest(allocator, api_key, final_payload);
+    defer allocator.free(final_response_body);
+
+    var final_turn = try parseAssistantTurn(allocator, final_response_body);
+    defer final_turn.deinit(allocator);
+    if (final_turn.tool_calls.len != 0) return error.ToolCallLimitExceeded;
+    const final_content = final_turn.content orelse return error.ToolCallLimitExceeded;
+    final_turn.content = null;
+    return final_content;
+}
+
+fn sendChatCompletionsRequest(
+    allocator: std.mem.Allocator,
+    api_key: []const u8,
+    payload: []const u8,
+) ![]u8 {
+    const auth_header = try std.mem.concat(allocator, u8, &.{ "Bearer ", api_key });
+    defer allocator.free(auth_header);
+
+    var response_buffer = std.Io.Writer.Allocating.init(allocator);
+    defer response_buffer.deinit();
+
+    var client: std.http.Client = .{ .allocator = allocator };
+    defer client.deinit();
+
+    const response = try client.fetch(.{
+        .location = .{ .url = "https://api.openai.com/v1/chat/completions" },
+        .method = .POST,
+        .payload = payload,
+        .extra_headers = &.{
+            .{ .name = "Authorization", .value = auth_header },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .response_writer = &response_buffer.writer,
+    });
+
+    const status_code = @intFromEnum(response.status);
+    const response_body = response_buffer.written();
+    if (status_code != 200) {
+        if (try parseApiErrorMessage(allocator, response_body)) |message| {
+            defer allocator.free(message);
+            std.debug.print("OpenAI API request failed ({d}): {s}\n", .{ status_code, message });
+        } else {
+            std.debug.print("OpenAI API request failed with status {d}.\n", .{status_code});
+        }
+        return error.ApiRequestFailed;
+    }
+
+    return try allocator.dupe(u8, response_body);
 }
 
 fn parseAvailableModels(allocator: std.mem.Allocator, response_body: []const u8) ![][]u8 {
@@ -271,7 +299,7 @@ fn buildChatCompletionsPayload(
     }
 
     const no_tools_policy = tool_runtime.Policy{ .workspace_root = "" };
-    return buildChatCompletionsPayloadWithTools(allocator, model, message_json.items, &no_tools_policy);
+    return buildChatCompletionsPayloadWithTools(allocator, model, message_json.items, &no_tools_policy, "auto");
 }
 
 fn buildSystemInstruction(
@@ -302,6 +330,7 @@ fn buildChatCompletionsPayloadWithTools(
     model: []const u8,
     wire_messages: []const []const u8,
     policy: *const tool_runtime.Policy,
+    tool_choice: []const u8,
 ) ![]u8 {
     var payload_buffer = std.Io.Writer.Allocating.init(allocator);
     errdefer payload_buffer.deinit();
@@ -340,7 +369,9 @@ fn buildChatCompletionsPayloadWithTools(
     try writeHttpPutToolDefinition(allocator, writer);
     try writer.writeAll(",");
     try writeHttpDeleteToolDefinition(allocator, writer);
-    try writer.writeAll("],\"tool_choice\":\"auto\"}");
+    try writer.writeAll("],\"tool_choice\":");
+    try writeJsonString(allocator, writer, tool_choice);
+    try writer.writeAll("}");
 
     return payload_buffer.toOwnedSlice();
 }
