@@ -33,8 +33,8 @@ Zoid includes a shared scheduler backend that can be used from:
 Examples:
 
 ```sh
-zoid jobs create --lua scripts/clean_up_docs.lua --cron "0 21 * * *"
-zoid jobs create --md reminders/pasta.md --run-at "2026-02-22T19:40:00Z"
+zoid jobs create scripts/clean_up_docs.lua --cron "0 21 * * *"
+zoid jobs create reminders/pasta.md --run-at "2026-02-22T19:40:00Z"
 zoid jobs list
 zoid jobs pause <job_id>
 zoid jobs resume <job_id>

@@ -45,6 +45,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - Update parsing + help text in `src/cli.zig`.
   - Update execution flow and user-visible errors in `src/main.zig`.
   - Jobs CLI commands live under `zoid jobs ...` with create/list/delete/pause/resume.
+  - `zoid jobs create` takes a single path argument and infers job type from extension: `.lua` or `.md`.
   - `zoid execute <file.lua> [args...]` must forward extra positional args to Lua global `arg` (`arg[0]` script path, `arg[1..]` forwarded args).
   - `zoid execute <file.lua>` must use the same sandbox restrictions and `.lua` path policy as `lua_execute` so local script runs match tool-mode behavior.
   - Default command is `chat` when running `zoid` with no arguments.
