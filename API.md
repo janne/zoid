@@ -6,15 +6,10 @@ This document describes how Lua behavior in Zoid differs from stock Lua.
 
 Zoid runs Lua in two ways:
 
-1. `zoid execute <file.lua>` (CLI script mode)
+1. `zoid execute [--timeout <seconds>] <file.lua> [args...]` (CLI script mode)
 2. `lua_execute` (agent tool mode used through tool calls)
 
 Both modes use sandbox restrictions and Lua API surface.
-
-When invoking `zoid execute`, extra positional arguments are forwarded to Lua global `arg`:
-
-- `arg[0]` = script path
-- `arg[1..n]` = arguments after `<file.lua>`
 
 ### Extra API Added by Zoid
 
@@ -149,6 +144,17 @@ The output APIs are replaced to capture script output safely:
 
 Captured streams are returned in tool JSON fields (`stdout`, `stderr`) instead of writing directly to terminal stdout/stderr. Tool-mode results also include `exit_code` (`null` unless the script called `zoid.exit`).
 
+### Execution Timeout
+
+Sandboxed Lua execution has a runtime timeout:
+
+- Default timeout: 10 seconds
+- Tool override: optional `timeout` in `lua_execute` input (seconds)
+- CLI override: `zoid execute --timeout <seconds> ...`
+- Accepted range for overrides: `1..600` seconds
+
+Tool-mode results include `timeout` (seconds) and, when timeout is reached, report `error: "LuaTimeout"` with timeout details in `stderr`.
+
 ### `arg` Global
 
 Lua scripts receive an `arg` table:
@@ -161,9 +167,12 @@ For tool-mode `lua_execute`, positional arguments can be supplied with optional 
 ```json
 {
   "path": "scripts/example.lua",
-  "args": ["one", "two"]
+  "args": ["one", "two"],
+  "timeout": 30
 }
 ```
+
+`timeout` is optional in tool mode and interpreted as seconds.
 
 ### Filesystem Sandbox Rules
 

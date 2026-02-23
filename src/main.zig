@@ -16,6 +16,11 @@ pub fn main() !void {
                 zoid.cli.printHelp();
                 return;
             },
+            error.InvalidExecuteArguments => {
+                std.debug.print("Invalid arguments for 'execute'.\n\n", .{});
+                zoid.cli.printHelp();
+                return;
+            },
             error.MissingRunArgument => {
                 std.debug.print("Missing argument for 'run'.\n\n", .{});
                 zoid.cli.printHelp();
@@ -77,6 +82,7 @@ pub fn main() !void {
                 allocator,
                 execute_cmd.file_path,
                 execute_cmd.script_args,
+                execute_cmd.timeout,
                 null,
             ) catch |err| {
                 switch (err) {
@@ -359,6 +365,7 @@ fn executeLuaAsTool(
     allocator: std.mem.Allocator,
     file_path: []const u8,
     script_args: []const []const u8,
+    timeout: ?u32,
     workspace_root_override: ?[]const u8,
 ) !LuaExecuteOutcome {
     var policy = if (workspace_root_override) |workspace_root|
@@ -383,6 +390,9 @@ fn executeLuaAsTool(
             try arguments_json.appendSlice(allocator, escaped_arg);
         }
         try arguments_json.append(allocator, ']');
+    }
+    if (timeout) |value| {
+        try arguments_json.writer(allocator).print(",\"timeout\":{d}", .{value});
     }
     try arguments_json.append(allocator, '}');
 
@@ -599,7 +609,7 @@ test "executeLuaAsTool runs script with lua_execute sandbox policy" {
     const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace_root);
 
-    var outcome = try executeLuaAsTool(std.testing.allocator, "ok.lua", &.{}, workspace_root);
+    var outcome = try executeLuaAsTool(std.testing.allocator, "ok.lua", &.{}, null, workspace_root);
     defer outcome.deinit(std.testing.allocator);
 
     try std.testing.expect(outcome.ok);
@@ -626,7 +636,7 @@ test "executeLuaAsTool rejects traversal outside workspace root" {
 
     try std.testing.expectError(
         error.PathNotAllowed,
-        executeLuaAsTool(std.testing.allocator, "../outside.lua", &.{}, workspace_root),
+        executeLuaAsTool(std.testing.allocator, "../outside.lua", &.{}, null, workspace_root),
     );
 }
 
@@ -643,7 +653,7 @@ test "executeLuaAsTool requires lua extension" {
 
     try std.testing.expectError(
         error.InvalidToolArguments,
-        executeLuaAsTool(std.testing.allocator, "not_lua.txt", &.{}, workspace_root),
+        executeLuaAsTool(std.testing.allocator, "not_lua.txt", &.{}, null, workspace_root),
     );
 }
 
@@ -663,7 +673,7 @@ test "executeLuaAsTool forwards script args to Lua arg table" {
     defer std.testing.allocator.free(workspace_root);
 
     const script_args = [_][]const u8{ "alpha", "beta" };
-    var outcome = try executeLuaAsTool(std.testing.allocator, "argv.lua", &script_args, workspace_root);
+    var outcome = try executeLuaAsTool(std.testing.allocator, "argv.lua", &script_args, null, workspace_root);
     defer outcome.deinit(std.testing.allocator);
 
     try std.testing.expect(outcome.ok);
@@ -689,7 +699,7 @@ test "executeLuaAsTool surfaces zoid exit code" {
     const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace_root);
 
-    var outcome = try executeLuaAsTool(std.testing.allocator, "exit.lua", &.{}, workspace_root);
+    var outcome = try executeLuaAsTool(std.testing.allocator, "exit.lua", &.{}, null, workspace_root);
     defer outcome.deinit(std.testing.allocator);
 
     try std.testing.expect(!outcome.ok);
@@ -697,6 +707,31 @@ test "executeLuaAsTool surfaces zoid exit code" {
     try std.testing.expectEqualStrings("before\n", outcome.stdout);
     try std.testing.expectEqualStrings("", outcome.stderr);
     try std.testing.expectEqualStrings("LuaExit", outcome.error_name.?);
+}
+
+test "executeLuaAsTool supports timeout override" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script = try tmp.dir.createFile("loop.lua", .{});
+    defer script.close();
+    try script.writeAll(
+        \\while true do
+        \\end
+        \\
+    );
+
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    var outcome = try executeLuaAsTool(std.testing.allocator, "loop.lua", &.{}, 1, workspace_root);
+    defer outcome.deinit(std.testing.allocator);
+
+    try std.testing.expect(!outcome.ok);
+    try std.testing.expect(outcome.exit_code == null);
+    try std.testing.expectEqualStrings("", outcome.stdout);
+    try std.testing.expectEqualStrings("LuaTimeout", outcome.error_name.?);
+    try std.testing.expect(std.mem.indexOf(u8, outcome.stderr, "timed out") != null);
 }
 
 test "loadWorkspaceAgentInstructionAtPath reads trimmed ZOID.md content" {

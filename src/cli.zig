@@ -30,6 +30,7 @@ pub const Command = union(enum) {
     help,
     execute: struct {
         file_path: []const u8,
+        timeout: ?u32,
         script_args: []const []const u8,
     },
     run: []const []const u8,
@@ -41,6 +42,7 @@ pub const Command = union(enum) {
 
 pub const ParseCommandError = error{
     MissingExecuteArgument,
+    InvalidExecuteArguments,
     MissingRunArgument,
     MissingConfigSubcommand,
     MissingConfigKey,
@@ -64,9 +66,20 @@ pub fn parseCommand(args: []const []const u8) ParseCommandError!Command {
 
     if (std.mem.eql(u8, cmd, "execute")) {
         if (args.len < 3) return error.MissingExecuteArgument;
+        var timeout: ?u32 = null;
+        var file_index: usize = 2;
+
+        if (std.mem.eql(u8, args[2], "--timeout")) {
+            if (args.len < 5) return error.MissingExecuteArgument;
+            timeout = std.fmt.parseInt(u32, args[3], 10) catch return error.InvalidExecuteArguments;
+            if (timeout.? == 0) return error.InvalidExecuteArguments;
+            file_index = 4;
+        }
+
         return .{ .execute = .{
-            .file_path = args[2],
-            .script_args = args[3..],
+            .file_path = args[file_index],
+            .timeout = timeout,
+            .script_args = args[file_index + 1 ..],
         } };
     }
 
@@ -207,8 +220,8 @@ pub fn printHelp() void {
         \\zoid help
         \\  Show this help message.
         \\
-        \\zoid execute <file.lua> [args...]
-        \\  Executes the Lua script at <file.lua> and forwards [args...] to Lua `arg`.
+        \\zoid execute [--timeout <seconds>] <file.lua> [args...]
+        \\  Executes the Lua script at <file.lua>, forwards [args...] to Lua `arg`, and enforces timeout (default 10s) in seconds.
         \\
         \\zoid run <prompt...>
         \\  Sends a single prompt to OpenAI and writes the response to stdout.
@@ -252,6 +265,27 @@ test "default command is chat" {
     const args = [_][]const u8{"zoid"};
     const command = try parseCommand(&args);
     try std.testing.expect(command == .chat);
+}
+
+test "execute parses timeout flag" {
+    const args = [_][]const u8{ "zoid", "execute", "--timeout", "12", "scripts/run.lua", "a", "b" };
+    const command = try parseCommand(&args);
+
+    switch (command) {
+        .execute => |execute_cmd| {
+            try std.testing.expectEqualStrings("scripts/run.lua", execute_cmd.file_path);
+            try std.testing.expectEqual(@as(?u32, 12), execute_cmd.timeout);
+            try std.testing.expectEqual(@as(usize, 2), execute_cmd.script_args.len);
+            try std.testing.expectEqualStrings("a", execute_cmd.script_args[0]);
+            try std.testing.expectEqualStrings("b", execute_cmd.script_args[1]);
+        },
+        else => return error.UnexpectedCommand,
+    }
+}
+
+test "execute rejects invalid timeout flag value" {
+    const args = [_][]const u8{ "zoid", "execute", "--timeout", "nope", "scripts/run.lua" };
+    try std.testing.expectError(error.InvalidExecuteArguments, parseCommand(&args));
 }
 
 test "jobs create lua with run-at parses" {

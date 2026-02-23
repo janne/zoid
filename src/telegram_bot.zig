@@ -820,6 +820,7 @@ fn executionStatusToString(status: lua_runner.CapturedExecutionStatus) []const u
     return switch (status) {
         .ok => "ok",
         .exited => "exited",
+        .timed_out => "timed_out",
         .state_init_failed => "state_init_failed",
         .load_failed => "load_failed",
         .runtime_failed => "runtime_failed",

@@ -47,6 +47,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - Jobs CLI commands live under `zoid jobs ...` with create/list/delete/pause/resume.
   - `zoid jobs create` takes a single path argument and infers job type from extension: `.lua` or `.md`.
   - `zoid execute <file.lua> [args...]` must forward extra positional args to Lua global `arg` (`arg[0]` script path, `arg[1..]` forwarded args).
+  - `zoid execute` supports optional `--timeout <seconds>` before `<file.lua>` to override Lua runtime timeout for that invocation.
   - `zoid execute <file.lua>` must use the same sandbox restrictions and `.lua` path policy as `lua_execute` so local script runs match tool-mode behavior.
   - Default command is `chat` when running `zoid` with no arguments.
   - `zoid serve` is the long-running service entrypoint; currently it requires both `OPENAI_API_KEY` and `TELEGRAM_BOT_TOKEN` in config and runs a Telegram long-polling loop until interrupted.
@@ -90,6 +91,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - `filesystem_delete` only removes files whose canonical path resolves inside workspace root; traversal outside root must return `error.PathNotAllowed`.
   - `lua_execute` runs scripts via the embedded Lua runtime (`src/lua_runner.zig`) in-process, not via shell process execution, and only accepts `.lua` files under workspace root.
   - `lua_execute` accepts optional `args` (array of strings) and forwards them to Lua global `arg[1..]` (with script path in `arg[0]`).
+  - `lua_execute` enforces runtime timeout (default 10s) and accepts optional `timeout` override in seconds (`1..600`).
   - `lua_execute` must intercept Lua script output so it is never written to process stdout/stderr in TUI mode; instead surface captured streams in tool JSON (`stdout` and `stderr`, with truncation flags) so the agent can read outputs safely.
   - `http_get`/`http_post`/`http_put`/`http_delete` are direct HTTP(S) tools (no Lua script required); accepted input is a `uri` string plus optional `body` for `post`/`put`, and responses include `status` + `body` with `ok` reflecting 2xx status.
   - In `lua_execute` tool-mode, remove `os`/`package`/`debug`/`require`/`dofile`/`loadfile`; expose `zoid.file(path)` metadata handles with `:read([max_bytes])/:write(content)/:delete()`, `zoid.dir(path)` metadata handles with `:list()/:create()/:remove()`, `zoid.uri(uri):get/post/put/delete`, `zoid.config():list/get/set/unset`, `zoid.json.decode`, and `zoid.exit([code])`.

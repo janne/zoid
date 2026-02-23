@@ -418,14 +418,17 @@ fn writeLuaExecuteToolDefinition(
 ) !void {
     const description = try std.fmt.allocPrint(
         allocator,
-        "Execute a Lua script file under workspace root {s}. Path must resolve inside this root and target a .lua file.",
+        "Execute a Lua script file under workspace root {s}. Path must resolve inside this root and target a .lua file. Optional timeout controls maximum runtime in seconds.",
         .{workspace_root},
     );
     defer allocator.free(description);
 
     try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"lua_execute\",\"description\":");
     try writeJsonString(allocator, writer, description);
-    try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"args\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"path\"],\"additionalProperties\":false}}}");
+    try writer.print(
+        ",\"parameters\":{{\"type\":\"object\",\"properties\":{{\"path\":{{\"type\":\"string\"}},\"args\":{{\"type\":\"array\",\"items\":{{\"type\":\"string\"}}}},\"timeout\":{{\"type\":\"integer\",\"minimum\":1,\"maximum\":{d}}}}},\"required\":[\"path\"],\"additionalProperties\":false}}}}",
+        .{tool_runtime.max_allowed_lua_timeout_seconds},
+    );
 }
 
 fn writeHttpGetToolDefinition(
@@ -764,6 +767,10 @@ test "buildChatCompletionsPayload creates valid payload" {
     const args_property = lua_properties.get("args").?.object;
     try std.testing.expectEqualStrings("array", args_property.get("type").?.string);
     try std.testing.expectEqualStrings("string", args_property.get("items").?.object.get("type").?.string);
+    const timeout_property = lua_properties.get("timeout").?.object;
+    try std.testing.expectEqualStrings("integer", timeout_property.get("type").?.string);
+    try std.testing.expectEqual(@as(i64, 1), timeout_property.get("minimum").?.integer);
+    try std.testing.expectEqual(@as(i64, tool_runtime.max_allowed_lua_timeout_seconds), timeout_property.get("maximum").?.integer);
     try std.testing.expectEqualStrings("config", tools[5].object.get("function").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("jobs", tools[6].object.get("function").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("http_get", tools[7].object.get("function").?.object.get("name").?.string);

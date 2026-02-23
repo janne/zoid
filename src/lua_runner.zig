@@ -20,10 +20,13 @@ pub const ExecuteLuaError = std.mem.Allocator.Error || error{
 pub const CaptureError = std.mem.Allocator.Error;
 pub const default_tool_max_read_bytes: usize = 128 * 1024;
 pub const default_tool_max_http_response_bytes: usize = 1024 * 1024;
+pub const default_tool_execution_timeout_seconds: u32 = 10;
+pub const max_tool_execution_timeout_seconds: u32 = 600;
 
 pub const CapturedExecutionStatus = enum {
     ok,
     exited,
+    timed_out,
     state_init_failed,
     load_failed,
     runtime_failed,
@@ -50,14 +53,17 @@ fn luaErrorMessage(state: *c.lua_State) []const u8 {
 
 const capture_registry_key = "__zoid_output_capture";
 const tool_sandbox_registry_key = "__zoid_tool_sandbox";
+const timeout_registry_key = "__zoid_execution_timeout";
 const max_captured_stream_bytes: usize = 256 * 1024;
 const max_json_decode_depth: usize = 64;
+const timeout_error_token = "__zoid_timeout_seconds__:";
 var json_null_sentinel: u8 = 0;
 
 pub const ToolSandbox = struct {
     workspace_root: []const u8,
     max_read_bytes: usize = default_tool_max_read_bytes,
     max_http_response_bytes: usize = default_tool_max_http_response_bytes,
+    execution_timeout_ns: ?u64 = timeoutSecondsToNanoseconds(default_tool_execution_timeout_seconds),
     config_path_override: ?[]const u8 = null,
 };
 
@@ -92,6 +98,11 @@ const ToolLuaEnvironment = struct {
     max_read_bytes: usize,
     max_http_response_bytes: usize,
     config_path_override: ?[]const u8,
+};
+
+const LuaExecutionTimeout = struct {
+    deadline_ns: i128,
+    timeout_seconds: u32,
 };
 
 const OwnedRequestHeader = struct {
@@ -213,6 +224,50 @@ fn toolEnvironmentFromLuaState(state: *c.lua_State) ?*ToolLuaEnvironment {
 
     const ptr = c.lua_touserdata(state, -1) orelse return null;
     return @ptrCast(@alignCast(ptr));
+}
+
+pub fn timeoutSecondsToNanoseconds(timeout_seconds: u32) u64 {
+    return @as(u64, timeout_seconds) * std.time.ns_per_s;
+}
+
+fn parseTimeoutToken(message: []const u8) ?u32 {
+    const token_start = std.mem.indexOf(u8, message, timeout_error_token) orelse return null;
+    const numeric_start = token_start + timeout_error_token.len;
+    if (numeric_start >= message.len) return null;
+
+    var end_index = numeric_start;
+    while (end_index < message.len and message[end_index] >= '0' and message[end_index] <= '9') : (end_index += 1) {}
+    if (end_index == numeric_start) return null;
+
+    return std.fmt.parseInt(u32, message[numeric_start..end_index], 10) catch null;
+}
+
+fn formatTimeoutMessage(buffer: []u8, timeout_seconds: u32) []const u8 {
+    return std.fmt.bufPrint(buffer, "Lua execution timed out after {d} second(s).", .{timeout_seconds}) catch "Lua execution timed out.";
+}
+
+fn timeoutFromLuaState(state: *c.lua_State) ?*LuaExecutionTimeout {
+    _ = c.lua_getglobal(state, timeout_registry_key);
+    defer luaPop(state, 1);
+
+    const ptr = c.lua_touserdata(state, -1) orelse return null;
+    return @ptrCast(@alignCast(ptr));
+}
+
+fn luaExecutionTimeoutHook(lua_state: ?*c.lua_State, debug: ?*c.lua_Debug) callconv(.c) void {
+    _ = debug;
+
+    const state = lua_state orelse return;
+    const timeout = timeoutFromLuaState(state) orelse return;
+    if (std.time.nanoTimestamp() < timeout.deadline_ns) return;
+
+    _ = pushLuaErrorMessage(state, "{s}{d}", .{ timeout_error_token, timeout.timeout_seconds });
+}
+
+fn installExecutionTimeout(lua_state: *c.lua_State, timeout: *LuaExecutionTimeout) void {
+    c.lua_pushlightuserdata(lua_state, timeout);
+    _ = c.lua_setglobal(lua_state, timeout_registry_key);
+    _ = c.lua_sethook(lua_state, luaExecutionTimeoutHook, c.LUA_MASKCOUNT, 10_000);
 }
 
 fn pushLuaErrorMessage(state: *c.lua_State, comptime format: []const u8, args: anytype) c_int {
@@ -1368,6 +1423,7 @@ fn executeLuaFileCaptureOutputInternal(
     installScriptArgs(lua_state, file_path, script_args);
 
     var tool_env: ToolLuaEnvironment = undefined;
+    var execution_timeout: ?LuaExecutionTimeout = null;
     if (sandbox) |tool_sandbox| {
         tool_env = .{
             .allocator = allocator,
@@ -1377,6 +1433,16 @@ fn executeLuaFileCaptureOutputInternal(
             .config_path_override = tool_sandbox.config_path_override,
         };
         restrictToolLuaEnvironment(lua_state, &tool_env);
+
+        if (tool_sandbox.execution_timeout_ns) |timeout_ns| {
+            const timeout_seconds_u64 = timeout_ns / std.time.ns_per_s;
+            const timeout_seconds = std.math.cast(u32, timeout_seconds_u64) orelse std.math.maxInt(u32);
+            execution_timeout = .{
+                .deadline_ns = std.time.nanoTimestamp() + @as(i128, @intCast(timeout_ns)),
+                .timeout_seconds = if (timeout_seconds == 0) 1 else timeout_seconds,
+            };
+            installExecutionTimeout(lua_state, &execution_timeout.?);
+        }
     }
 
     if (c.luaL_loadfilex(lua_state, c_file_path.ptr, null) != c.LUA_OK) {
@@ -1388,7 +1454,15 @@ fn executeLuaFileCaptureOutputInternal(
         if (parseLuaExitCode(lua_state)) |exit_code| {
             return finalizeCapture(allocator, &capture, .exited, exit_code);
         }
-        capture.appendStderrSlice(luaErrorMessage(lua_state));
+
+        const lua_error = luaErrorMessage(lua_state);
+        if (parseTimeoutToken(lua_error)) |timeout_seconds| {
+            var timeout_message_buffer: [96]u8 = undefined;
+            capture.appendStderrSlice(formatTimeoutMessage(&timeout_message_buffer, timeout_seconds));
+            return finalizeCapture(allocator, &capture, .timed_out, null);
+        }
+
+        capture.appendStderrSlice(lua_error);
         return finalizeCapture(allocator, &capture, .runtime_failed, null);
     }
 
@@ -1686,6 +1760,36 @@ test "executeLuaFileCaptureOutputTool supports zoid.exit default code zero" {
     try std.testing.expectEqual(@as(?i64, 0), output.exit_code);
     try std.testing.expectEqualStrings("start\n", output.stdout);
     try std.testing.expectEqualStrings("", output.stderr);
+}
+
+test "executeLuaFileCaptureOutputTool enforces execution timeout" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file_path = "timeout.lua";
+    const file = try tmp.dir.createFile(file_path, .{});
+    defer file.close();
+    try file.writeAll(
+        \\while true do
+        \\end
+        \\
+    );
+
+    const abs_path = try tmp.dir.realpathAlloc(std.testing.allocator, file_path);
+    defer std.testing.allocator.free(abs_path);
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    var output = try executeLuaFileCaptureOutputTool(std.testing.allocator, abs_path, .{
+        .workspace_root = workspace_root,
+        .execution_timeout_ns = 1,
+    });
+    defer output.deinit(std.testing.allocator);
+
+    try std.testing.expect(output.status == .timed_out);
+    try std.testing.expectEqual(@as(?i64, null), output.exit_code);
+    try std.testing.expectEqualStrings("", output.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "timed out") != null);
 }
 
 test "executeLuaFileCaptureOutputTool exposes file metadata and dir listing" {

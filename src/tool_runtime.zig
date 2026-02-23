@@ -24,6 +24,8 @@ pub const disabled_tools = [_][]const u8{};
 pub const default_max_read_bytes: usize = 128 * 1024;
 pub const max_allowed_read_bytes: usize = 1024 * 1024;
 pub const max_allowed_http_response_bytes: usize = 1024 * 1024;
+pub const default_lua_timeout_seconds: u32 = lua_runner.default_tool_execution_timeout_seconds;
+pub const max_allowed_lua_timeout_seconds: u32 = lua_runner.max_tool_execution_timeout_seconds;
 
 pub const Policy = struct {
     workspace_root: []u8,
@@ -365,6 +367,19 @@ fn executeLuaExecute(
         else => return error.InvalidToolArguments,
     };
 
+    var timeout: u32 = default_lua_timeout_seconds;
+    if (root_object.get("timeout")) |timeout_value| {
+        timeout = switch (timeout_value) {
+            .integer => |value| blk: {
+                if (value <= 0) return error.InvalidToolArguments;
+                const converted = std.math.cast(u32, value) orelse return error.InvalidToolArguments;
+                break :blk converted;
+            },
+            else => return error.InvalidToolArguments,
+        };
+        if (timeout > max_allowed_lua_timeout_seconds) return error.InvalidToolArguments;
+    }
+
     var script_args = std.ArrayList([]const u8).empty;
     defer script_args.deinit(allocator);
     if (root_object.get("args")) |args_value| {
@@ -400,6 +415,7 @@ fn executeLuaExecute(
             .workspace_root = policy.workspace_root,
             .max_read_bytes = max_allowed_read_bytes,
             .max_http_response_bytes = max_allowed_http_response_bytes,
+            .execution_timeout_ns = lua_runner.timeoutSecondsToNanoseconds(timeout),
             .config_path_override = policy.config_path_override,
         },
         script_args.items,
@@ -413,7 +429,7 @@ fn executeLuaExecute(
     const ok = switch (execution.status) {
         .ok => true,
         .exited => (execution.exit_code orelse 0) == 0,
-        .state_init_failed, .load_failed, .runtime_failed => false,
+        .timed_out, .state_init_failed, .load_failed, .runtime_failed => false,
     };
     try writer.writeAll("{\"ok\":");
     try writer.writeAll(if (ok) "true" else "false");
@@ -433,10 +449,13 @@ fn executeLuaExecute(
     } else {
         try writer.writeAll("null");
     }
+    try writer.writeAll(",\"timeout\":");
+    try writer.print("{d}", .{timeout});
     if (!ok) {
         const error_name = switch (execution.status) {
             .ok => unreachable,
             .exited => "LuaExit",
+            .timed_out => "LuaTimeout",
             .state_init_failed => "LuaStateInitFailed",
             .load_failed => "LuaLoadFailed",
             .runtime_failed => "LuaRuntimeFailed",
@@ -1224,6 +1243,77 @@ test "lua execute rejects invalid args shape" {
             &policy,
             "lua_execute",
             "{\"path\":\"ok.lua\",\"args\":[\"ok\",123]}",
+        ),
+    );
+}
+
+test "lua execute supports timeout override" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("loop.lua", .{});
+    defer file.close();
+    try file.writeAll(
+        \\while true do
+        \\end
+        \\
+    );
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+
+    const result = try executeToolCall(
+        std.testing.allocator,
+        &policy,
+        "lua_execute",
+        "{\"path\":\"loop.lua\",\"timeout\":1}",
+    );
+    defer std.testing.allocator.free(result);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+
+    const root_object = parsed.value.object;
+    try std.testing.expect(!root_object.get("ok").?.bool);
+    try std.testing.expectEqualStrings("LuaTimeout", root_object.get("error").?.string);
+    try std.testing.expectEqual(@as(i64, 1), root_object.get("timeout").?.integer);
+    try std.testing.expect(std.mem.indexOf(u8, root_object.get("stderr").?.string, "timed out") != null);
+}
+
+test "lua execute rejects invalid timeout" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("ok.lua", .{});
+    defer file.close();
+    try file.writeAll("print('ok')\n");
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+
+    try std.testing.expectError(
+        error.InvalidToolArguments,
+        executeToolCall(
+            std.testing.allocator,
+            &policy,
+            "lua_execute",
+            "{\"path\":\"ok.lua\",\"timeout\":0}",
+        ),
+    );
+
+    try std.testing.expectError(
+        error.InvalidToolArguments,
+        executeToolCall(
+            std.testing.allocator,
+            &policy,
+            "lua_execute",
+            "{\"path\":\"ok.lua\",\"timeout\":601}",
         ),
     );
 }
