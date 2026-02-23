@@ -8,7 +8,7 @@ The project provides:
 - A CLI binary (`zoid`) with command parsing in `src/cli.zig` and app entrypoint in `src/main.zig`.
 - Lua script execution via `zoid execute <file.lua>` in `src/lua_runner.zig`.
 - JSON config key/value storage via `zoid config set|get|unset|list` in `src/config_store.zig`.
-- Service mode via `zoid serve` in `src/telegram_bot.zig` (currently Telegram long-polling), maintaining conversation context per Telegram `chat_id`, persisting it under the app-data directory, forwarding messages to OpenAI, replying with `sendMessage`, and running scheduled jobs from workspace scheduler storage.
+- Service mode via `zoid serve` in `src/telegram_bot.zig` (currently Telegram long-polling), maintaining conversation context per Telegram `chat_id`, persisting it under the app-data directory, forwarding messages to OpenAI, replying with `sendMessage`, and running scheduled jobs from app-data scheduler storage (workspace-scoped namespace).
 - OpenAI chat + one-shot run flows in `src/openai_client.zig` and `src/chat_session.zig`, including local tools (`filesystem_read`, `filesystem_list`, `filesystem_write`, `filesystem_delete`, `lua_execute`, `config`, `jobs`, `http_get`, `http_post`, `http_put`, `http_delete`) with workspace-root policy handling via `src/tool_runtime.zig`.
 - Shared scheduler persistence/runtime in `src/scheduler_store.zig` + `src/scheduler_runtime.zig` with cron helper logic in `src/cron_adapter.zig`.
 - Shared OpenAI model policy in `src/model_catalog.zig` (default model, picker fallback models, and chat-model ID filtering rules).
@@ -56,6 +56,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - While generating a reply in Telegram service mode, send the native `sendChatAction` typing indicator periodically so users see Telegram's built-in "typing..." state until `sendMessage` completes.
   - Service mode processes due scheduled jobs before polling updates; scheduler output is sent to the assistant and assistant replies are delivered to Telegram DM when a DM chat id is available.
   - Service mode persists the latest private-chat `chat_id` to app-data (`telegram_dm_chat_id.txt`), which is used as runtime DM fallback when scheduled jobs execute.
+  - Scheduler metadata files (`scheduler_jobs.json` + lock/tmp) must live under `getAppDataDir("zoid")`, not inside the workspace tree; only user-authored script/markdown job payload files should live in workspace.
 
 ### Chat interface changes:
   - `src/chat_session.zig` now uses fullscreen `libvaxis` UI in the alternate screen when running on a TTY, with `vaxis.widgets.TextInput` handling readline-style editing (`Ctrl+A`, `Ctrl+E`, arrows, backspace/delete).

@@ -1,7 +1,8 @@
 const std = @import("std");
 
 pub const max_store_bytes: usize = 8 * 1024 * 1024;
-const store_dir_name = ".zoid";
+const app_data_app_name = "zoid";
+const store_dir_name = "scheduler";
 const store_file_name = "scheduler_jobs.json";
 const store_tmp_name = "scheduler_jobs.json.tmp";
 const lock_file_name = "scheduler_jobs.lock";
@@ -186,19 +187,43 @@ pub fn saveJobs(allocator: std.mem.Allocator, workspace_root: []const u8, jobs: 
 }
 
 pub fn storeFilePath(allocator: std.mem.Allocator, workspace_root: []const u8) ![]u8 {
-    return std.fs.path.join(allocator, &.{ workspace_root, store_dir_name, store_file_name });
+    const dir_path = try storeDirPath(allocator, workspace_root);
+    defer allocator.free(dir_path);
+
+    return std.fs.path.join(allocator, &.{ dir_path, store_file_name });
 }
 
 fn storeTmpPath(allocator: std.mem.Allocator, workspace_root: []const u8) ![]u8 {
-    return std.fs.path.join(allocator, &.{ workspace_root, store_dir_name, store_tmp_name });
+    const dir_path = try storeDirPath(allocator, workspace_root);
+    defer allocator.free(dir_path);
+
+    return std.fs.path.join(allocator, &.{ dir_path, store_tmp_name });
 }
 
 fn storeDirPath(allocator: std.mem.Allocator, workspace_root: []const u8) ![]u8 {
-    return std.fs.path.join(allocator, &.{ workspace_root, store_dir_name });
+    const app_data_dir = try appDataDirPath(allocator);
+    defer allocator.free(app_data_dir);
+
+    const namespace = try workspaceStoreNamespace(allocator, workspace_root);
+    defer allocator.free(namespace);
+
+    return std.fs.path.join(allocator, &.{ app_data_dir, store_dir_name, namespace });
 }
 
 fn lockFilePath(allocator: std.mem.Allocator, workspace_root: []const u8) ![]u8 {
-    return std.fs.path.join(allocator, &.{ workspace_root, store_dir_name, lock_file_name });
+    const dir_path = try storeDirPath(allocator, workspace_root);
+    defer allocator.free(dir_path);
+
+    return std.fs.path.join(allocator, &.{ dir_path, lock_file_name });
+}
+
+fn appDataDirPath(allocator: std.mem.Allocator) ![]u8 {
+    return std.fs.getAppDataDir(allocator, app_data_app_name);
+}
+
+fn workspaceStoreNamespace(allocator: std.mem.Allocator, workspace_root: []const u8) ![]u8 {
+    const hash = std.hash.Wyhash.hash(0, workspace_root);
+    return std.fmt.allocPrint(allocator, "{x}", .{hash});
 }
 
 fn parseJob(allocator: std.mem.Allocator, object: std.json.ObjectMap) !Job {
@@ -389,4 +414,21 @@ test "saveJobs and loadJobs roundtrip" {
     try std.testing.expectEqual(@as(i64, 456), loaded[1].chat_id);
     try std.testing.expectEqual(JobType.markdown, loaded[1].job_type);
     try std.testing.expectEqualStrings("0 21 * * *", loaded[1].cron.?);
+}
+
+test "scheduler store path is under app-data and outside workspace root" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    const file_path = try storeFilePath(std.testing.allocator, workspace_root);
+    defer std.testing.allocator.free(file_path);
+
+    const app_data_dir = try std.fs.getAppDataDir(std.testing.allocator, app_data_app_name);
+    defer std.testing.allocator.free(app_data_dir);
+
+    try std.testing.expect(std.mem.startsWith(u8, file_path, app_data_dir));
+    try std.testing.expect(!std.mem.startsWith(u8, file_path, workspace_root));
 }
