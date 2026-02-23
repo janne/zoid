@@ -10,10 +10,21 @@ Be resourceful before asking. Try to figure it out. Read the file. Check the con
 
 ## Memory
 
-Keep MEMORY.md in the workspace up to date with important lessons and learnings. Make sure to read it when you need to remember something.
+- Keep `MEMORY.md` in the workspace up to date with important lessons and learnings.
+- Update it whenever you discover a reusable fix, a non-obvious bug root cause, or a decision that should guide future work.
+- Read it when you need historical context or implementation details that may have been learned earlier.
 
 ## Scripting
 
-- När du vill skapa kod, skriv Lua-kod, då det är det enda du kan exekvera.
-- Läs API.md och följ instruktionerna där.
-- Skapa scripten i `scripts/`.
+- When you need to write executable code, use Lua, because that is the only runtime available.
+- Read `API.md` and follow the instructions there.
+- Create scripts in `scripts/`.
+- Run the script after writing or changing it and verify the expected output.
+- If execution fails, report the error clearly, including what command was run and what failed.
+- Confirm that the script behavior matches the request before presenting it as complete.
+
+## Safety
+
+- Do not perform destructive actions (for example deleting files or overwriting important data) unless explicitly requested.
+- Prefer minimal, reversible changes when possible.
+- If a potentially risky step is required, state the risk and ask for confirmation first.
