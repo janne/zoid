@@ -280,7 +280,7 @@ fn runFullscreen(
                         } else {
                             if (isEscapeKey(key)) break :loop;
 
-                            if (key.matches(vaxis.Key.enter, .{}) or key.matches('j', .{ .ctrl = true })) {
+                            if (isSubmitKey(key)) {
                                 if (pending) continue;
 
                                 const line_owned = try takeInputText(allocator, &input);
@@ -341,6 +341,9 @@ fn runFullscreen(
                                         status_text = "Waiting for assistant response...";
                                     }
                                 }
+                            } else if (isShiftEnterKey(key)) {
+                                input_history.clearBrowseState(allocator);
+                                try input.insertSliceAtCursor("\n");
                             } else {
                                 input_history.clearBrowseState(allocator);
                                 try input.update(.{ .key_press = key });
@@ -849,6 +852,22 @@ fn isEnterSequence(text: []const u8) bool {
     return text.len == 1 and (text[0] == '\r' or text[0] == '\n');
 }
 
+fn isSubmitKey(key: vaxis.Key) bool {
+    if (isShiftEnterKey(key)) return false;
+    if (isCtrlJ(key)) return true;
+    if (key.codepoint == vaxis.Key.enter or key.codepoint == vaxis.Key.kp_enter) return true;
+    if (key.matches(vaxis.Key.enter, .{}) or key.matches(vaxis.Key.kp_enter, .{})) return true;
+    if (key.text) |text| return isEnterSequence(text);
+    return false;
+}
+
+fn isShiftEnterKey(key: vaxis.Key) bool {
+    if (!key.mods.shift) return false;
+    if (key.codepoint == vaxis.Key.enter or key.codepoint == vaxis.Key.kp_enter) return true;
+    if (key.text) |text| return isEnterSequence(text);
+    return false;
+}
+
 fn isEscSequence(text: []const u8) bool {
     return text.len == 1 and text[0] == 0x1B;
 }
@@ -917,6 +936,10 @@ fn isCtrlU(key: vaxis.Key) bool {
 
 fn isCtrlD(key: vaxis.Key) bool {
     return key.matches('d', .{ .ctrl = true }) or key.codepoint == 0x04;
+}
+
+fn isCtrlJ(key: vaxis.Key) bool {
+    return key.matches('j', .{ .ctrl = true }) or key.codepoint == 0x0A;
 }
 
 fn renderScreen(
@@ -1897,6 +1920,38 @@ test "inputHistoryActionFromKey detects up and down keys" {
     try std.testing.expect(inputHistoryActionFromKey(up_key) == .up);
     try std.testing.expect(inputHistoryActionFromKey(down_key) == .down);
     try std.testing.expect(inputHistoryActionFromKey(regular_key) == .none);
+}
+
+test "isSubmitKey ignores shift+enter but accepts enter and ctrl+j" {
+    const enter_key: vaxis.Key = .{ .codepoint = vaxis.Key.enter, .text = "\r" };
+    const shift_enter_key: vaxis.Key = .{
+        .codepoint = vaxis.Key.enter,
+        .text = "\r",
+        .mods = .{ .shift = true },
+    };
+    const ctrl_j_key: vaxis.Key = .{
+        .codepoint = 'j',
+        .mods = .{ .ctrl = true },
+    };
+
+    try std.testing.expect(isSubmitKey(enter_key));
+    try std.testing.expect(!isSubmitKey(shift_enter_key));
+    try std.testing.expect(isSubmitKey(ctrl_j_key));
+}
+
+test "isShiftEnterKey detects shifted newline text events" {
+    const shifted_text_only: vaxis.Key = .{
+        .codepoint = vaxis.Key.multicodepoint,
+        .text = "\n",
+        .mods = .{ .shift = true },
+    };
+    const plain_newline: vaxis.Key = .{
+        .codepoint = vaxis.Key.multicodepoint,
+        .text = "\n",
+    };
+
+    try std.testing.expect(isShiftEnterKey(shifted_text_only));
+    try std.testing.expect(!isShiftEnterKey(plain_newline));
 }
 
 test "transcriptScrollActionFromKey detects row and half-page controls" {

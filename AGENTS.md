@@ -65,6 +65,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - Sanitize transcript text before rendering: strip ANSI escape sequences, normalize `\r`/`\r\n` to `\n`, replace tabs with spaces, and replace other control bytes with spaces to avoid terminal state corruption from model/tool output.
   - Chat input history is session-local: `Up`/`Down` browse previously submitted prompts/commands, and moving down past the newest history entry restores the current draft.
   - Slash commands in chat: `/new` clears the current conversation+transcript (new local session), `/help` appends a local command list message, and `/exit`/`/quit` exits chat.
+  - In chat input, `Enter` submits, while `Shift+Enter` inserts a newline without sending.
   - `chat` is TTY-only; non-interactive one-shot usage should go through `zoid run <prompt...>` and write only the agent output to stdout.
   - Keep the input box anchored at the bottom of the screen.
   - Input rendering is manual soft word-wrap, and the input box grows vertically upward as lines increase.
