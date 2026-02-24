@@ -24,6 +24,7 @@ const conversation_state_file_name = "telegram_context.json";
 const serve_lock_file_name = "telegram_serve.lock";
 const typing_action_refresh_ns: u64 = 4 * std.time.ns_per_s;
 const typing_action_sleep_step_ns: u64 = 200 * std.time.ns_per_ms;
+const telegram_message_parse_mode = "MarkdownV2";
 
 const InboundChatKind = enum {
     private,
@@ -1016,14 +1017,7 @@ fn sendMessage(
     );
     defer allocator.free(uri);
 
-    const escaped_text = try std.json.Stringify.valueAlloc(allocator, text, .{});
-    defer allocator.free(escaped_text);
-
-    const payload = try std.fmt.allocPrint(
-        allocator,
-        "{{\"chat_id\":{d},\"text\":{s}}}",
-        .{ chat_id, escaped_text },
-    );
+    const payload = try buildSendMessagePayload(allocator, chat_id, text);
     defer allocator.free(payload);
 
     const headers = [_]http_client.RequestHeader{
@@ -1129,6 +1123,21 @@ fn sendTypingAction(
         }
         return error.TelegramApiRequestFailed;
     }
+}
+
+fn buildSendMessagePayload(
+    allocator: std.mem.Allocator,
+    chat_id: i64,
+    text: []const u8,
+) ![]u8 {
+    const escaped_text = try std.json.Stringify.valueAlloc(allocator, text, .{});
+    defer allocator.free(escaped_text);
+
+    return try std.fmt.allocPrint(
+        allocator,
+        "{{\"chat_id\":{d},\"text\":{s},\"parse_mode\":\"{s}\"}}",
+        .{ chat_id, escaped_text, telegram_message_parse_mode },
+    );
 }
 
 fn buildChatActionPayload(
@@ -1281,6 +1290,16 @@ test "buildChatActionPayload encodes chat action request" {
 
     try std.testing.expectEqualStrings(
         "{\"chat_id\":42,\"action\":\"typing\"}",
+        payload,
+    );
+}
+
+test "buildSendMessagePayload includes markdown parse mode" {
+    const payload = try buildSendMessagePayload(std.testing.allocator, 42, "*bold*");
+    defer std.testing.allocator.free(payload);
+
+    try std.testing.expectEqualStrings(
+        "{\"chat_id\":42,\"text\":\"*bold*\",\"parse_mode\":\"MarkdownV2\"}",
         payload,
     );
 }

@@ -56,6 +56,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - Telegram service mode acquires an app-data lock file (`telegram_serve.lock`) so only one `zoid serve` instance runs per user profile; a second instance fails with `error.ServiceAlreadyRunning`.
   - `/new` or `/reset` clears that chat's stored Telegram context.
   - While generating a reply in Telegram service mode, send the native `sendChatAction` typing indicator periodically so users see Telegram's built-in "typing..." state until `sendMessage` completes.
+  - Telegram `sendMessage` requests set `parse_mode` to `MarkdownV2`.
   - Service mode processes due scheduled jobs before polling updates; scheduler output is sent to the assistant and assistant replies are delivered to Telegram DM when a DM chat id is available.
   - Service mode persists the latest private-chat `chat_id` to app-data (`telegram_dm_chat_id.txt`), which is used as runtime DM fallback when scheduled jobs execute.
   - Scheduler metadata files (`scheduler_jobs.json` + lock/tmp) must live under `getAppDataDir("zoid")`, not inside the workspace tree; only user-authored script/markdown job payload files should live in workspace.
