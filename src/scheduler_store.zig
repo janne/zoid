@@ -9,14 +9,8 @@ const lock_file_name = "scheduler_jobs.lock";
 const lock_retry_delay_ns: u64 = 50 * std.time.ns_per_ms;
 const lock_retry_attempts: usize = 200;
 
-pub const JobType = enum {
-    lua,
-    markdown,
-};
-
 pub const Job = struct {
     id: []u8,
-    job_type: JobType,
     path: []u8,
     chat_id: i64,
     paused: bool,
@@ -36,7 +30,6 @@ pub const Job = struct {
     pub fn clone(self: *const Job, allocator: std.mem.Allocator) !Job {
         return .{
             .id = try allocator.dupe(u8, self.id),
-            .job_type = self.job_type,
             .path = try allocator.dupe(u8, self.path),
             .chat_id = self.chat_id,
             .paused = self.paused,
@@ -61,19 +54,6 @@ pub const Lock = struct {
         self.* = undefined;
     }
 };
-
-pub fn jobTypeToString(job_type: JobType) []const u8 {
-    return switch (job_type) {
-        .lua => "lua",
-        .markdown => "markdown",
-    };
-}
-
-pub fn parseJobType(value: []const u8) !JobType {
-    if (std.mem.eql(u8, value, "lua")) return .lua;
-    if (std.mem.eql(u8, value, "markdown")) return .markdown;
-    return error.InvalidJobType;
-}
 
 pub fn deinitJobs(allocator: std.mem.Allocator, jobs: []Job) void {
     for (jobs) |*job| job.deinit(allocator);
@@ -230,9 +210,6 @@ fn parseJob(allocator: std.mem.Allocator, object: std.json.ObjectMap) !Job {
     const id = try allocator.dupe(u8, try requireString(object, "id"));
     errdefer allocator.free(id);
 
-    const job_type_string = try requireString(object, "job_type");
-    const job_type = try parseJobType(job_type_string);
-
     const path = try allocator.dupe(u8, try requireString(object, "path"));
     errdefer allocator.free(path);
 
@@ -253,7 +230,6 @@ fn parseJob(allocator: std.mem.Allocator, object: std.json.ObjectMap) !Job {
 
     return .{
         .id = id,
-        .job_type = job_type,
         .path = path,
         .chat_id = chat_id,
         .paused = paused,
@@ -284,8 +260,6 @@ fn jobsToJson(allocator: std.mem.Allocator, jobs: []const Job) ![]u8 {
 fn jobToJson(allocator: std.mem.Allocator, writer: *std.Io.Writer, job: *const Job) !void {
     try writer.writeAll("{\"id\":");
     try writeJsonString(allocator, writer, job.id);
-    try writer.writeAll(",\"job_type\":");
-    try writeJsonString(allocator, writer, jobTypeToString(job.job_type));
     try writer.writeAll(",\"path\":");
     try writeJsonString(allocator, writer, job.path);
     try writer.writeAll(",\"chat_id\":");
@@ -373,7 +347,6 @@ test "saveJobs and loadJobs roundtrip" {
     var initial_jobs = [_]Job{
         .{
             .id = try std.testing.allocator.dupe(u8, "job-1"),
-            .job_type = .lua,
             .path = try std.testing.allocator.dupe(u8, "script.lua"),
             .chat_id = 123,
             .paused = false,
@@ -386,8 +359,7 @@ test "saveJobs and loadJobs roundtrip" {
         },
         .{
             .id = try std.testing.allocator.dupe(u8, "job-2"),
-            .job_type = .markdown,
-            .path = try std.testing.allocator.dupe(u8, "note.md"),
+            .path = try std.testing.allocator.dupe(u8, "job.lua"),
             .chat_id = 456,
             .paused = true,
             .run_at = null,
@@ -410,9 +382,8 @@ test "saveJobs and loadJobs roundtrip" {
     try std.testing.expectEqual(@as(usize, 2), loaded.len);
     try std.testing.expectEqualStrings("job-1", loaded[0].id);
     try std.testing.expectEqualStrings("script.lua", loaded[0].path);
-    try std.testing.expectEqual(JobType.lua, loaded[0].job_type);
     try std.testing.expectEqual(@as(i64, 456), loaded[1].chat_id);
-    try std.testing.expectEqual(JobType.markdown, loaded[1].job_type);
+    try std.testing.expectEqualStrings("job.lua", loaded[1].path);
     try std.testing.expectEqualStrings("0 21 * * *", loaded[1].cron.?);
 }
 

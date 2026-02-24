@@ -1,5 +1,4 @@
 const std = @import("std");
-const scheduler_store = @import("scheduler_store.zig");
 
 pub const ConfigCommand = union(enum) {
     set: struct {
@@ -12,7 +11,6 @@ pub const ConfigCommand = union(enum) {
 };
 
 pub const JobsCreateCommand = struct {
-    job_type: scheduler_store.JobType,
     path: []const u8,
     run_at: ?[]const u8,
     cron: ?[]const u8,
@@ -201,14 +199,9 @@ fn parseJobsCreate(args: []const []const u8) ParseCommandError!JobsCreateCommand
     if (path == null) return error.InvalidJobsArguments;
     if ((run_at == null and cron == null) or (run_at != null and cron != null)) return error.InvalidJobsArguments;
 
-    const job_type: scheduler_store.JobType = blk: {
-        if (std.mem.endsWith(u8, path.?, ".lua")) break :blk .lua;
-        if (std.mem.endsWith(u8, path.?, ".md")) break :blk .markdown;
-        return error.InvalidJobsArguments;
-    };
+    if (!std.mem.endsWith(u8, path.?, ".lua")) return error.InvalidJobsArguments;
 
     return .{
-        .job_type = job_type,
         .path = path.?,
         .run_at = run_at,
         .cron = cron,
@@ -232,8 +225,8 @@ pub fn printHelp() void {
         \\zoid serve
         \\  Starts long-running service mode.
         \\
-        \\zoid jobs create <path.lua|path.md> (--run-at <rfc3339> | --cron "<min hour dom mon dow>")
-        \\  Creates a scheduled job from a relative path or /path under workspace root and infers type from file extension.
+        \\zoid jobs create <path.lua> (--run-at <rfc3339> | --cron "<min hour dom mon dow>")
+        \\  Creates a scheduled Lua job from a relative path or /path under workspace root.
         \\
         \\zoid jobs list
         \\  Lists scheduled jobs with workspace-absolute paths (/...).
@@ -295,7 +288,6 @@ test "jobs create lua with run-at parses" {
     switch (command) {
         .jobs => |jobs_cmd| switch (jobs_cmd) {
             .create => |create| {
-                try std.testing.expectEqual(scheduler_store.JobType.lua, create.job_type);
                 try std.testing.expectEqualStrings("scripts/a.lua", create.path);
                 try std.testing.expectEqualStrings("2026-02-22T21:00:00Z", create.run_at.?);
                 try std.testing.expect(create.cron == null);
@@ -306,15 +298,14 @@ test "jobs create lua with run-at parses" {
     }
 }
 
-test "jobs create markdown with cron parses" {
-    const args = [_][]const u8{ "zoid", "jobs", "create", "note.md", "--cron", "0 21 * * *" };
+test "jobs create lua with cron parses" {
+    const args = [_][]const u8{ "zoid", "jobs", "create", "note.lua", "--cron", "0 21 * * *" };
     const command = try parseCommand(&args);
 
     switch (command) {
         .jobs => |jobs_cmd| switch (jobs_cmd) {
             .create => |create| {
-                try std.testing.expectEqual(scheduler_store.JobType.markdown, create.job_type);
-                try std.testing.expectEqualStrings("note.md", create.path);
+                try std.testing.expectEqualStrings("note.lua", create.path);
                 try std.testing.expect(create.run_at == null);
                 try std.testing.expectEqualStrings("0 21 * * *", create.cron.?);
             },
@@ -355,6 +346,6 @@ test "jobs rejects unsupported path extension" {
 }
 
 test "jobs rejects multiple paths" {
-    const args = [_][]const u8{ "zoid", "jobs", "create", "task.lua", "note.md", "--cron", "0 * * * *" };
+    const args = [_][]const u8{ "zoid", "jobs", "create", "task.lua", "note.lua", "--cron", "0 * * * *" };
     try std.testing.expectError(error.InvalidJobsArguments, parseCommand(&args));
 }

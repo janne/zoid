@@ -45,9 +45,9 @@ If you change command behavior, error handling, config format, or Lua execution 
   - Update parsing + help text in `src/cli.zig`.
   - Update execution flow and user-visible errors in `src/main.zig`.
   - Jobs CLI commands live under `zoid jobs ...` with create/list/delete/pause/resume.
-  - `zoid jobs create` takes a single path argument and infers job type from extension: `.lua` or `.md`.
+  - `zoid jobs create` takes a single path argument and requires a `.lua` extension.
   - Scheduler job ids are short random 5-character base36 strings; generation retries under scheduler lock to avoid collisions.
-  - `zoid jobs list` renders a compact single-line table (`JOB ST TYPE NEXT SCHEDULE LAST PATH`); `JOB` is the job id.
+  - `zoid jobs list` renders a compact single-line table (`JOB ST NEXT SCHEDULE LAST PATH`); `JOB` is the job id.
   - Workspace paths accept both relative paths and leading-slash workspace-absolute paths (`/path/from/workspace/root`) for `zoid execute` and `zoid jobs create`; `zoid jobs list` prints paths in this workspace-absolute `/...` format.
   - `zoid execute <file.lua> [args...]` must forward extra positional args to Lua global `arg` (`arg[0]` script path, `arg[1..]` forwarded args).
   - `zoid execute` supports optional `--timeout <seconds>` before `<file.lua>` to override Lua runtime timeout for that invocation.
@@ -62,7 +62,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - Telegram `sendMessage` requests set `parse_mode` to `MarkdownV2`.
   - Service mode processes due scheduled jobs before polling updates; scheduler output is sent to the assistant and assistant replies are delivered to Telegram DM when a DM chat id is available.
   - Service mode persists the latest private-chat `chat_id` to app-data (`telegram_dm_chat_id.txt`), which is used as runtime DM fallback when scheduled jobs execute.
-  - Scheduler metadata files (`scheduler_jobs.json` + lock/tmp) must live under `getAppDataDir("zoid")`, not inside the workspace tree; only user-authored script/markdown job payload files should live in workspace.
+  - Scheduler metadata files (`scheduler_jobs.json` + lock/tmp) must live under `getAppDataDir("zoid")`, not inside the workspace tree; only user-authored Lua job payload files and documents should live in workspace.
 
 ### Chat interface changes:
   - `src/chat_session.zig` now uses fullscreen `libvaxis` UI in the alternate screen when running on a TTY, with `vaxis.widgets.TextInput` handling readline-style editing (`Ctrl+A`, `Ctrl+E`, arrows, backspace/delete).
@@ -115,8 +115,8 @@ If you change command behavior, error handling, config format, or Lua execution 
   - `zoid.uri(...):get/delete/post/put` accept optional request options with `headers` table (string->string); header names/values are validated and dangerous overrides such as `Host`/`Content-Length` are rejected.
   - `zoid.json.decode` maps JSON values to Lua tables/scalars and maps JSON `null` to the sentinel `zoid.json.null`.
   - `zoid.time([table])` and `zoid.date([format[, epoch]])` provide safe time/date helpers while global `os` remains disabled; behavior is aligned with Lua `os.time`/`os.date`, including date-table normalization in `zoid.time`.
-  - `jobs` tool supports `create/list/delete/pause/resume`; create supports `.lua` and `.md` paths with exactly one schedule input (`run_at` RFC3339 or 5-field `cron`), and does not resolve Telegram destination at create time.
-  - In `telegram_bot` scheduled processing, skip agent dispatch when Lua stdout+stderr are both empty (after trim), or when markdown content is empty (after trim).
+  - `jobs` tool supports `create/list/delete/pause/resume`; create supports `.lua` paths with exactly one schedule input (`run_at` RFC3339 or 5-field `cron`), and does not resolve Telegram destination at create time.
+  - In `telegram_bot` scheduled processing, skip agent dispatch when Lua stdout+stderr are both empty (after trim).
   - Tool-mode routes stderr through `zoid.eprint(...)` and stdout through global `print(...)`, both captured for agent inspection without enabling general file I/O APIs.
   - `shell_command` and `exec` are intentionally disabled for OpenAI tool calls; unknown/disabled tool calls must return `error.ToolDisabled`.
   - Keep path checks strict: resolve to canonical paths and reject access outside workspace root.

@@ -13,7 +13,6 @@ pub const Context = struct {
 };
 
 pub const CreateRequest = struct {
-    job_type: scheduler_store.JobType,
     path: []const u8,
     run_at: ?[]const u8 = null,
     cron: ?[]const u8 = null,
@@ -45,7 +44,7 @@ pub fn createJob(allocator: std.mem.Allocator, context: Context, request: Create
     );
     errdefer allocator.free(resolved_path);
 
-    try validateJobPath(request.job_type, resolved_path);
+    try validateJobPath(resolved_path);
 
     const now = std.time.timestamp();
 
@@ -79,7 +78,6 @@ pub fn createJob(allocator: std.mem.Allocator, context: Context, request: Create
 
     const new_job: scheduler_store.Job = .{
         .id = id,
-        .job_type = request.job_type,
         .path = resolved_path,
         .chat_id = 0,
         .paused = false,
@@ -294,16 +292,9 @@ fn findJobIndexById(jobs: []const scheduler_store.Job, id: []const u8) ?usize {
     return null;
 }
 
-fn validateJobPath(job_type: scheduler_store.JobType, resolved_path: []const u8) !void {
+fn validateJobPath(resolved_path: []const u8) !void {
     const extension = std.fs.path.extension(resolved_path);
-    switch (job_type) {
-        .lua => {
-            if (!std.mem.eql(u8, extension, ".lua")) return error.InvalidJobPath;
-        },
-        .markdown => {
-            if (!std.mem.eql(u8, extension, ".md")) return error.InvalidJobPath;
-        },
-    }
+    if (!std.mem.eql(u8, extension, ".lua")) return error.InvalidJobPath;
 }
 
 pub fn loadDefaultDmChatIdAtPath(
@@ -424,7 +415,6 @@ test "create/list/delete/pause/resume lifecycle" {
     const context = Context{ .workspace_root = workspace_root };
 
     const created = try createJob(std.testing.allocator, context, .{
-        .job_type = .lua,
         .path = "task.lua",
         .run_at = "2026-01-10T10:00:00Z",
     });
@@ -450,14 +440,13 @@ test "createJob no longer requires chat context" {
     defer std.testing.allocator.free(workspace_root);
 
     {
-        const file = try tmp.dir.createFile("task.md", .{});
+        const file = try tmp.dir.createFile("task.lua", .{});
         defer file.close();
-        try file.writeAll("hello\n");
+        try file.writeAll("print('hello')\n");
     }
 
     const created = try createJob(std.testing.allocator, .{ .workspace_root = workspace_root }, .{
-        .job_type = .markdown,
-        .path = "task.md",
+        .path = "task.lua",
         .run_at = "2026-01-10T10:00:00Z",
     });
     defer {
@@ -497,7 +486,6 @@ test "job id matching requires exact id" {
     var jobs = [_]scheduler_store.Job{
         .{
             .id = try std.testing.allocator.dupe(u8, "job-abc"),
-            .job_type = .lua,
             .path = try std.testing.allocator.dupe(u8, "/tmp/one.lua"),
             .chat_id = 0,
             .paused = false,
@@ -510,8 +498,7 @@ test "job id matching requires exact id" {
         },
         .{
             .id = try std.testing.allocator.dupe(u8, "job-abcde"),
-            .job_type = .markdown,
-            .path = try std.testing.allocator.dupe(u8, "/tmp/two.md"),
+            .path = try std.testing.allocator.dupe(u8, "/tmp/two.lua"),
             .chat_id = 0,
             .paused = false,
             .run_at = null,

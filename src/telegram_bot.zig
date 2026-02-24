@@ -3,7 +3,6 @@ const http_client = @import("http_client.zig");
 const lua_runner = @import("lua_runner.zig");
 const openai_client = @import("openai_client.zig");
 const scheduler_runtime = @import("scheduler_runtime.zig");
-const scheduler_store = @import("scheduler_store.zig");
 const tool_runtime = @import("tool_runtime.zig");
 
 pub const Settings = struct {
@@ -679,15 +678,6 @@ fn parseRole(name: []const u8) ?openai_client.Role {
     return null;
 }
 
-const MarkdownReadResult = struct {
-    content: []u8,
-    truncated: bool,
-
-    fn deinit(self: *MarkdownReadResult, allocator: std.mem.Allocator) void {
-        allocator.free(self.content);
-    }
-};
-
 fn buildScheduledPrompt(
     allocator: std.mem.Allocator,
     workspace_root: []const u8,
@@ -701,8 +691,6 @@ fn buildScheduledPrompt(
     try payload.appendSlice(allocator, "{\"event\":\"scheduled_job\",\"job\":{");
     try payload.appendSlice(allocator, "\"id\":");
     try appendJsonString(allocator, &payload, due_job.job.id);
-    try payload.appendSlice(allocator, ",\"job_type\":");
-    try appendJsonString(allocator, &payload, scheduler_store.jobTypeToString(due_job.job.job_type));
     try payload.appendSlice(allocator, ",\"path\":");
     try appendJsonString(allocator, &payload, due_job.job.path);
     try payload.appendSlice(allocator, ",\"scheduled_for\":");
@@ -711,104 +699,43 @@ fn buildScheduledPrompt(
     try payload.writer(allocator).print("{d}", .{triggered_at});
     try payload.appendSlice(allocator, "},\"result\":{");
 
-    switch (due_job.job.job_type) {
-        .lua => {
-            var execution = try lua_runner.executeLuaFileCaptureOutputTool(
-                allocator,
-                due_job.job.path,
-                .{
-                    .workspace_root = workspace_root,
-                    .max_read_bytes = tool_runtime.max_allowed_read_bytes,
-                    .max_http_response_bytes = tool_runtime.max_allowed_http_response_bytes,
-                },
-            );
-            defer execution.deinit(allocator);
-
-            if (std.mem.trim(u8, execution.stdout, " \t\r\n").len == 0 and
-                std.mem.trim(u8, execution.stderr, " \t\r\n").len == 0)
-            {
-                payload.deinit(allocator);
-                return null;
-            }
-
-            try payload.appendSlice(allocator, "\"kind\":\"lua\",\"status\":");
-            try appendJsonString(allocator, &payload, executionStatusToString(execution.status));
-            try payload.appendSlice(allocator, ",\"exit_code\":");
-            if (execution.exit_code) |exit_code| {
-                try payload.writer(allocator).print("{d}", .{exit_code});
-            } else {
-                try payload.appendSlice(allocator, "null");
-            }
-            try payload.appendSlice(allocator, ",\"stdout\":");
-            try appendJsonString(allocator, &payload, execution.stdout);
-            try payload.appendSlice(allocator, ",\"stderr\":");
-            try appendJsonString(allocator, &payload, execution.stderr);
-            try payload.appendSlice(allocator, ",\"stdout_truncated\":");
-            try payload.appendSlice(allocator, if (execution.stdout_truncated) "true" else "false");
-            try payload.appendSlice(allocator, ",\"stderr_truncated\":");
-            try payload.appendSlice(allocator, if (execution.stderr_truncated) "true" else "false");
+    var execution = try lua_runner.executeLuaFileCaptureOutputTool(
+        allocator,
+        due_job.job.path,
+        .{
+            .workspace_root = workspace_root,
+            .max_read_bytes = tool_runtime.max_allowed_read_bytes,
+            .max_http_response_bytes = tool_runtime.max_allowed_http_response_bytes,
         },
-        .markdown => {
-            var markdown_read = try readMarkdownWithCap(
-                allocator,
-                due_job.job.path,
-                tool_runtime.max_allowed_read_bytes,
-            );
-            defer markdown_read.deinit(allocator);
+    );
+    defer execution.deinit(allocator);
 
-            if (std.mem.trim(u8, markdown_read.content, " \t\r\n").len == 0) {
-                payload.deinit(allocator);
-                return null;
-            }
-
-            try payload.appendSlice(allocator, "\"kind\":\"markdown\",\"content\":");
-            try appendJsonString(allocator, &payload, markdown_read.content);
-            try payload.appendSlice(allocator, ",\"content_truncated\":");
-            try payload.appendSlice(allocator, if (markdown_read.truncated) "true" else "false");
-        },
+    if (std.mem.trim(u8, execution.stdout, " \t\r\n").len == 0 and
+        std.mem.trim(u8, execution.stderr, " \t\r\n").len == 0)
+    {
+        payload.deinit(allocator);
+        return null;
     }
+
+    try payload.appendSlice(allocator, "\"kind\":\"lua\",\"status\":");
+    try appendJsonString(allocator, &payload, executionStatusToString(execution.status));
+    try payload.appendSlice(allocator, ",\"exit_code\":");
+    if (execution.exit_code) |exit_code| {
+        try payload.writer(allocator).print("{d}", .{exit_code});
+    } else {
+        try payload.appendSlice(allocator, "null");
+    }
+    try payload.appendSlice(allocator, ",\"stdout\":");
+    try appendJsonString(allocator, &payload, execution.stdout);
+    try payload.appendSlice(allocator, ",\"stderr\":");
+    try appendJsonString(allocator, &payload, execution.stderr);
+    try payload.appendSlice(allocator, ",\"stdout_truncated\":");
+    try payload.appendSlice(allocator, if (execution.stdout_truncated) "true" else "false");
+    try payload.appendSlice(allocator, ",\"stderr_truncated\":");
+    try payload.appendSlice(allocator, if (execution.stderr_truncated) "true" else "false");
 
     try payload.appendSlice(allocator, "}}\n");
     return try payload.toOwnedSlice(allocator);
-}
-
-fn readMarkdownWithCap(
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    cap_bytes: usize,
-) !MarkdownReadResult {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-
-    var result = std.ArrayList(u8).empty;
-    errdefer result.deinit(allocator);
-
-    var truncated = false;
-    var total: usize = 0;
-    var buffer: [4096]u8 = undefined;
-    while (true) {
-        const read_len = try file.read(&buffer);
-        if (read_len == 0) break;
-
-        const remaining = cap_bytes -| total;
-        if (read_len > remaining) {
-            if (remaining > 0) try result.appendSlice(allocator, buffer[0..remaining]);
-            truncated = true;
-            break;
-        }
-
-        try result.appendSlice(allocator, buffer[0..read_len]);
-        total += read_len;
-        if (total >= cap_bytes) {
-            truncated = true;
-            break;
-        }
-    }
-
-    return .{
-        .content = try result.toOwnedSlice(allocator),
-        .truncated = truncated,
-    };
 }
 
 fn appendJsonString(allocator: std.mem.Allocator, payload: *std.ArrayList(u8), value: []const u8) !void {
@@ -1345,7 +1272,7 @@ test "conversation state round-trips through disk persistence" {
     try std.testing.expectEqualStrings("hej", restored_b.messages.items[0].content);
 }
 
-test "buildScheduledPrompt skips empty markdown and empty lua output" {
+test "buildScheduledPrompt skips empty lua output" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1353,50 +1280,17 @@ test "buildScheduledPrompt skips empty markdown and empty lua output" {
     defer std.testing.allocator.free(workspace_root);
 
     {
-        const file = try tmp.dir.createFile("empty.md", .{});
-        file.close();
-    }
-    {
         const file = try tmp.dir.createFile("silent.lua", .{});
         defer file.close();
         try file.writeAll("-- no output\n");
     }
 
-    const empty_md_path = try tmp.dir.realpathAlloc(std.testing.allocator, "empty.md");
-    defer std.testing.allocator.free(empty_md_path);
     const silent_lua_path = try tmp.dir.realpathAlloc(std.testing.allocator, "silent.lua");
     defer std.testing.allocator.free(silent_lua_path);
-
-    var markdown_due_job = scheduler_runtime.DueJob{
-        .job = .{
-            .id = try std.testing.allocator.dupe(u8, "job-md"),
-            .job_type = .markdown,
-            .path = try std.testing.allocator.dupe(u8, empty_md_path),
-            .chat_id = 1,
-            .paused = false,
-            .run_at = 100,
-            .cron = null,
-            .next_run_at = 100,
-            .created_at = 90,
-            .updated_at = 90,
-            .last_run_at = null,
-        },
-        .scheduled_for = 100,
-    };
-    defer markdown_due_job.deinit(std.testing.allocator);
-
-    const markdown_prompt = try buildScheduledPrompt(
-        std.testing.allocator,
-        workspace_root,
-        &markdown_due_job,
-        101,
-    );
-    try std.testing.expect(markdown_prompt == null);
 
     var lua_due_job = scheduler_runtime.DueJob{
         .job = .{
             .id = try std.testing.allocator.dupe(u8, "job-lua"),
-            .job_type = .lua,
             .path = try std.testing.allocator.dupe(u8, silent_lua_path),
             .chat_id = 1,
             .paused = false,

@@ -554,11 +554,11 @@ fn writeSchedulerToolDefinition(
 ) !void {
     const description =
         "Manage scheduled jobs in the current workspace. action=create|list|delete|pause|resume. " ++
-        "create requires job_type=lua|markdown, path, and exactly one of run_at (RFC3339) or cron (5-field). " ++
+        "create requires a Lua path and exactly one of run_at (RFC3339) or cron (5-field). " ++
         "Scheduled output is routed at execution time: Telegram DM if available, otherwise dropped.";
     try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"jobs\",\"description\":");
     try writeJsonString(allocator, writer, description);
-    try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"create\",\"list\",\"delete\",\"pause\",\"resume\"]},\"job_type\":{\"type\":\"string\",\"enum\":[\"lua\",\"markdown\"]},\"path\":{\"type\":\"string\"},\"run_at\":{\"type\":\"string\"},\"cron\":{\"type\":\"string\"},\"job_id\":{\"type\":\"string\"}},\"required\":[\"action\"],\"additionalProperties\":false}}}");
+    try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"create\",\"list\",\"delete\",\"pause\",\"resume\"]},\"path\":{\"type\":\"string\"},\"run_at\":{\"type\":\"string\"},\"cron\":{\"type\":\"string\"},\"job_id\":{\"type\":\"string\"}},\"required\":[\"action\"],\"additionalProperties\":false}}}");
 }
 
 fn writeHttpPostToolDefinition(

@@ -34,7 +34,7 @@ Examples:
 
 ```sh
 zoid jobs create scripts/clean_up_docs.lua --cron "0 21 * * *"
-zoid jobs create reminders/pasta.md --run-at "2026-02-22T19:40:00Z"
+zoid jobs create reminders/pasta.lua --run-at "2026-02-22T19:40:00Z"
 zoid jobs list
 zoid jobs pause <job_id>
 zoid jobs resume <job_id>

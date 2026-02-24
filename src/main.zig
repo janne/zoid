@@ -193,7 +193,6 @@ pub fn main() !void {
                         allocator,
                         scheduler_context,
                         .{
-                            .job_type = create_cmd.job_type,
                             .path = create_cmd.path,
                             .run_at = create_cmd.run_at,
                             .cron = create_cmd.cron,
@@ -555,7 +554,6 @@ fn getWorkspaceRoot(allocator: std.mem.Allocator) ![]u8 {
 const JobListRow = struct {
     id: []const u8,
     state: []const u8,
-    job_type: []const u8,
     next_run: []u8,
     schedule: []u8,
     last_run: []u8,
@@ -586,7 +584,6 @@ fn formatScheduleJobList(
 
     var id_width: usize = "JOB".len;
     var state_width: usize = "ST".len;
-    var type_width: usize = "TYPE".len;
     var next_width: usize = "NEXT".len;
     var schedule_width: usize = "SCHEDULE".len;
     var last_width: usize = "LAST".len;
@@ -615,7 +612,6 @@ fn formatScheduleJobList(
         const row: JobListRow = .{
             .id = job.id,
             .state = if (job.paused) "P" else "R",
-            .job_type = zoid.scheduler_store.jobTypeToString(job.job_type),
             .next_run = next_run,
             .schedule = schedule,
             .last_run = last_run,
@@ -624,7 +620,6 @@ fn formatScheduleJobList(
 
         id_width = @max(id_width, row.id.len);
         state_width = @max(state_width, row.state.len);
-        type_width = @max(type_width, row.job_type.len);
         next_width = @max(next_width, row.next_run.len);
         schedule_width = @max(schedule_width, row.schedule.len);
         last_width = @max(last_width, row.last_run.len);
@@ -642,8 +637,6 @@ fn formatScheduleJobList(
         id_width,
         "ST",
         state_width,
-        "TYPE",
-        type_width,
         "NEXT",
         next_width,
         "SCHEDULE",
@@ -661,8 +654,6 @@ fn formatScheduleJobList(
             id_width,
             row.state,
             state_width,
-            row.job_type,
-            type_width,
             row.next_run,
             next_width,
             row.schedule,
@@ -683,8 +674,6 @@ fn appendScheduleListLine(
     id_width: usize,
     state: []const u8,
     state_width: usize,
-    job_type: []const u8,
-    type_width: usize,
     next_run: []const u8,
     next_width: usize,
     schedule: []const u8,
@@ -696,8 +685,6 @@ fn appendScheduleListLine(
     try appendPaddedCell(output, allocator, id, id_width);
     try output.append(allocator, ' ');
     try appendPaddedCell(output, allocator, state, state_width);
-    try output.append(allocator, ' ');
-    try appendPaddedCell(output, allocator, job_type, type_width);
     try output.append(allocator, ' ');
     try appendPaddedCell(output, allocator, next_run, next_width);
     try output.append(allocator, ' ');
@@ -778,9 +765,8 @@ fn printScheduleJob(
         try std.fmt.allocPrint(allocator, "/{s}", .{relative_path});
     defer allocator.free(workspace_absolute_path);
 
-    const line1 = try std.fmt.allocPrint(allocator, "id={s} type={s} path={s} paused={}\n", .{
+    const line1 = try std.fmt.allocPrint(allocator, "id={s} path={s} paused={}\n", .{
         job.id,
-        zoid.scheduler_store.jobTypeToString(job.job_type),
         workspace_absolute_path,
         job.paused,
     });
@@ -808,7 +794,7 @@ fn reportScheduleError(err: anyerror) void {
     switch (err) {
         error.InvalidSchedule => std.debug.print("Invalid schedule. Provide either --run-at <rfc3339> or --cron \"<min hour dom mon dow>\".\n", .{}),
         error.InvalidTimestamp => std.debug.print("Invalid run_at timestamp. Expected RFC3339 (for example 2026-02-22T21:00:00Z).\n", .{}),
-        error.InvalidJobPath => std.debug.print("Invalid job path. Lua jobs require .lua and markdown jobs require .md under workspace root.\n", .{}),
+        error.InvalidJobPath => std.debug.print("Invalid job path. Scheduled jobs require a .lua file under workspace root.\n", .{}),
         error.InvalidExpression, error.InvalidField, error.InvalidRange, error.InvalidStep, error.InvalidValue => {
             std.debug.print("Invalid cron expression.\n", .{});
         },
@@ -820,7 +806,6 @@ test "formatScheduleJobList renders ps-like columns" {
     var jobs = [_]zoid.scheduler_store.Job{
         .{
             .id = try std.testing.allocator.dupe(u8, "job-aaa111"),
-            .job_type = .lua,
             .path = try std.testing.allocator.dupe(u8, "/tmp/first.lua"),
             .chat_id = 0,
             .paused = false,
@@ -833,8 +818,7 @@ test "formatScheduleJobList renders ps-like columns" {
         },
         .{
             .id = try std.testing.allocator.dupe(u8, "job-bbb111"),
-            .job_type = .markdown,
-            .path = try std.testing.allocator.dupe(u8, "/tmp/second.md"),
+            .path = try std.testing.allocator.dupe(u8, "/tmp/second.lua"),
             .chat_id = 0,
             .paused = true,
             .run_at = null,
@@ -854,14 +838,13 @@ test "formatScheduleJobList renders ps-like columns" {
     const header = lines.next().?;
     try std.testing.expect(std.mem.indexOf(u8, header, "JOB") != null);
     try std.testing.expect(std.mem.indexOf(u8, header, "ST") != null);
-    try std.testing.expect(std.mem.indexOf(u8, header, "TYPE") != null);
     try std.testing.expect(std.mem.indexOf(u8, header, "NEXT") != null);
     try std.testing.expect(std.mem.indexOf(u8, header, "SCHEDULE") != null);
     try std.testing.expect(std.mem.indexOf(u8, header, "LAST") != null);
     try std.testing.expect(std.mem.indexOf(u8, header, "PATH") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "cron:0 21 * * *") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "/first.lua") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "/second.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "/second.lua") != null);
 }
 
 test "executeLuaAsTool runs script with lua_execute policy" {

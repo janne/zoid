@@ -1282,10 +1282,6 @@ fn pushLuaSchedulerJobTable(
     _ = c.lua_pushlstring(state, job.id.ptr, job.id.len);
     c.lua_setfield(state, -2, "id");
 
-    const job_type = scheduler_store.jobTypeToString(job.job_type);
-    _ = c.lua_pushlstring(state, job_type.ptr, job_type.len);
-    c.lua_setfield(state, -2, "job_type");
-
     _ = c.lua_pushlstring(state, workspace_path.ptr, workspace_path.len);
     c.lua_setfield(state, -2, "path");
 
@@ -1331,19 +1327,6 @@ fn luaZoidJobsCreate(lua_state: ?*c.lua_State) callconv(.c) c_int {
         return pushLuaErrorMessage(state, "zoid.jobs.create requires a table argument", .{});
     }
     const options_index = c.lua_absindex(state, 1);
-
-    _ = c.lua_getfield(state, options_index, "job_type");
-    var job_type_len: usize = 0;
-    const job_type_ptr = c.lua_tolstring(state, -1, &job_type_len) orelse {
-        luaPop(state, 1);
-        return pushLuaErrorMessage(state, "zoid.jobs.create requires job_type", .{});
-    };
-    const job_type_value = env.allocator.dupe(u8, job_type_ptr[0..job_type_len]) catch |err| {
-        luaPop(state, 1);
-        return pushLuaErrorMessage(state, "zoid.jobs.create failed: {s}", .{@errorName(err)});
-    };
-    defer env.allocator.free(job_type_value);
-    luaPop(state, 1);
 
     _ = c.lua_getfield(state, options_index, "path");
     var path_len: usize = 0;
@@ -1398,15 +1381,10 @@ fn luaZoidJobsCreate(lua_state: ?*c.lua_State) callconv(.c) c_int {
     }
     luaPop(state, 1);
 
-    const job_type = scheduler_store.parseJobType(job_type_value) catch {
-        return pushLuaErrorMessage(state, "zoid.jobs.create job_type must be 'lua' or 'markdown'", .{});
-    };
-
     var job = scheduler_runtime.createJob(
         env.allocator,
         .{ .workspace_root = env.workspace_root },
         .{
-            .job_type = job_type,
             .path = path_value,
             .run_at = run_at_value,
             .cron = cron_value,
@@ -3099,19 +3077,17 @@ test "executeLuaFileCaptureOutputTool supports zoid jobs api" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const markdown = try tmp.dir.createFile("note.md", .{});
-    defer markdown.close();
-    try markdown.writeAll("# hello\n");
+    const scheduled = try tmp.dir.createFile("note.lua", .{});
+    defer scheduled.close();
+    try scheduled.writeAll("print('hello')\n");
 
     const script = try tmp.dir.createFile("schedule.lua", .{});
     defer script.close();
     try script.writeAll(
         \\local created = zoid.jobs.create({
-        \\  job_type = "markdown",
-        \\  path = "note.md",
+        \\  path = "note.lua",
         \\  run_at = "2026-01-10T10:00:00Z"
         \\})
-        \\print(created.job_type)
         \\print(created.path)
         \\print(zoid.jobs.list()[1].path)
         \\print(#zoid.jobs.list())
@@ -3134,7 +3110,7 @@ test "executeLuaFileCaptureOutputTool supports zoid jobs api" {
 
     try std.testing.expect(output.status == .ok);
     try std.testing.expectEqualStrings(
-        "markdown\n/note.md\n/note.md\n1\ntrue\ntrue\ntrue\n0\n",
+        "/note.lua\n/note.lua\n1\ntrue\ntrue\ntrue\n0\n",
         output.stdout,
     );
     try std.testing.expectEqualStrings("", output.stderr);

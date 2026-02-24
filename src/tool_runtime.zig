@@ -797,8 +797,6 @@ fn executeScheduler(
     const writer = &output.writer;
 
     if (std.mem.eql(u8, action, "create")) {
-        const job_type_value = try requireStringProperty(root_object, "job_type");
-        const job_type = scheduler_store.parseJobType(job_type_value) catch return error.InvalidToolArguments;
         const path = try requireStringProperty(root_object, "path");
 
         const run_at: ?[]const u8 = if (root_object.get("run_at")) |value|
@@ -823,7 +821,6 @@ fn executeScheduler(
             allocator,
             context,
             .{
-                .job_type = job_type,
                 .path = path,
                 .run_at = run_at,
                 .cron = cron,
@@ -897,8 +894,6 @@ fn writeSchedulerJobJson(
 
     try writer.writeAll("{\"id\":");
     try writeJsonString(allocator, writer, job.id);
-    try writer.writeAll(",\"job_type\":");
-    try writeJsonString(allocator, writer, scheduler_store.jobTypeToString(job.job_type));
     try writer.writeAll(",\"path\":");
     try writeJsonString(allocator, writer, workspace_path);
     try writer.writeAll(",\"paused\":");
@@ -1172,7 +1167,7 @@ test "jobs tool can create and list jobs" {
         &policy,
         .{ .request_chat_id = 777 },
         "jobs",
-        "{\"action\":\"create\",\"job_type\":\"lua\",\"path\":\"task.lua\",\"run_at\":\"2026-01-10T10:00:00Z\"}",
+        "{\"action\":\"create\",\"path\":\"task.lua\",\"run_at\":\"2026-01-10T10:00:00Z\"}",
     );
     defer std.testing.allocator.free(create_result);
 
