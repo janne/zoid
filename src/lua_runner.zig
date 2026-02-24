@@ -60,6 +60,7 @@ pub const ToolSandbox = struct {
     max_http_response_bytes: usize = default_tool_max_http_response_bytes,
     execution_timeout_ns: ?u64 = timeoutSecondsToNanoseconds(default_tool_execution_timeout_seconds),
     config_path_override: ?[]const u8 = null,
+    allow_private_http_destinations: bool = false,
 };
 
 const LuaOutputCapture = struct {
@@ -93,6 +94,7 @@ const ToolLuaEnvironment = struct {
     max_read_bytes: usize,
     max_http_response_bytes: usize,
     config_path_override: ?[]const u8,
+    allow_private_http_destinations: bool,
     module_cache: std.StringHashMapUnmanaged(c_int) = .{},
     module_stack: std.ArrayList([]u8) = .empty,
 
@@ -1070,6 +1072,7 @@ fn luaZoidUriRequest(
         payload,
         request_headers,
         env.max_http_response_bytes,
+        env.allow_private_http_destinations,
     ) catch |err| {
         return pushLuaErrorMessage(state, "zoid.uri(uri):{s} failed: {s}", .{ method_name, @errorName(err) });
     };
@@ -1725,6 +1728,9 @@ fn luaZoidExit(lua_state: ?*c.lua_State) callconv(.c) c_int {
         if (isnum == 0) {
             return pushLuaErrorMessage(state, "zoid.exit([code]) code must be an integer", .{});
         }
+        if (exit_code < 0 or exit_code > 125) {
+            return pushLuaErrorMessage(state, "zoid.exit([code]) code must be in range 0..125", .{});
+        }
     }
 
     c.lua_newtable(state);
@@ -1857,6 +1863,7 @@ fn executeLuaFileCaptureOutputInternal(
         .max_read_bytes = sandbox.max_read_bytes,
         .max_http_response_bytes = sandbox.max_http_response_bytes,
         .config_path_override = sandbox.config_path_override,
+        .allow_private_http_destinations = sandbox.allow_private_http_destinations,
     };
     defer {
         const env = allocated_tool_env;
@@ -2173,6 +2180,32 @@ test "executeLuaFileCaptureOutputTool supports zoid.exit default code zero" {
     try std.testing.expectEqual(@as(?i64, 0), output.exit_code);
     try std.testing.expectEqualStrings("start\n", output.stdout);
     try std.testing.expectEqualStrings("", output.stderr);
+}
+
+test "executeLuaFileCaptureOutputTool rejects out-of-range zoid.exit codes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file_path = "exit_invalid.lua";
+    const file = try tmp.dir.createFile(file_path, .{});
+    defer file.close();
+    try file.writeAll(
+        \\zoid.exit(-1)
+        \\
+    );
+
+    const abs_path = try tmp.dir.realpathAlloc(std.testing.allocator, file_path);
+    defer std.testing.allocator.free(abs_path);
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    var output = try executeLuaFileCaptureOutputTool(std.testing.allocator, abs_path, .{
+        .workspace_root = workspace_root,
+    });
+    defer output.deinit(std.testing.allocator);
+
+    try std.testing.expect(output.status == .runtime_failed);
+    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "range 0..125") != null);
 }
 
 test "executeLuaFileCaptureOutputTool enforces execution timeout" {
@@ -2879,6 +2912,7 @@ test "executeLuaFileCaptureOutputTool supports zoid uri get/post/put/delete" {
 
     var output = try executeLuaFileCaptureOutputTool(std.testing.allocator, script_path, .{
         .workspace_root = workspace_root,
+        .allow_private_http_destinations = true,
     });
     defer output.deinit(std.testing.allocator);
 
@@ -2941,6 +2975,31 @@ test "executeLuaFileCaptureOutputTool rejects invalid uri header values" {
 
     try std.testing.expect(output.status == .runtime_failed);
     try std.testing.expect(std.mem.indexOf(u8, output.stderr, "InvalidHeaderValue") != null);
+}
+
+test "executeLuaFileCaptureOutputTool blocks localhost uri destinations by default" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script = try tmp.dir.createFile("blocked_localhost.lua", .{});
+    defer script.close();
+    try script.writeAll(
+        \\zoid.uri("http://127.0.0.1:8080"):get()
+        \\
+    );
+
+    const script_path = try tmp.dir.realpathAlloc(std.testing.allocator, "blocked_localhost.lua");
+    defer std.testing.allocator.free(script_path);
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    var output = try executeLuaFileCaptureOutputTool(std.testing.allocator, script_path, .{
+        .workspace_root = workspace_root,
+    });
+    defer output.deinit(std.testing.allocator);
+
+    try std.testing.expect(output.status == .runtime_failed);
+    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "DestinationNotAllowed") != null);
 }
 
 test "executeLuaFileCaptureOutputTool supports zoid json decode" {

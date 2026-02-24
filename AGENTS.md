@@ -118,6 +118,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - Filesystem/tool/Lua/jobs path outputs should use workspace-absolute `/...` paths for user-facing JSON/tables/CLI output instead of host filesystem absolute paths.
   - `zoid.dir(path):grep(pattern, [options])` uses the same workspace sandbox/path rules as filesystem tools and supports `options.recursive` (default `true`) and `options.max_matches` (default `200`, max `5000`).
   - `zoid.uri(uri)` allows only HTTP/HTTPS requests and returns a Lua table with `status`, `body`, and `ok`; response body capture is capped by tool policy (currently 1 MiB in `lua_execute`).
+  - Outbound HTTP tools (`zoid.uri(...)` and direct `http_*`) must reject internal destinations by default (`localhost`, loopback, private/link-local ranges including IPv6 private/link-local blocks), and should not auto-follow redirects.
   - `zoid.uri(...):get/delete/post/put` accept optional request options with `headers` table (string->string); header names/values are validated and dangerous overrides such as `Host`/`Content-Length` are rejected.
   - `zoid.json.decode` maps JSON values to Lua tables/scalars and maps JSON `null` to the sentinel `zoid.json.null`.
   - `zoid.time([table])` and `zoid.date([format[, epoch]])` provide safe time/date helpers while global `os` remains disabled; behavior is aligned with Lua `os.time`/`os.date`, including date-table normalization in `zoid.time`.
@@ -138,6 +139,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - Preserve current error contract (`LuaStateInitFailed`, `LuaLoadFailed`, `LuaRuntimeFailed`).
   - Keep Lua execution entrypoints tool-policy-only.
   - Tool-mode `zoid.jobs` API mirrors scheduler operations: `create/list/delete/pause/resume`.
+  - `zoid.exit([code])` accepts only integer exit codes in range `0..125`; out-of-range values must fail with a Lua runtime error.
 
 ### Lua script examples (`workspace/scripts/*.lua`) changes:
   - Keep scripts compatible with the `zoid` API surface (`zoid.file`, `zoid.dir`, `zoid.uri`, `zoid.config`, `zoid.jobs`, `zoid.import`, `zoid.json`, `zoid.time`, `zoid.date`, `zoid.exit`, `zoid.eprint`) and do not rely on removed globals like `os`/`package`/`require`.

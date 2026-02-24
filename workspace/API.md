@@ -179,7 +179,7 @@ Supported methods and return values:
 - `zoid.json.null` sentinel value used when decoded JSON contains `null`
 - `zoid.time([table]) -> integer` (Lua-compatible with `os.time`: `year`/`month`/`day` required, optional `hour`/`min`/`sec`/`isdst`; numeric fields are normalized by `mktime`, and table fields are updated with normalized values)
 - `zoid.date([format[, epoch]]) -> string | table` (`*t` format returns table fields `year`, `month`, `day`, `hour`, `min`, `sec`, `wday`, `yday`, optional `isdst`; `!` prefix forces UTC)
-- `zoid.exit([code]) -> never` (stops Lua script execution; defaults to exit code `0`)
+- `zoid.exit([code]) -> never` (stops Lua script execution; defaults to exit code `0`; accepted range `0..125`)
 - `zoid.eprint(...)` writes to captured `stderr` (arguments are stringified and concatenated; no automatic tab/newline)
 
 ### `error(...)` vs `zoid.exit([code])`
@@ -188,6 +188,7 @@ Supported methods and return values:
 - Use `error(...)` for unexpected failures. In tool-mode this is reported as `error: "LuaRuntimeFailed"`.
 - Use `zoid.exit([code])` for intentional early termination with an explicit exit code.
 - `zoid.exit(0)` is treated as a successful tool result (`ok: true`), while non-zero codes are reported as `error: "LuaExit"` with `exit_code` set.
+- `zoid.exit(code)` values outside `0..125` are rejected as Lua runtime errors.
 - Neither function crashes the host process. They only stop the current Lua script execution.
 
 ### APIs Removed or Disabled
@@ -283,6 +284,8 @@ Method-specific behavior:
 - Header names/values are validated (invalid bytes and dangerous headers are rejected)
 - Header limits: at most 64 headers and 16 KiB total header bytes
 - Blocked header names: `Host`, `Content-Length`, `Transfer-Encoding` (case-insensitive)
+- Internal destinations are blocked by default (`localhost`, loopback, private IPv4 ranges, link-local, and private IPv6 ranges)
+- Redirects are not automatically followed (3xx responses are returned directly)
 - Response body size is capped by sandbox policy
 
 ### Scheduler Rules

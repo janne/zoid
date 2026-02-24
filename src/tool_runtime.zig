@@ -39,6 +39,7 @@ pub const max_allowed_lua_timeout_seconds: u32 = lua_runner.max_tool_execution_t
 pub const Policy = struct {
     workspace_root: []u8,
     config_path_override: ?[]const u8 = null,
+    allow_private_http_destinations: bool = false,
 
     pub fn initForCurrentWorkspace(allocator: std.mem.Allocator) !Policy {
         const cwd = try std.process.getCwdAlloc(allocator);
@@ -139,16 +140,16 @@ pub fn executeToolCallWithContext(
         return executeScheduler(allocator, policy, request_context, arguments_json);
     }
     if (std.mem.eql(u8, tool_name, "http_get")) {
-        return executeHttpGet(allocator, arguments_json);
+        return executeHttpGet(allocator, policy, arguments_json);
     }
     if (std.mem.eql(u8, tool_name, "http_post")) {
-        return executeHttpPost(allocator, arguments_json);
+        return executeHttpPost(allocator, policy, arguments_json);
     }
     if (std.mem.eql(u8, tool_name, "http_put")) {
-        return executeHttpPut(allocator, arguments_json);
+        return executeHttpPut(allocator, policy, arguments_json);
     }
     if (std.mem.eql(u8, tool_name, "http_delete")) {
-        return executeHttpDelete(allocator, arguments_json);
+        return executeHttpDelete(allocator, policy, arguments_json);
     }
     if (std.mem.eql(u8, tool_name, "datetime_now")) {
         return executeDateTimeNow(allocator, arguments_json);
@@ -615,6 +616,7 @@ fn executeLuaExecute(
             .max_http_response_bytes = max_allowed_http_response_bytes,
             .execution_timeout_ns = lua_runner.timeoutSecondsToNanoseconds(timeout),
             .config_path_override = policy.config_path_override,
+            .allow_private_http_destinations = policy.allow_private_http_destinations,
         },
         script_args.items,
     );
@@ -935,20 +937,20 @@ fn requireStringProperty(
     };
 }
 
-fn executeHttpGet(allocator: std.mem.Allocator, arguments_json: []const u8) ![]u8 {
-    return executeHttpRequestTool(allocator, "http_get", .GET, false, arguments_json);
+fn executeHttpGet(allocator: std.mem.Allocator, policy: *const Policy, arguments_json: []const u8) ![]u8 {
+    return executeHttpRequestTool(allocator, policy, "http_get", .GET, false, arguments_json);
 }
 
-fn executeHttpPost(allocator: std.mem.Allocator, arguments_json: []const u8) ![]u8 {
-    return executeHttpRequestTool(allocator, "http_post", .POST, true, arguments_json);
+fn executeHttpPost(allocator: std.mem.Allocator, policy: *const Policy, arguments_json: []const u8) ![]u8 {
+    return executeHttpRequestTool(allocator, policy, "http_post", .POST, true, arguments_json);
 }
 
-fn executeHttpPut(allocator: std.mem.Allocator, arguments_json: []const u8) ![]u8 {
-    return executeHttpRequestTool(allocator, "http_put", .PUT, true, arguments_json);
+fn executeHttpPut(allocator: std.mem.Allocator, policy: *const Policy, arguments_json: []const u8) ![]u8 {
+    return executeHttpRequestTool(allocator, policy, "http_put", .PUT, true, arguments_json);
 }
 
-fn executeHttpDelete(allocator: std.mem.Allocator, arguments_json: []const u8) ![]u8 {
-    return executeHttpRequestTool(allocator, "http_delete", .DELETE, false, arguments_json);
+fn executeHttpDelete(allocator: std.mem.Allocator, policy: *const Policy, arguments_json: []const u8) ![]u8 {
+    return executeHttpRequestTool(allocator, policy, "http_delete", .DELETE, false, arguments_json);
 }
 
 fn executeDateTimeNow(allocator: std.mem.Allocator, arguments_json: []const u8) ![]u8 {
@@ -993,6 +995,7 @@ fn executeDateTimeNow(allocator: std.mem.Allocator, arguments_json: []const u8) 
 
 fn executeHttpRequestTool(
     allocator: std.mem.Allocator,
+    policy: *const Policy,
     tool_name: []const u8,
     method: std.http.Method,
     allows_body: bool,
@@ -1027,6 +1030,7 @@ fn executeHttpRequestTool(
         payload,
         &.{},
         max_allowed_http_response_bytes,
+        policy.allow_private_http_destinations,
     );
     defer result.deinit(allocator);
 
@@ -2287,6 +2291,7 @@ test "http tools perform get/post/put/delete requests" {
 
     var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
     defer policy.deinit(std.testing.allocator);
+    policy.allow_private_http_destinations = true;
 
     var listen_address = try std.net.Address.parseIp4("127.0.0.1", 0);
     const server = try listen_address.listen(.{ .reuse_address = true });
@@ -2394,6 +2399,27 @@ test "http tools reject unsupported uri scheme" {
             &policy,
             "http_get",
             "{\"uri\":\"ftp://example.com/file.txt\"}",
+        ),
+    );
+}
+
+test "http tools block localhost destinations by default" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+
+    try std.testing.expectError(
+        error.DestinationNotAllowed,
+        executeToolCall(
+            std.testing.allocator,
+            &policy,
+            "http_get",
+            "{\"uri\":\"http://127.0.0.1:8080\"}",
         ),
     );
 }

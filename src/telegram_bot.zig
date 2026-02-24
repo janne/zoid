@@ -800,6 +800,7 @@ fn fetchPollBatch(
         payload,
         &headers,
         max_poll_response_bytes,
+        false,
     );
     defer response.deinit(allocator);
 
@@ -958,6 +959,7 @@ fn sendMessage(
         payload,
         &headers,
         max_send_response_bytes,
+        false,
     );
     defer response.deinit(allocator);
 
@@ -1018,6 +1020,7 @@ fn sendTypingAction(
         payload,
         &headers,
         max_send_response_bytes,
+        false,
     );
     defer response.deinit(allocator);
 

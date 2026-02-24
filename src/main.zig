@@ -467,7 +467,10 @@ fn executeLuaAsTool(
 
     const exit_code = if (root_object.get("exit_code")) |exit_value| switch (exit_value) {
         .null => null,
-        .integer => |value| @as(u8, @intCast(std.math.clamp(value, 0, 255))),
+        .integer => |value| blk: {
+            if (value < 0 or value > 255) return error.InvalidToolResult;
+            break :blk @as(u8, @intCast(value));
+        },
         else => return error.InvalidToolResult,
     } else null;
 
@@ -993,6 +996,30 @@ test "executeLuaAsTool surfaces zoid exit code" {
     try std.testing.expectEqualStrings("before\n", outcome.stdout);
     try std.testing.expectEqualStrings("", outcome.stderr);
     try std.testing.expectEqualStrings("LuaExit", outcome.error_name.?);
+}
+
+test "executeLuaAsTool rejects out-of-range zoid exit code" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script = try tmp.dir.createFile("exit_invalid.lua", .{});
+    defer script.close();
+    try script.writeAll(
+        \\zoid.exit(-1)
+        \\
+    );
+
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    var outcome = try executeLuaAsTool(std.testing.allocator, "exit_invalid.lua", &.{}, null, workspace_root);
+    defer outcome.deinit(std.testing.allocator);
+
+    try std.testing.expect(!outcome.ok);
+    try std.testing.expect(outcome.exit_code == null);
+    try std.testing.expectEqualStrings("", outcome.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, outcome.stderr, "range 0..125") != null);
+    try std.testing.expectEqualStrings("LuaRuntimeFailed", outcome.error_name.?);
 }
 
 test "executeLuaAsTool supports timeout override" {
