@@ -208,30 +208,14 @@ fn luaCapturedPrint(lua_state: ?*c.lua_State) callconv(.c) c_int {
     return 0;
 }
 
-fn luaCapturedIoWrite(lua_state: ?*c.lua_State) callconv(.c) c_int {
-    const state = lua_state orelse return 0;
-    const capture = captureFromLuaState(state) orelse return 0;
-
-    const nargs = c.lua_gettop(state);
-    var arg_idx: c_int = 1;
-    while (arg_idx <= nargs) : (arg_idx += 1) {
-        var str_len: usize = 0;
-        if (c.luaL_tolstring(state, arg_idx, &str_len)) |text_ptr| {
-            capture.appendStdoutSlice(text_ptr[0..str_len]);
-            luaPop(state, 1);
-        }
-    }
-    return 0;
-}
-
-fn luaCapturedIoStderrWrite(lua_state: ?*c.lua_State) callconv(.c) c_int {
+fn luaCapturedStderrPrint(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
     const capture = captureFromLuaState(state) orelse return 0;
 
     const nargs = c.lua_gettop(state);
     var arg_idx: c_int = 1;
     if (nargs > 0 and c.lua_type(state, 1) == c.LUA_TTABLE) {
-        // Support method-style calls: io.stderr:write("message")
+        // Support method-style calls: zoid:eprint("message")
         arg_idx = 2;
     }
 
@@ -1802,18 +1786,6 @@ fn installOutputCapture(lua_state: *c.lua_State, capture: *LuaOutputCapture) voi
 
     c.lua_pushcclosure(lua_state, luaCapturedPrint, 0);
     _ = c.lua_setglobal(lua_state, "print");
-
-    // Keep a safe io table for stdout/stderr so scripts can still emit output
-    // while all file/network/process side effects remain unavailable.
-    c.lua_newtable(lua_state);
-    c.lua_pushcclosure(lua_state, luaCapturedIoWrite, 0);
-    c.lua_setfield(lua_state, -2, "write");
-
-    c.lua_newtable(lua_state);
-    c.lua_pushcclosure(lua_state, luaCapturedIoStderrWrite, 0);
-    c.lua_setfield(lua_state, -2, "write");
-    c.lua_setfield(lua_state, -2, "stderr");
-    _ = c.lua_setglobal(lua_state, "io");
 }
 
 fn installScriptArgs(lua_state: *c.lua_State, file_path: []const u8, script_args: []const []const u8) void {
@@ -1855,18 +1827,20 @@ fn installZoidTable(lua_state: *c.lua_State, sandbox: *ToolLuaEnvironment) void 
     c.lua_setfield(lua_state, -2, "date");
     c.lua_pushcclosure(lua_state, luaZoidExit, 0);
     c.lua_setfield(lua_state, -2, "exit");
+    c.lua_pushcclosure(lua_state, luaCapturedStderrPrint, 0);
+    c.lua_setfield(lua_state, -2, "eprint");
     _ = c.lua_setglobal(lua_state, "zoid");
 }
 
-fn setGlobalNil(lua_state: *c.lua_State, name: [:0]const u8) void {
+fn setGlobalNil(lua_state: *c.lua_State, name: [*:0]const u8) void {
     c.lua_pushnil(lua_state);
-    _ = c.lua_setglobal(lua_state, name.ptr);
+    _ = c.lua_setglobal(lua_state, name);
 }
 
 fn restrictToolLuaEnvironment(lua_state: *c.lua_State, sandbox: *ToolLuaEnvironment) void {
     installZoidTable(lua_state, sandbox);
 
-    // Remove standard escape hatches; zoid.file(...), zoid.dir(...), zoid.uri(...), zoid.config(), zoid.import(...), zoid.json.decode, zoid.time, and zoid.date are sandbox APIs.
+    // Remove standard escape hatches; zoid.file(...), zoid.dir(...), zoid.uri(...), zoid.config(), zoid.import(...), zoid.json.decode, zoid.time, zoid.date, and zoid.eprint(...) are sandbox APIs.
     setGlobalNil(lua_state, "workspace");
     setGlobalNil(lua_state, "os");
     setGlobalNil(lua_state, "package");
@@ -1874,6 +1848,7 @@ fn restrictToolLuaEnvironment(lua_state: *c.lua_State, sandbox: *ToolLuaEnvironm
     setGlobalNil(lua_state, "require");
     setGlobalNil(lua_state, "dofile");
     setGlobalNil(lua_state, "loadfile");
+    setGlobalNil(lua_state, c.LUA_IOLIBNAME);
 }
 
 fn executeLuaFileCaptureOutputInternal(
@@ -2061,7 +2036,7 @@ test "executeLuaFile returns runtime error for failing script" {
     try std.testing.expectError(error.LuaRuntimeFailed, executeLuaFile(std.testing.allocator, abs_path));
 }
 
-test "executeLuaFileCaptureOutput captures print and io.write output" {
+test "executeLuaFileCaptureOutput captures print output" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2070,8 +2045,7 @@ test "executeLuaFileCaptureOutput captures print and io.write output" {
     defer file.close();
     try file.writeAll(
         \\print("hello", 123)
-        \\io.write("ab")
-        \\io.write("cd\n")
+        \\print("ab", "cd")
         \\
     );
 
@@ -2082,31 +2056,13 @@ test "executeLuaFileCaptureOutput captures print and io.write output" {
     defer output.deinit(std.testing.allocator);
 
     try std.testing.expect(output.status == .ok);
-    try std.testing.expectEqualStrings("hello\t123\nabcd\n", output.stdout);
+    try std.testing.expectEqualStrings("hello\t123\nab\tcd\n", output.stdout);
     try std.testing.expectEqualStrings("", output.stderr);
 }
 
-test "executeLuaFileCaptureOutput captures io.stderr writes and runtime errors" {
+test "executeLuaFileCaptureOutput captures runtime errors" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-
-    {
-        const file = try tmp.dir.createFile("stderr.lua", .{});
-        defer file.close();
-        try file.writeAll(
-            \\io.stderr:write("bad")
-            \\io.stderr:write(" news\n")
-            \\
-        );
-    }
-
-    const stderr_path = try tmp.dir.realpathAlloc(std.testing.allocator, "stderr.lua");
-    defer std.testing.allocator.free(stderr_path);
-    var stderr_output = try executeLuaFileCaptureOutput(std.testing.allocator, stderr_path);
-    defer stderr_output.deinit(std.testing.allocator);
-    try std.testing.expect(stderr_output.status == .ok);
-    try std.testing.expectEqualStrings("", stderr_output.stdout);
-    try std.testing.expectEqualStrings("bad news\n", stderr_output.stderr);
 
     {
         const file = try tmp.dir.createFile("boom.lua", .{});
@@ -2134,8 +2090,8 @@ test "executeLuaFileCaptureOutputTool allows zoid file read/write/delete and cap
         \\note:write("hello")
         \\print(note:read())
         \\note:delete()
-        \\io.write("tail")
-        \\io.stderr:write("warn\n")
+        \\print("tail")
+        \\zoid.eprint("warn")
         \\
     );
 
@@ -2150,7 +2106,7 @@ test "executeLuaFileCaptureOutputTool allows zoid file read/write/delete and cap
     defer output.deinit(std.testing.allocator);
 
     try std.testing.expect(output.status == .ok);
-    try std.testing.expectEqualStrings("hello\ntail", output.stdout);
+    try std.testing.expectEqualStrings("hello\ntail\n", output.stdout);
     try std.testing.expectEqualStrings("warn\n", output.stderr);
 
     const note_path = try std.fs.path.join(std.testing.allocator, &.{ workspace_root, "note.txt" });

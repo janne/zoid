@@ -117,7 +117,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - `zoid.time([table])` and `zoid.date([format[, epoch]])` provide safe time/date helpers inside sandboxed Lua while global `os` remains disabled; behavior is aligned with Lua `os.time`/`os.date`, including date-table normalization in `zoid.time`.
   - `jobs` tool supports `create/list/delete/pause/resume`; create supports `.lua` and `.md` paths with exactly one schedule input (`run_at` RFC3339 or 5-field `cron`), and does not resolve Telegram destination at create time.
   - In `telegram_bot` scheduled processing, skip agent dispatch when Lua stdout+stderr are both empty (after trim), or when markdown content is empty (after trim).
-  - Tool-mode `io` must be a minimal capture-only table (`io.write` and `io.stderr:write`) so scripts can emit stdout/stderr for agent inspection without gaining general file I/O APIs.
+  - Tool-mode routes stderr through `zoid.eprint(...)` and stdout through global `print(...)`, both captured for agent inspection without enabling general file I/O APIs.
   - `shell_command` and `exec` are intentionally disabled for OpenAI tool calls; unknown/disabled tool calls must return `error.ToolDisabled`.
   - Keep path checks strict: resolve to canonical paths and reject access outside workspace root.
 
@@ -139,3 +139,4 @@ If you change command behavior, error handling, config format, or Lua execution 
 
 ### Public module surface:
   - Keep `src/root.zig` exports aligned with intended package API.
+  - Do not export `lua_runner` from `src/root.zig`; keep Lua runner internals private to the binary/tooling modules.

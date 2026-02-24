@@ -173,6 +173,7 @@ Supported methods and return values:
 - `zoid.time([table]) -> integer` (Lua-compatible with `os.time`: `year`/`month`/`day` required, optional `hour`/`min`/`sec`/`isdst`; numeric fields are normalized by `mktime`, and table fields are updated with normalized values)
 - `zoid.date([format[, epoch]]) -> string | table` (`*t` format returns table fields `year`, `month`, `day`, `hour`, `min`, `sec`, `wday`, `yday`, optional `isdst`; `!` prefix forces UTC)
 - `zoid.exit([code]) -> never` (stops Lua script execution; defaults to exit code `0`)
+- `zoid.eprint(...)` writes to captured `stderr` (tab-separated arguments, newline appended)
 
 ### APIs Removed or Disabled
 
@@ -187,14 +188,12 @@ The following standard Lua escape hatches are removed:
 
 Use `zoid.import(path)` for sandboxed module loading instead.
 
-### `io` and `print` Behavior
+### `print` and `zoid.eprint` Behavior
 
 The output APIs are replaced to capture script output safely:
 
 - `print(...)` is captured to `stdout` (tab-separated arguments, newline appended)
-- `io.write(...)` is captured to `stdout`
-- `io.stderr:write(...)` is captured to `stderr`
-- Other standard `io` functions are not available
+- `zoid.eprint(...)` is captured to `stderr` (tab-separated arguments, newline appended)
 
 Captured streams are returned in tool JSON fields (`stdout`, `stderr`) instead of writing directly to terminal stdout/stderr. Tool-mode results also include `exit_code` (`null` unless the script called `zoid.exit`).
 

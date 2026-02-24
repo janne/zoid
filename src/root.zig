@@ -4,7 +4,6 @@ pub const cron_adapter = @import("cron_adapter.zig");
 pub const config_keys = @import("config_keys.zig");
 pub const config_runtime = @import("config_runtime.zig");
 pub const config_store = @import("config_store.zig");
-pub const lua_runner = @import("lua_runner.zig");
 pub const model_catalog = @import("model_catalog.zig");
 pub const openai_client = @import("openai_client.zig");
 pub const scheduler_runtime = @import("scheduler_runtime.zig");

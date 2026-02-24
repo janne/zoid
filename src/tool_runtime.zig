@@ -2078,7 +2078,7 @@ test "lua execute reports runtime failure and stderr output" {
     const file = try tmp.dir.createFile("fail.lua", .{});
     defer file.close();
     try file.writeAll(
-        \\io.stderr:write("before boom\n")
+        \\zoid.eprint("before boom")
         \\error("boom")
         \\
     );
