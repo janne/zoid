@@ -221,7 +221,7 @@ pub fn printHelp() void {
         \\  Show this help message.
         \\
         \\zoid execute [--timeout <seconds>] <file.lua> [args...]
-        \\  Executes the Lua script at <file.lua>, forwards [args...] to Lua `arg`, and enforces timeout (default 10s) in seconds.
+        \\  Executes <file.lua> (relative path or /path from workspace root), forwards [args...] to Lua `arg`, and enforces timeout (default 10s) in seconds.
         \\
         \\zoid run <prompt...>
         \\  Sends a single prompt to OpenAI and writes the response to stdout.
@@ -233,10 +233,10 @@ pub fn printHelp() void {
         \\  Starts long-running service mode.
         \\
         \\zoid jobs create <path.lua|path.md> (--run-at <rfc3339> | --cron "<min hour dom mon dow>")
-        \\  Creates a scheduled job and infers type from file extension.
+        \\  Creates a scheduled job from a relative path or /path under workspace root and infers type from file extension.
         \\
         \\zoid jobs list
-        \\  Lists scheduled jobs.
+        \\  Lists scheduled jobs with workspace-absolute paths (/...).
         \\
         \\zoid jobs delete <job_id>
         \\  Deletes a scheduled job.

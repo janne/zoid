@@ -48,6 +48,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - `zoid jobs create` takes a single path argument and infers job type from extension: `.lua` or `.md`.
   - Scheduler job ids are short random 5-character base36 strings; generation retries under scheduler lock to avoid collisions.
   - `zoid jobs list` renders a compact single-line table (`JOB ST TYPE NEXT SCHEDULE LAST PATH`); `JOB` is the job id.
+  - Workspace paths accept both relative paths and leading-slash workspace-absolute paths (`/path/from/workspace/root`) for `zoid execute` and `zoid jobs create`; `zoid jobs list` prints paths in this workspace-absolute `/...` format.
   - `zoid execute <file.lua> [args...]` must forward extra positional args to Lua global `arg` (`arg[0]` script path, `arg[1..]` forwarded args).
   - `zoid execute` supports optional `--timeout <seconds>` before `<file.lua>` to override Lua runtime timeout for that invocation.
   - `zoid execute <file.lua>` must use the same sandbox restrictions and `.lua` path policy as `lua_execute` so local script runs match tool-mode behavior.
@@ -91,6 +92,7 @@ If you change command behavior, error handling, config format, or Lua execution 
 ### Tool runtime changes:
   - `src/tool_runtime.zig` enforces `workspace-write` policy rooted at current working directory and exposes `filesystem_read`, `filesystem_list`, `filesystem_grep`, `filesystem_write`, `filesystem_mkdir`, `filesystem_rmdir`, `filesystem_delete`, `lua_execute`, `config`, `jobs`, `http_get`, `http_post`, `http_put`, `http_delete`, and `datetime_now`.
   - Shared filesystem sandbox/path enforcement and metadata/listing logic lives in `src/workspace_fs.zig`; both `lua_execute` (`zoid.file(...)` / `zoid.dir(...)`) and direct filesystem tools must use this module.
+  - In workspace path APIs, a leading `/` means workspace root (not filesystem root); canonical filesystem absolute paths are only accepted when already inside workspace root.
   - Shared outbound HTTP request behavior lives in `src/http_client.zig`; both `lua_execute` (`zoid.uri(...)`) and direct HTTP tools must use this module to avoid divergence.
   - Shared config mutation/read behavior lives in `src/config_runtime.zig`; both `lua_execute` (`zoid.config():list/get/set/unset`) and direct `config` tool calls must use this module to avoid divergence.
   - `filesystem_mkdir` creates one directory whose canonical path resolves inside workspace root and fails if it already exists.
@@ -107,6 +109,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - `zoid.exit([code])` must stop only the current Lua script execution and never terminate the hosting `zoid` process; tool JSON should surface `exit_code` and report non-zero exits as `LuaExit`.
   - `zoid.dir(path):create()` must fail when the target directory already exists, and `zoid.dir(path):remove()` must fail when the target directory is non-empty.
   - `filesystem_grep` searches file content under a workspace path with optional recursion and match limits; tool result includes match path/line/column/text, files scanned, and truncation status.
+  - Filesystem/tool/Lua/jobs path outputs should use workspace-absolute `/...` paths for user-facing JSON/tables/CLI output instead of host filesystem absolute paths.
   - `zoid.dir(path):grep(pattern, [options])` uses the same workspace sandbox/path rules as filesystem tools and supports `options.recursive` (default `true`) and `options.max_matches` (default `200`, max `5000`).
   - `zoid.uri(uri)` allows only HTTP/HTTPS requests and returns a Lua table with `status`, `body`, and `ok`; response body capture is capped by sandbox policy (currently 1 MiB in `lua_execute`).
   - `zoid.uri(...):get/delete/post/put` accept optional request options with `headers` table (string->string); header names/values are validated and dangerous overrides such as `Host`/`Content-Length` are rejected.

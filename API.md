@@ -29,7 +29,7 @@ Lua run through Zoid has a `zoid` global with:
 File example:
 
 ```lua
-local f = zoid.file("notes.txt")
+local f = zoid.file("/notes.txt")
 print(f.name, f.path, f.type, f.size, f.mode, f.owner, f.group, f.modified_at)
 f:write("hello")
 local content = f:read()
@@ -39,7 +39,7 @@ local ok = f:delete()
 Directory example:
 
 ```lua
-local dir = zoid.dir("logs")
+local dir = zoid.dir("/logs")
 print(dir.name, dir.path, dir.type, dir.modified_at)
 dir:create()
 for _, entry in ipairs(dir:list()) do
@@ -220,7 +220,7 @@ For tool-mode `lua_execute`, positional arguments can be supplied with optional 
 
 ```json
 {
-  "path": "scripts/example.lua",
+  "path": "/scripts/example.lua",
   "args": ["one", "two"],
   "timeout": 30
 }
@@ -233,8 +233,10 @@ For tool-mode `lua_execute`, positional arguments can be supplied with optional 
 All `zoid.file(path)` and `zoid.dir(path)` operations are enforced to stay inside workspace root:
 
 - Relative paths are resolved from workspace root
-- Absolute paths are allowed only if they resolve inside workspace root
+- Paths beginning with `/` are resolved from workspace root (for example `/ZOID.md`)
+- Canonical absolute filesystem paths are accepted when they already resolve inside workspace root
 - Canonical path checks block traversal outside root (for example `../outside.txt`)
+- Returned metadata paths (`path`) use workspace-absolute format (`/...`)
 
 Method-specific behavior:
 
@@ -276,6 +278,7 @@ Method-specific behavior:
 - exactly one schedule input is required: `run_at` (RFC3339) or `cron` (5-field cron)
 - no Telegram destination is resolved at create time
 - destination is resolved when the job runs: Telegram DM (if available), otherwise the reply is dropped
+- returned `job.path` values use workspace-absolute format (`/...`)
 
 ### Read Limits
 

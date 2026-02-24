@@ -485,9 +485,31 @@ fn toCandidatePath(
 ) ![]u8 {
     if (requested_path.len == 0) return error.InvalidToolArguments;
     if (std.fs.path.isAbsolute(requested_path)) {
-        return allocator.dupe(u8, requested_path);
+        if (isPathInsideWorkspace(workspace_root, requested_path)) {
+            return allocator.dupe(u8, requested_path);
+        }
+
+        const trimmed_path = std.mem.trimLeft(u8, requested_path, "/\\");
+        if (trimmed_path.len == 0) return allocator.dupe(u8, workspace_root);
+        return std.fs.path.join(allocator, &.{ workspace_root, trimmed_path });
     }
     return std.fs.path.join(allocator, &.{ workspace_root, requested_path });
+}
+
+pub fn toWorkspaceAbsolutePath(
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    resolved_path: []const u8,
+) ![]u8 {
+    if (!isPathInsideWorkspace(workspace_root, resolved_path)) return error.PathNotAllowed;
+
+    const relative_path = try std.fs.path.relative(allocator, workspace_root, resolved_path);
+    defer allocator.free(relative_path);
+
+    if (relative_path.len == 0 or std.mem.eql(u8, relative_path, ".")) {
+        return allocator.dupe(u8, "/");
+    }
+    return std.fmt.allocPrint(allocator, "/{s}", .{relative_path});
 }
 
 fn isPathInsideWorkspace(workspace_root: []const u8, candidate_path: []const u8) bool {
@@ -829,4 +851,27 @@ test "grep supports recursive and non-recursive search" {
     try std.testing.expect(!recursive.truncated);
     try std.testing.expectEqualStrings("deep.txt", std.fs.path.basename(recursive.matches[0].path));
     try std.testing.expectEqualStrings("top.txt", std.fs.path.basename(recursive.matches[1].path));
+}
+
+test "workspace absolute path resolves from workspace root" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const file = try tmp.dir.createFile("ZOID.md", .{});
+        defer file.close();
+        try file.writeAll("instructions");
+    }
+
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    const resolved = try resolveAllowedReadPath(std.testing.allocator, workspace_root, "/ZOID.md");
+    defer std.testing.allocator.free(resolved);
+    try std.testing.expect(std.mem.startsWith(u8, resolved, workspace_root));
+    try std.testing.expect(std.mem.endsWith(u8, resolved, "ZOID.md"));
+
+    const workspace_absolute = try toWorkspaceAbsolutePath(std.testing.allocator, workspace_root, resolved);
+    defer std.testing.allocator.free(workspace_absolute);
+    try std.testing.expectEqualStrings("/ZOID.md", workspace_absolute);
 }

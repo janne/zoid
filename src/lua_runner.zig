@@ -351,11 +351,11 @@ fn pushLuaJsonValue(state: *c.lua_State, value: std.json.Value, depth: usize) !v
     }
 }
 
-fn setLuaMetadataFields(state: *c.lua_State, metadata: *const workspace_fs.PathMetadata) void {
+fn setLuaMetadataFields(state: *c.lua_State, metadata: *const workspace_fs.PathMetadata, workspace_path: []const u8) void {
     _ = c.lua_pushlstring(state, metadata.name.ptr, metadata.name.len);
     c.lua_setfield(state, -2, "name");
 
-    _ = c.lua_pushlstring(state, metadata.path.ptr, metadata.path.len);
+    _ = c.lua_pushlstring(state, workspace_path.ptr, workspace_path.len);
     c.lua_setfield(state, -2, "path");
 
     const type_name = workspace_fs.entryTypeToString(metadata.entry_type);
@@ -507,10 +507,19 @@ fn luaZoidFile(lua_state: ?*c.lua_State) callconv(.c) c_int {
     };
     defer metadata.deinit(env.allocator);
 
+    const workspace_path = workspace_fs.toWorkspaceAbsolutePath(
+        env.allocator,
+        env.workspace_root,
+        metadata.path,
+    ) catch |err| {
+        return pushLuaErrorMessage(state, "zoid.file(path) failed: {s}", .{@errorName(err)});
+    };
+    defer env.allocator.free(workspace_path);
+
     c.lua_newtable(state);
-    _ = c.lua_pushlstring(state, metadata.path.ptr, metadata.path.len);
+    _ = c.lua_pushlstring(state, workspace_path.ptr, workspace_path.len);
     c.lua_setfield(state, -2, "_path");
-    setLuaMetadataFields(state, &metadata);
+    setLuaMetadataFields(state, &metadata, workspace_path);
 
     c.lua_pushcclosure(state, luaZoidFileRead, 0);
     c.lua_setfield(state, -2, "read");
@@ -546,9 +555,18 @@ fn luaZoidDirList(lua_state: ?*c.lua_State) callconv(.c) c_int {
 
     c.lua_newtable(state);
     for (list_result.entries, 0..) |entry, index| {
+        const workspace_path = workspace_fs.toWorkspaceAbsolutePath(
+            env.allocator,
+            env.workspace_root,
+            entry.path,
+        ) catch |err| {
+            return pushLuaErrorMessage(state, "zoid.dir(path):list failed: {s}", .{@errorName(err)});
+        };
+        defer env.allocator.free(workspace_path);
+
         c.lua_pushinteger(state, @intCast(index + 1));
         c.lua_newtable(state);
-        setLuaMetadataFields(state, &entry);
+        setLuaMetadataFields(state, &entry, workspace_path);
         c.lua_settable(state, -3);
     }
     return 1;
@@ -702,10 +720,19 @@ fn luaZoidDirGrep(lua_state: ?*c.lua_State) callconv(.c) c_int {
 
     c.lua_newtable(state);
     for (grep_result.matches, 0..) |match, index| {
+        const workspace_path = workspace_fs.toWorkspaceAbsolutePath(
+            env.allocator,
+            env.workspace_root,
+            match.path,
+        ) catch |err| {
+            return pushLuaErrorMessage(state, "zoid.dir(path):grep failed: {s}", .{@errorName(err)});
+        };
+        defer env.allocator.free(workspace_path);
+
         c.lua_pushinteger(state, @intCast(index + 1));
         c.lua_newtable(state);
 
-        _ = c.lua_pushlstring(state, match.path.ptr, match.path.len);
+        _ = c.lua_pushlstring(state, workspace_path.ptr, workspace_path.len);
         c.lua_setfield(state, -2, "path");
 
         c.lua_pushinteger(state, @intCast(match.line));
@@ -745,10 +772,19 @@ fn luaZoidDir(lua_state: ?*c.lua_State) callconv(.c) c_int {
         return pushLuaErrorMessage(state, "zoid.dir(path) failed: NotDir", .{});
     }
 
+    const workspace_path = workspace_fs.toWorkspaceAbsolutePath(
+        env.allocator,
+        env.workspace_root,
+        metadata.path,
+    ) catch |err| {
+        return pushLuaErrorMessage(state, "zoid.dir(path) failed: {s}", .{@errorName(err)});
+    };
+    defer env.allocator.free(workspace_path);
+
     c.lua_newtable(state);
-    _ = c.lua_pushlstring(state, metadata.path.ptr, metadata.path.len);
+    _ = c.lua_pushlstring(state, workspace_path.ptr, workspace_path.len);
     c.lua_setfield(state, -2, "_path");
-    setLuaMetadataFields(state, &metadata);
+    setLuaMetadataFields(state, &metadata, workspace_path);
 
     c.lua_pushcclosure(state, luaZoidDirList, 0);
     c.lua_setfield(state, -2, "list");
@@ -1254,7 +1290,15 @@ fn luaZoidConfig(lua_state: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-fn pushLuaSchedulerJobTable(state: *c.lua_State, job: *const scheduler_store.Job) void {
+fn pushLuaSchedulerJobTable(
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    state: *c.lua_State,
+    job: *const scheduler_store.Job,
+) !void {
+    const workspace_path = try workspace_fs.toWorkspaceAbsolutePath(allocator, workspace_root, job.path);
+    defer allocator.free(workspace_path);
+
     c.lua_newtable(state);
 
     _ = c.lua_pushlstring(state, job.id.ptr, job.id.len);
@@ -1264,7 +1308,7 @@ fn pushLuaSchedulerJobTable(state: *c.lua_State, job: *const scheduler_store.Job
     _ = c.lua_pushlstring(state, job_type.ptr, job_type.len);
     c.lua_setfield(state, -2, "job_type");
 
-    _ = c.lua_pushlstring(state, job.path.ptr, job.path.len);
+    _ = c.lua_pushlstring(state, workspace_path.ptr, workspace_path.len);
     c.lua_setfield(state, -2, "path");
 
     c.lua_pushboolean(state, if (job.paused) 1 else 0);
@@ -1394,7 +1438,9 @@ fn luaZoidJobsCreate(lua_state: ?*c.lua_State) callconv(.c) c_int {
     };
     defer job.deinit(env.allocator);
 
-    pushLuaSchedulerJobTable(state, &job);
+    pushLuaSchedulerJobTable(env.allocator, env.workspace_root, state, &job) catch |err| {
+        return pushLuaErrorMessage(state, "zoid.jobs.create failed: {s}", .{@errorName(err)});
+    };
     return 1;
 }
 
@@ -1413,7 +1459,9 @@ fn luaZoidJobsList(lua_state: ?*c.lua_State) callconv(.c) c_int {
     c.lua_newtable(state);
     for (jobs, 0..) |job, index| {
         c.lua_pushinteger(state, @intCast(index + 1));
-        pushLuaSchedulerJobTable(state, &job);
+        pushLuaSchedulerJobTable(env.allocator, env.workspace_root, state, &job) catch |err| {
+            return pushLuaErrorMessage(state, "zoid.jobs.list failed: {s}", .{@errorName(err)});
+        };
         c.lua_settable(state, -3);
     }
     return 1;
@@ -2250,12 +2298,12 @@ test "executeLuaFileCaptureOutputTool exposes file metadata and dir listing" {
     const script = try tmp.dir.createFile(file_path, .{});
     defer script.close();
     try script.writeAll(
-        \\local note = zoid.file("data/a.txt")
-        \\print("file_meta", note.name, note.type, note.size == 5, #note.mode == 4, #note.owner > 0, #note.group > 0, string.sub(note.modified_at, -1) == "Z")
-        \\local dir = zoid.dir("data")
-        \\print("dir_meta", dir.name, dir.type, #dir.mode == 4, #dir.owner > 0, #dir.group > 0)
+        \\local note = zoid.file("/data/a.txt")
+        \\print("file_meta", note.path, note.name, note.type, note.size == 5, #note.mode == 4, #note.owner > 0, #note.group > 0, string.sub(note.modified_at, -1) == "Z")
+        \\local dir = zoid.dir("/data")
+        \\print("dir_meta", dir.path, dir.name, dir.type, #dir.mode == 4, #dir.owner > 0, #dir.group > 0)
         \\local entries = dir:list()
-        \\print("entries", #entries, entries[1].name, entries[1].type, entries[2].name, entries[2].type)
+        \\print("entries", #entries, entries[1].path, entries[1].name, entries[1].type, entries[2].path, entries[2].name, entries[2].type)
         \\
     );
 
@@ -2271,9 +2319,9 @@ test "executeLuaFileCaptureOutputTool exposes file metadata and dir listing" {
 
     try std.testing.expect(output.status == .ok);
     try std.testing.expectEqualStrings(
-        "file_meta\ta.txt\tfile\ttrue\ttrue\ttrue\ttrue\ttrue\n" ++
-            "dir_meta\tdata\tdirectory\ttrue\ttrue\ttrue\n" ++
-            "entries\t2\ta.txt\tfile\tz-sub\tdirectory\n",
+        "file_meta\t/data/a.txt\ta.txt\tfile\ttrue\ttrue\ttrue\ttrue\ttrue\n" ++
+            "dir_meta\t/data\tdata\tdirectory\ttrue\ttrue\ttrue\n" ++
+            "entries\t2\t/data/a.txt\ta.txt\tfile\t/data/z-sub\tz-sub\tdirectory\n",
         output.stdout,
     );
     try std.testing.expectEqualStrings("", output.stderr);
@@ -3120,6 +3168,8 @@ test "executeLuaFileCaptureOutputTool supports zoid jobs api" {
         \\  run_at = "2026-01-10T10:00:00Z"
         \\})
         \\print(created.job_type)
+        \\print(created.path)
+        \\print(zoid.jobs.list()[1].path)
         \\print(#zoid.jobs.list())
         \\print(zoid.jobs.pause(created.id))
         \\print(zoid.jobs.resume(created.id))
@@ -3140,7 +3190,7 @@ test "executeLuaFileCaptureOutputTool supports zoid jobs api" {
 
     try std.testing.expect(output.status == .ok);
     try std.testing.expectEqualStrings(
-        "markdown\n1\ntrue\ntrue\ntrue\n0\n",
+        "markdown\n/note.md\n/note.md\n1\ntrue\ntrue\ntrue\n0\n",
         output.stdout,
     );
     try std.testing.expectEqualStrings("", output.stderr);

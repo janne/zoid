@@ -204,7 +204,7 @@ pub fn main() !void {
                     };
                     defer created.deinit(allocator);
 
-                    try printScheduleJob(allocator, &created);
+                    try printScheduleJob(allocator, workspace_root, &created);
                 },
                 .list => {
                     const jobs = zoid.scheduler_runtime.listJobs(allocator, scheduler_context) catch |err| {
@@ -605,7 +605,12 @@ fn formatScheduleJobList(
         errdefer allocator.free(last_run);
 
         const relative_path = try std.fs.path.relative(allocator, workspace_root, job.path);
-        errdefer allocator.free(relative_path);
+        const workspace_absolute_path = if (relative_path.len == 0 or std.mem.eql(u8, relative_path, "."))
+            try allocator.dupe(u8, "/")
+        else
+            try std.fmt.allocPrint(allocator, "/{s}", .{relative_path});
+        allocator.free(relative_path);
+        errdefer allocator.free(workspace_absolute_path);
 
         const row: JobListRow = .{
             .id = job.id,
@@ -614,7 +619,7 @@ fn formatScheduleJobList(
             .next_run = next_run,
             .schedule = schedule,
             .last_run = last_run,
-            .path = relative_path,
+            .path = workspace_absolute_path,
         };
 
         id_width = @max(id_width, row.id.len);
@@ -760,11 +765,23 @@ fn sortJobsForList(_: void, a: zoid.scheduler_store.Job, b: zoid.scheduler_store
     return std.mem.order(u8, a.id, b.id) == .lt;
 }
 
-fn printScheduleJob(allocator: std.mem.Allocator, job: *const zoid.scheduler_store.Job) !void {
+fn printScheduleJob(
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    job: *const zoid.scheduler_store.Job,
+) !void {
+    const relative_path = try std.fs.path.relative(allocator, workspace_root, job.path);
+    defer allocator.free(relative_path);
+    const workspace_absolute_path = if (relative_path.len == 0 or std.mem.eql(u8, relative_path, "."))
+        try allocator.dupe(u8, "/")
+    else
+        try std.fmt.allocPrint(allocator, "/{s}", .{relative_path});
+    defer allocator.free(workspace_absolute_path);
+
     const line1 = try std.fmt.allocPrint(allocator, "id={s} type={s} path={s} paused={}\n", .{
         job.id,
         zoid.scheduler_store.jobTypeToString(job.job_type),
-        job.path,
+        workspace_absolute_path,
         job.paused,
     });
     defer allocator.free(line1);
@@ -843,8 +860,8 @@ test "formatScheduleJobList renders ps-like columns" {
     try std.testing.expect(std.mem.indexOf(u8, header, "LAST") != null);
     try std.testing.expect(std.mem.indexOf(u8, header, "PATH") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "cron:0 21 * * *") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "first.lua") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "second.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "/first.lua") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "/second.md") != null);
 }
 
 test "executeLuaAsTool runs script with lua_execute sandbox policy" {
@@ -875,6 +892,26 @@ test "executeLuaAsTool runs script with lua_execute sandbox policy" {
     const note_path = try std.fs.path.join(std.testing.allocator, &.{ workspace_root, "note.txt" });
     defer std.testing.allocator.free(note_path);
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(note_path, .{}));
+}
+
+test "executeLuaAsTool accepts workspace absolute script path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script = try tmp.dir.createFile("abs.lua", .{});
+    defer script.close();
+    try script.writeAll("print('ok')\n");
+
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    var outcome = try executeLuaAsTool(std.testing.allocator, "/abs.lua", &.{}, null, workspace_root);
+    defer outcome.deinit(std.testing.allocator);
+
+    try std.testing.expect(outcome.ok);
+    try std.testing.expectEqualStrings("ok\n", outcome.stdout);
+    try std.testing.expectEqualStrings("", outcome.stderr);
+    try std.testing.expect(outcome.error_name == null);
 }
 
 test "executeLuaAsTool rejects traversal outside workspace root" {

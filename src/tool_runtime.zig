@@ -212,7 +212,7 @@ fn executeFilesystemRead(
 
     const writer = &output.writer;
     try writer.writeAll("{\"ok\":true,\"tool\":\"filesystem_read\",\"path\":");
-    try writeJsonString(allocator, writer, read_result.path);
+    try writeWorkspacePathJson(allocator, writer, policy.workspace_root, read_result.path);
     try writer.writeAll(",\"content\":");
     try writeJsonString(allocator, writer, read_result.content);
     try writer.writeAll("}");
@@ -256,7 +256,7 @@ fn executeFilesystemWrite(
 
     const writer = &output.writer;
     try writer.writeAll("{\"ok\":true,\"tool\":\"filesystem_write\",\"path\":");
-    try writeJsonString(allocator, writer, write_result.path);
+    try writeWorkspacePathJson(allocator, writer, policy.workspace_root, write_result.path);
     try writer.writeAll(",\"bytes_written\":");
     try writer.print("{d}", .{write_result.bytes_written});
     try writer.writeAll("}");
@@ -297,11 +297,11 @@ fn executeFilesystemList(
 
     const writer = &output.writer;
     try writer.writeAll("{\"ok\":true,\"tool\":\"filesystem_list\",\"path\":");
-    try writeJsonString(allocator, writer, list_result.path);
+    try writeWorkspacePathJson(allocator, writer, policy.workspace_root, list_result.path);
     try writer.writeAll(",\"entries\":[");
     for (list_result.entries, 0..) |entry, index| {
         if (index != 0) try writer.writeAll(",");
-        try writePathMetadataJson(allocator, writer, &entry);
+        try writePathMetadataJson(allocator, writer, policy.workspace_root, &entry);
     }
     try writer.writeAll("]}");
 
@@ -338,7 +338,7 @@ fn executeFilesystemMkdir(
 
     const writer = &output.writer;
     try writer.writeAll("{\"ok\":true,\"tool\":\"filesystem_mkdir\",\"path\":");
-    try writeJsonString(allocator, writer, mkdir_result.path);
+    try writeWorkspacePathJson(allocator, writer, policy.workspace_root, mkdir_result.path);
     try writer.writeAll(",\"created\":true}");
 
     return output.toOwnedSlice();
@@ -374,7 +374,7 @@ fn executeFilesystemRmdir(
 
     const writer = &output.writer;
     try writer.writeAll("{\"ok\":true,\"tool\":\"filesystem_rmdir\",\"path\":");
-    try writeJsonString(allocator, writer, rmdir_result.path);
+    try writeWorkspacePathJson(allocator, writer, policy.workspace_root, rmdir_result.path);
     try writer.writeAll(",\"removed\":true}");
 
     return output.toOwnedSlice();
@@ -410,7 +410,7 @@ fn executeFilesystemDelete(
 
     const writer = &output.writer;
     try writer.writeAll("{\"ok\":true,\"tool\":\"filesystem_delete\",\"path\":");
-    try writeJsonString(allocator, writer, delete_result.path);
+    try writeWorkspacePathJson(allocator, writer, policy.workspace_root, delete_result.path);
     try writer.writeAll(",\"deleted\":true}");
 
     return output.toOwnedSlice();
@@ -478,7 +478,7 @@ fn executeFilesystemGrep(
 
     const writer = &output.writer;
     try writer.writeAll("{\"ok\":true,\"tool\":\"filesystem_grep\",\"path\":");
-    try writeJsonString(allocator, writer, grep_result.path);
+    try writeWorkspacePathJson(allocator, writer, policy.workspace_root, grep_result.path);
     try writer.writeAll(",\"pattern\":");
     try writeJsonString(allocator, writer, pattern);
     try writer.writeAll(",\"recursive\":");
@@ -490,7 +490,7 @@ fn executeFilesystemGrep(
     try writer.writeAll(",\"matches\":[");
     for (grep_result.matches, 0..) |match, index| {
         if (index != 0) try writer.writeAll(",");
-        try writeGrepMatchJson(allocator, writer, &match);
+        try writeGrepMatchJson(allocator, writer, policy.workspace_root, &match);
     }
     try writer.writeAll("]}");
 
@@ -500,12 +500,16 @@ fn executeFilesystemGrep(
 fn writePathMetadataJson(
     allocator: std.mem.Allocator,
     writer: *std.Io.Writer,
+    workspace_root: []const u8,
     metadata: *const workspace_fs.PathMetadata,
 ) !void {
+    const workspace_path = try workspace_fs.toWorkspaceAbsolutePath(allocator, workspace_root, metadata.path);
+    defer allocator.free(workspace_path);
+
     try writer.writeAll("{\"name\":");
     try writeJsonString(allocator, writer, metadata.name);
     try writer.writeAll(",\"path\":");
-    try writeJsonString(allocator, writer, metadata.path);
+    try writeJsonString(allocator, writer, workspace_path);
     try writer.writeAll(",\"type\":");
     try writeJsonString(allocator, writer, workspace_fs.entryTypeToString(metadata.entry_type));
     try writer.writeAll(",\"size\":");
@@ -524,10 +528,14 @@ fn writePathMetadataJson(
 fn writeGrepMatchJson(
     allocator: std.mem.Allocator,
     writer: *std.Io.Writer,
+    workspace_root: []const u8,
     match: *const workspace_fs.GrepMatch,
 ) !void {
+    const workspace_path = try workspace_fs.toWorkspaceAbsolutePath(allocator, workspace_root, match.path);
+    defer allocator.free(workspace_path);
+
     try writer.writeAll("{\"path\":");
-    try writeJsonString(allocator, writer, match.path);
+    try writeJsonString(allocator, writer, workspace_path);
     try writer.writeAll(",\"line\":");
     try writer.print("{d}", .{match.line});
     try writer.writeAll(",\"column\":");
@@ -624,7 +632,7 @@ fn executeLuaExecute(
     try writer.writeAll("{\"ok\":");
     try writer.writeAll(if (ok) "true" else "false");
     try writer.writeAll(",\"tool\":\"lua_execute\",\"path\":");
-    try writeJsonString(allocator, writer, resolved_path);
+    try writeWorkspacePathJson(allocator, writer, policy.workspace_root, resolved_path);
     try writer.writeAll(",\"stdout\":");
     try writeJsonString(allocator, writer, execution.stdout);
     try writer.writeAll(",\"stderr\":");
@@ -824,7 +832,7 @@ fn executeScheduler(
         defer created.deinit(allocator);
 
         try writer.writeAll("{\"ok\":true,\"tool\":\"jobs\",\"action\":\"create\",\"job\":");
-        try writeSchedulerJobJson(allocator, writer, &created);
+        try writeSchedulerJobJson(allocator, writer, policy.workspace_root, &created);
         try writer.writeAll("}");
         return output.toOwnedSlice();
     }
@@ -836,7 +844,7 @@ fn executeScheduler(
         try writer.writeAll("{\"ok\":true,\"tool\":\"jobs\",\"action\":\"list\",\"jobs\":[");
         for (jobs, 0..) |*job, index| {
             if (index > 0) try writer.writeAll(",");
-            try writeSchedulerJobJson(allocator, writer, job);
+            try writeSchedulerJobJson(allocator, writer, policy.workspace_root, job);
         }
         try writer.writeAll("]}");
         return output.toOwnedSlice();
@@ -881,14 +889,18 @@ fn executeScheduler(
 fn writeSchedulerJobJson(
     allocator: std.mem.Allocator,
     writer: *std.Io.Writer,
+    workspace_root: []const u8,
     job: *const scheduler_store.Job,
 ) !void {
+    const workspace_path = try workspace_fs.toWorkspaceAbsolutePath(allocator, workspace_root, job.path);
+    defer allocator.free(workspace_path);
+
     try writer.writeAll("{\"id\":");
     try writeJsonString(allocator, writer, job.id);
     try writer.writeAll(",\"job_type\":");
     try writeJsonString(allocator, writer, scheduler_store.jobTypeToString(job.job_type));
     try writer.writeAll(",\"path\":");
-    try writeJsonString(allocator, writer, job.path);
+    try writeJsonString(allocator, writer, workspace_path);
     try writer.writeAll(",\"paused\":");
     try writer.writeAll(if (job.paused) "true" else "false");
     try writer.writeAll(",\"run_at\":");
@@ -1073,6 +1085,17 @@ fn writeJsonString(allocator: std.mem.Allocator, writer: *std.Io.Writer, value: 
     try writer.writeAll(escaped);
 }
 
+fn writeWorkspacePathJson(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    workspace_root: []const u8,
+    resolved_path: []const u8,
+) !void {
+    const workspace_path = try workspace_fs.toWorkspaceAbsolutePath(allocator, workspace_root, resolved_path);
+    defer allocator.free(workspace_path);
+    try writeJsonString(allocator, writer, workspace_path);
+}
+
 test "buildPolicyJson emits required fields" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1159,6 +1182,8 @@ test "jobs tool can create and list jobs" {
     try std.testing.expect(create_object.get("ok").?.bool);
     try std.testing.expectEqualStrings("jobs", create_object.get("tool").?.string);
     try std.testing.expectEqualStrings("create", create_object.get("action").?.string);
+    const created_job = create_object.get("job").?.object;
+    try std.testing.expectEqualStrings("/task.lua", created_job.get("path").?.string);
 
     const list_result = try executeToolCallWithContext(
         std.testing.allocator,
@@ -1174,6 +1199,7 @@ test "jobs tool can create and list jobs" {
     const list_object = parsed_list.value.object;
     const jobs = list_object.get("jobs").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), jobs.len);
+    try std.testing.expectEqualStrings("/task.lua", jobs[0].object.get("path").?.string);
 }
 
 test "filesystem write and read stay within workspace root" {
@@ -1190,15 +1216,20 @@ test "filesystem write and read stay within workspace root" {
         std.testing.allocator,
         &policy,
         "filesystem_write",
-        "{\"path\":\"notes.txt\",\"content\":\"hello\"}",
+        "{\"path\":\"/notes.txt\",\"content\":\"hello\"}",
     );
     defer std.testing.allocator.free(write_result);
+
+    var parsed_write = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, write_result, .{});
+    defer parsed_write.deinit();
+    const write_object = parsed_write.value.object;
+    try std.testing.expectEqualStrings("/notes.txt", write_object.get("path").?.string);
 
     const read_result = try executeToolCall(
         std.testing.allocator,
         &policy,
         "filesystem_read",
-        "{\"path\":\"notes.txt\"}",
+        "{\"path\":\"/notes.txt\"}",
     );
     defer std.testing.allocator.free(read_result);
 
@@ -1380,11 +1411,12 @@ test "filesystem list returns metadata entries" {
     const root_object = parsed.value.object;
     try std.testing.expect(root_object.get("ok").?.bool);
     try std.testing.expectEqualStrings("filesystem_list", root_object.get("tool").?.string);
-    try std.testing.expectEqualStrings(tmp_path, root_object.get("path").?.string);
+    try std.testing.expectEqualStrings("/", root_object.get("path").?.string);
 
     const entries = root_object.get("entries").?.array.items;
     try std.testing.expectEqual(@as(usize, 2), entries.len);
     try std.testing.expectEqualStrings("alpha.txt", entries[0].object.get("name").?.string);
+    try std.testing.expectEqualStrings("/alpha.txt", entries[0].object.get("path").?.string);
     try std.testing.expectEqualStrings("file", entries[0].object.get("type").?.string);
     try std.testing.expect(entries[0].object.get("size").?.integer > 0);
     try std.testing.expectEqual(@as(usize, 4), entries[0].object.get("mode").?.string.len);
@@ -1393,6 +1425,7 @@ test "filesystem list returns metadata entries" {
     try std.testing.expect(std.mem.endsWith(u8, entries[0].object.get("modified_at").?.string, "Z"));
 
     try std.testing.expectEqualStrings("docs", entries[1].object.get("name").?.string);
+    try std.testing.expectEqualStrings("/docs", entries[1].object.get("path").?.string);
     try std.testing.expectEqualStrings("directory", entries[1].object.get("type").?.string);
 }
 
@@ -1466,6 +1499,8 @@ test "filesystem grep returns recursive matches" {
 
     const matches = root_object.get("matches").?.array.items;
     try std.testing.expectEqual(@as(usize, 2), matches.len);
+    try std.testing.expectEqualStrings("/logs/nested/deep.txt", matches[0].object.get("path").?.string);
+    try std.testing.expectEqualStrings("/logs/top.txt", matches[1].object.get("path").?.string);
     try std.testing.expectEqual(@as(i64, 1), matches[0].object.get("line").?.integer);
     try std.testing.expectEqualStrings("needle deep", matches[0].object.get("text").?.string);
     try std.testing.expectEqualStrings("needle top", matches[1].object.get("text").?.string);
@@ -1552,7 +1587,12 @@ test "filesystem delete removes file within workspace root" {
     try std.testing.expect(delete_object.get("ok").?.bool);
     try std.testing.expectEqualStrings("filesystem_delete", delete_object.get("tool").?.string);
     try std.testing.expect(delete_object.get("deleted").?.bool);
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(delete_object.get("path").?.string, .{}));
+    const resolved_deleted_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ tmp_path, std.mem.trimLeft(u8, delete_object.get("path").?.string, "/") },
+    );
+    defer std.testing.allocator.free(resolved_deleted_path);
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(resolved_deleted_path, .{}));
 }
 
 test "filesystem delete rejects traversal outside workspace root" {
