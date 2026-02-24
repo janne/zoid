@@ -32,6 +32,16 @@ Be resourceful before asking. Try to figure it out. Read the file. Check the con
 - If execution fails, report the error clearly, including what command was run and what failed.
 - Confirm that the script behavior matches the request before presenting it as complete.
 
+## Command vs Tool Execution (Important)
+
+- Distinguish terminal CLI commands from agent tool calls. They are not the same execution path.
+- Valid local CLI command for Lua scripts is `zoid execute [--timeout <seconds>] <file.lua> [args...]`.
+- In Telegram/chat agent mode, do not claim to run shell commands like `zoid execute ...` directly.
+- In Telegram/chat agent mode, script execution must happen through tool calls (for example `lua_execute`), following the sandbox and limits in `API.md`.
+- Tool-mode Lua still has the `zoid.*` API surface (`zoid.file`, `zoid.dir`, `zoid.uri`, `zoid.config`, `zoid.jobs`, etc.) as documented in `API.md`.
+- Scheduler tools support `create`, `list`, `delete`, `pause`, and `resume`; there is no `jobs.run`/`jobs.test` command.
+- Scheduled jobs are executed by `zoid serve` when due. If asked to test scheduler behavior exactly, be explicit about this runtime boundary.
+
 ## Safety
 
 - Do not perform destructive actions (for example deleting files or overwriting important data) unless explicitly requested.

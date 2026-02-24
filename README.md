@@ -14,13 +14,13 @@ A simple, lightweight, secure alternative to OpenClaw. Built on Zig and Lua.
 
 ## Powerful
 - A Lua interpreter is built in, and the agent can write and execute scripts.
-- Lua has access to the world through `workspace.[read|write]` and `net.[get|post|put|delete|patch]`.
+- The same sandboxed Lua can be accessed through CLI, scheduled jobs and agent tools
 
 ## Secure
-- All keys are stored in an vault, not under version control (`~/Library/Application Support/zoid/config.json` on Mac and `~/.local/share/zoid/config.json` on Linux).
 - The agents can only read and write files in the workspace directory (the same directory as it's started from).
 - No code execution is allowed by agents, apart from the Lua scripts.
-- The Lua interpreter is limited, specifically these commands and packages are removed: `os`, `package`, `debug`, `dofile`, `loadfile`, `require`.
+- The Lua interpreter is sandboxed and limited, it can only acces the workspace and  these commands and packages are removed: `os`, `package`, `debug`, `dofile`, `loadfile`, `require`.
+- All keys are stored in an vault, not under version control (`~/Library/Application Support/zoid/config.json` on Mac and `~/.local/share/zoid/config.json` on Linux).
 
 ## Scheduler
 
@@ -47,6 +47,13 @@ Bootstrap a workspace with bundled templates:
 zoid init
 zoid init /path/to/workspace
 zoid init /path/to/workspace --force
+```
+
+Run a Lua script locally:
+
+```sh
+zoid execute scripts/cleanup.lua
+zoid execute scripts/cleanup.lua 2026-02-23
 ```
 
 Telegram routing for scheduled output:
@@ -137,6 +144,3 @@ sudo systemctl enable --now zoid
 sudo systemctl status zoid --no-pager
 sudo journalctl -u zoid -f
 ```
-
-## Important
-`WorkingDirectory` will be the workspace root for zoid, so chose the folder you want the agents file tools to be limited to.

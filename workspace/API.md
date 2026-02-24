@@ -12,6 +12,12 @@ Zoid runs Lua in two ways:
 Both modes use sandbox restrictions and Lua API surface.
 `zoid execute` uses the same `lua_execute` policy path, then writes captured `stdout`/`stderr` back to the process streams.
 
+Important boundaries:
+
+- `zoid execute ...` is a local terminal CLI command.
+- Agent tool mode does not invoke shell commands and cannot run `zoid execute ...` directly.
+- In chat/Telegram tool mode, script execution happens through `lua_execute`.
+
 ### Extra API Added by Zoid
 
 Lua run through Zoid has a `zoid` global with:
@@ -289,6 +295,9 @@ Method-specific behavior:
 - no Telegram destination is resolved at create time
 - destination is resolved when the job runs: Telegram DM (if available), otherwise the reply is dropped
 - returned `job.path` values use workspace-absolute format (`/...`)
+
+`zoid.jobs` supports `create`, `list`, `delete`, `pause`, and `resume`.
+There is no immediate `run`/`test` scheduler action in the current API.
 
 ### Read Limits
 
