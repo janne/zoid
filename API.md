@@ -177,6 +177,14 @@ Supported methods and return values:
 - `zoid.exit([code]) -> never` (stops Lua script execution; defaults to exit code `0`)
 - `zoid.eprint(...)` writes to captured `stderr` (arguments are stringified and concatenated; no automatic tab/newline)
 
+### `error(...)` vs `zoid.exit([code])`
+
+- `error(message[, level])` is the standard Lua error function and remains available.
+- Use `error(...)` for unexpected failures. In tool-mode this is reported as `error: "LuaRuntimeFailed"`.
+- Use `zoid.exit([code])` for intentional early termination with an explicit exit code.
+- `zoid.exit(0)` is treated as a successful tool result (`ok: true`), while non-zero codes are reported as `error: "LuaExit"` with `exit_code` set.
+- Neither function crashes the host process. They only stop the current Lua script execution.
+
 ### APIs Removed or Disabled
 
 The following standard Lua escape hatches are removed:
