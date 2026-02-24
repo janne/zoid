@@ -96,7 +96,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - `lua_execute` enforces runtime timeout (default 10s) and accepts optional `timeout` override in seconds (`1..600`).
   - `lua_execute` must intercept Lua script output so it is never written to process stdout/stderr in TUI mode; instead surface captured streams in tool JSON (`stdout` and `stderr`, with truncation flags) so the agent can read outputs safely.
   - `http_get`/`http_post`/`http_put`/`http_delete` are direct HTTP(S) tools (no Lua script required); accepted input is a `uri` string plus optional `body` for `post`/`put`, and responses include `status` + `body` with `ok` reflecting 2xx status.
-  - In `lua_execute` tool-mode, remove `os`/`package`/`debug`/`require`/`dofile`/`loadfile`; expose `zoid.file(path)` metadata handles with `:read([max_bytes])/:write(content)/:delete()`, `zoid.dir(path)` metadata handles with `:list()/:create()/:remove()/:grep(pattern, [options])`, `zoid.uri(uri):get/post/put/delete`, `zoid.config():list/get/set/unset`, `zoid.import(path)`, `zoid.json.decode`, and `zoid.exit([code])`.
+  - In `lua_execute` tool-mode, remove `os`/`package`/`debug`/`require`/`dofile`/`loadfile`; expose `zoid.file(path)` metadata handles with `:read([max_bytes])/:write(content)/:delete()`, `zoid.dir(path)` metadata handles with `:list()/:create()/:remove()/:grep(pattern, [options])`, `zoid.uri(uri):get/post/put/delete`, `zoid.config():list/get/set/unset`, `zoid.import(path)`, `zoid.json.decode`, `zoid.time([table])`, `zoid.date([format[, epoch]])`, and `zoid.exit([code])`.
   - `zoid.import(path)` only loads `.lua` files inside workspace root, resolves relative paths from the importing module's directory, caches loaded modules per script execution, and rejects cyclic imports.
   - `zoid.exit([code])` must stop only the current Lua script execution and never terminate the hosting `zoid` process; tool JSON should surface `exit_code` and report non-zero exits as `LuaExit`.
   - `zoid.dir(path):create()` must fail when the target directory already exists, and `zoid.dir(path):remove()` must fail when the target directory is non-empty.
@@ -105,6 +105,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - `zoid.uri(uri)` allows only HTTP/HTTPS requests and returns a Lua table with `status`, `body`, and `ok`; response body capture is capped by sandbox policy (currently 1 MiB in `lua_execute`).
   - `zoid.uri(...):get/delete/post/put` accept optional request options with `headers` table (string->string); header names/values are validated and dangerous overrides such as `Host`/`Content-Length` are rejected.
   - `zoid.json.decode` maps JSON values to Lua tables/scalars and maps JSON `null` to the sentinel `zoid.json.null`.
+  - `zoid.time([table])` and `zoid.date([format[, epoch]])` provide safe time/date helpers inside sandboxed Lua while global `os` remains disabled; behavior is aligned with Lua `os.time`/`os.date`, including date-table normalization in `zoid.time`.
   - `jobs` tool supports `create/list/delete/pause/resume`; create supports `.lua` and `.md` paths with exactly one schedule input (`run_at` RFC3339 or 5-field `cron`), and does not resolve Telegram destination at create time.
   - In `telegram_bot` scheduled processing, skip agent dispatch when Lua stdout+stderr are both empty (after trim), or when markdown content is empty (after trim).
   - Tool-mode `io` must be a minimal capture-only table (`io.write` and `io.stderr:write`) so scripts can emit stdout/stderr for agent inspection without gaining general file I/O APIs.
@@ -122,7 +123,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - Tool-mode `zoid.jobs` API mirrors scheduler operations: `create/list/delete/pause/resume`.
 
 ### Lua script examples (`scripts/*.lua`) changes:
-  - Keep scripts compatible with the sandboxed `zoid` API surface (`zoid.file`, `zoid.dir`, `zoid.uri`, `zoid.config`, `zoid.jobs`, `zoid.import`, `zoid.json`, `zoid.exit`) and do not rely on removed globals like `os`/`package`/`require`.
+  - Keep scripts compatible with the sandboxed `zoid` API surface (`zoid.file`, `zoid.dir`, `zoid.uri`, `zoid.config`, `zoid.jobs`, `zoid.import`, `zoid.json`, `zoid.time`, `zoid.date`, `zoid.exit`) and do not rely on removed globals like `os`/`package`/`require`.
   - `zoid execute <file.lua> [args...]` exposes Lua global `arg` with `arg[0]` as script path and `arg[1..]` as forwarded positional arguments.
   - `scripts/gmail.lua` is a CLI-style utility; it supports `--query`, `--limit`, `--id`, and `--labels`, with default query `is:unread in:inbox`.
   - `scripts/counter.lua` creates `counter.txt` with `1` when missing; otherwise it reads the current integer value, increments by `1`, and writes it back.

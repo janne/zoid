@@ -9,6 +9,7 @@ const c = @cImport({
     @cInclude("lua.h");
     @cInclude("lauxlib.h");
     @cInclude("lualib.h");
+    @cInclude("time.h");
 });
 
 pub const ExecuteLuaError = std.mem.Allocator.Error || error{
@@ -1525,6 +1526,190 @@ fn luaZoidJson(lua_state: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
+fn luaPushTimestamp(state: *c.lua_State, timestamp: c.time_t) c_int {
+    if (timestamp == -1) {
+        return pushLuaErrorMessage(state, "time result cannot be represented in this installation", .{});
+    }
+    const timestamp_int = std.math.cast(c.lua_Integer, timestamp) orelse {
+        return pushLuaErrorMessage(state, "time result cannot be represented in this installation", .{});
+    };
+    if (std.math.cast(c.time_t, timestamp_int) != timestamp) {
+        return pushLuaErrorMessage(state, "time result cannot be represented in this installation", .{});
+    }
+    c.lua_pushinteger(state, timestamp_int);
+    return 1;
+}
+
+fn readDateTimeTableField(
+    state: *c.lua_State,
+    field_name: [:0]const u8,
+    default_value: ?c.lua_Integer,
+    delta: c.lua_Integer,
+) ?c_int {
+    const field_type = c.lua_getfield(state, 1, field_name.ptr);
+    defer luaPop(state, 1);
+
+    var isnum: c_int = 0;
+    const value = c.lua_tointegerx(state, -1, &isnum);
+    if (isnum == 0) {
+        if (field_type != c.LUA_TNIL) {
+            _ = pushLuaErrorMessage(state, "field '{s}' is not an integer", .{field_name});
+            return null;
+        }
+        const fallback = default_value orelse {
+            _ = pushLuaErrorMessage(state, "field '{s}' missing in date table", .{field_name});
+            return null;
+        };
+        return std.math.cast(c_int, fallback) orelse blk: {
+            _ = pushLuaErrorMessage(state, "field '{s}' is out-of-bound", .{field_name});
+            break :blk null;
+        };
+    }
+
+    const adjusted = @as(i128, value) - @as(i128, delta);
+    if (adjusted < std.math.minInt(c_int) or adjusted > std.math.maxInt(c_int)) {
+        _ = pushLuaErrorMessage(state, "field '{s}' is out-of-bound", .{field_name});
+        return null;
+    }
+    return @intCast(adjusted);
+}
+
+fn readDateTimeIsDstField(state: *c.lua_State) c_int {
+    const field_type = c.lua_getfield(state, 1, "isdst");
+    defer luaPop(state, 1);
+
+    if (field_type == c.LUA_TNIL) return -1;
+    return if (c.lua_toboolean(state, -1) != 0) 1 else 0;
+}
+
+fn setDateTableField(state: *c.lua_State, key: [:0]const u8, value: c_int, delta: c_int) void {
+    const adjusted = @as(i64, value) + @as(i64, delta);
+    c.lua_pushinteger(state, @intCast(adjusted));
+    c.lua_setfield(state, -2, key.ptr);
+}
+
+fn setDateTableBoolField(state: *c.lua_State, key: [:0]const u8, value: c_int) void {
+    if (value < 0) {
+        return;
+    }
+    c.lua_pushboolean(state, if (value != 0) 1 else 0);
+    c.lua_setfield(state, -2, key.ptr);
+}
+
+fn setAllDateTableFields(state: *c.lua_State, tm_value: *const c.struct_tm) void {
+    setDateTableField(state, "year", tm_value.tm_year, 1900);
+    setDateTableField(state, "month", tm_value.tm_mon, 1);
+    setDateTableField(state, "day", tm_value.tm_mday, 0);
+    setDateTableField(state, "hour", tm_value.tm_hour, 0);
+    setDateTableField(state, "min", tm_value.tm_min, 0);
+    setDateTableField(state, "sec", tm_value.tm_sec, 0);
+    setDateTableField(state, "yday", tm_value.tm_yday, 1);
+    setDateTableField(state, "wday", tm_value.tm_wday, 1);
+    setDateTableBoolField(state, "isdst", tm_value.tm_isdst);
+}
+
+fn tmFromTimestamp(timestamp: c.time_t, utc: bool, out_tm: *c.struct_tm) bool {
+    var value = timestamp;
+    const tm_ptr = if (utc) c.gmtime(&value) else c.localtime(&value);
+    if (tm_ptr == null) return false;
+    out_tm.* = tm_ptr.*;
+    return true;
+}
+
+fn pushDateTable(state: *c.lua_State, tm_value: *const c.struct_tm) c_int {
+    c.lua_newtable(state);
+    setAllDateTableFields(state, tm_value);
+    return 1;
+}
+
+fn luaZoidTime(lua_state: ?*c.lua_State) callconv(.c) c_int {
+    const state = lua_state orelse return 0;
+    const nargs = c.lua_gettop(state);
+
+    if (nargs == 0 or c.lua_isnoneornil(state, 1)) {
+        return luaPushTimestamp(state, c.time(null));
+    }
+    if (c.lua_type(state, 1) != c.LUA_TTABLE) {
+        return pushLuaErrorMessage(state, "zoid.time([table]) requires table or nil", .{});
+    }
+    c.lua_settop(state, 1);
+
+    var tm_value = std.mem.zeroes(c.struct_tm);
+    tm_value.tm_year = readDateTimeTableField(state, "year", null, 1900) orelse return 0;
+    tm_value.tm_mon = readDateTimeTableField(state, "month", null, 1) orelse return 0;
+    tm_value.tm_mday = readDateTimeTableField(state, "day", null, 0) orelse return 0;
+    tm_value.tm_hour = readDateTimeTableField(state, "hour", 12, 0) orelse return 0;
+    tm_value.tm_min = readDateTimeTableField(state, "min", 0, 0) orelse return 0;
+    tm_value.tm_sec = readDateTimeTableField(state, "sec", 0, 0) orelse return 0;
+    tm_value.tm_isdst = readDateTimeIsDstField(state);
+
+    const epoch = c.mktime(&tm_value);
+    setAllDateTableFields(state, &tm_value);
+    return luaPushTimestamp(state, epoch);
+}
+
+fn luaZoidDate(lua_state: ?*c.lua_State) callconv(.c) c_int {
+    const state = lua_state orelse return 0;
+    const nargs = c.lua_gettop(state);
+
+    var format_text: []const u8 = "%c";
+    if (nargs >= 1 and !c.lua_isnoneornil(state, 1)) {
+        var format_len: usize = 0;
+        const format_ptr = c.luaL_checklstring(state, 1, &format_len) orelse return pushLuaErrorMessage(state, "zoid.date([format[, epoch]]) format must be string", .{});
+        format_text = format_ptr[0..format_len];
+    }
+
+    var use_utc = false;
+    if (format_text.len > 0 and format_text[0] == '!') {
+        use_utc = true;
+        format_text = format_text[1..];
+    }
+
+    var timestamp = c.time(null);
+    if (nargs >= 2 and !c.lua_isnoneornil(state, 2)) {
+        var isnum: c_int = 0;
+        const epoch = c.lua_tointegerx(state, 2, &isnum);
+        if (isnum == 0) {
+            return pushLuaErrorMessage(state, "zoid.date([format[, epoch]]) epoch must be an integer", .{});
+        }
+        timestamp = std.math.cast(c.time_t, epoch) orelse return pushLuaErrorMessage(state, "time out-of-bounds", .{});
+        if (std.math.cast(c.lua_Integer, timestamp) != epoch) {
+            return pushLuaErrorMessage(state, "time out-of-bounds", .{});
+        }
+    }
+
+    var tm_value = std.mem.zeroes(c.struct_tm);
+    if (!tmFromTimestamp(timestamp, use_utc, &tm_value)) {
+        return pushLuaErrorMessage(state, "date result cannot be represented in this installation", .{});
+    }
+
+    if (std.mem.eql(u8, format_text, "*t")) {
+        return pushDateTable(state, &tm_value);
+    }
+
+    if (format_text.len > 255) {
+        return pushLuaErrorMessage(state, "zoid.date([format[, epoch]]) format is too long", .{});
+    }
+
+    var format_buffer: [256]u8 = undefined;
+    @memcpy(format_buffer[0..format_text.len], format_text);
+    format_buffer[format_text.len] = 0;
+
+    var output_buffer: [1024]u8 = undefined;
+    const written = c.strftime(
+        output_buffer[0..].ptr,
+        output_buffer.len,
+        format_buffer[0..format_text.len :0].ptr,
+        &tm_value,
+    );
+    if (written == 0) {
+        return pushLuaErrorMessage(state, "zoid.date([format[, epoch]]) formatting failed", .{});
+    }
+
+    _ = c.lua_pushlstring(state, output_buffer[0..written].ptr, written);
+    return 1;
+}
+
 fn luaZoidExit(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
     const nargs = c.lua_gettop(state);
@@ -1616,6 +1801,10 @@ fn installZoidTable(lua_state: *c.lua_State, sandbox: *ToolLuaEnvironment) void 
     c.lua_setfield(lua_state, -2, "import");
     _ = luaZoidJson(lua_state);
     c.lua_setfield(lua_state, -2, "json");
+    c.lua_pushcclosure(lua_state, luaZoidTime, 0);
+    c.lua_setfield(lua_state, -2, "time");
+    c.lua_pushcclosure(lua_state, luaZoidDate, 0);
+    c.lua_setfield(lua_state, -2, "date");
     c.lua_pushcclosure(lua_state, luaZoidExit, 0);
     c.lua_setfield(lua_state, -2, "exit");
     _ = c.lua_setglobal(lua_state, "zoid");
@@ -1629,7 +1818,7 @@ fn setGlobalNil(lua_state: *c.lua_State, name: [:0]const u8) void {
 fn restrictToolLuaEnvironment(lua_state: *c.lua_State, sandbox: *ToolLuaEnvironment) void {
     installZoidTable(lua_state, sandbox);
 
-    // Remove standard escape hatches; zoid.file(...), zoid.dir(...), zoid.uri(...), zoid.config(), zoid.import(...), and zoid.json.decode are sandbox APIs.
+    // Remove standard escape hatches; zoid.file(...), zoid.dir(...), zoid.uri(...), zoid.config(), zoid.import(...), zoid.json.decode, zoid.time, and zoid.date are sandbox APIs.
     setGlobalNil(lua_state, "workspace");
     setGlobalNil(lua_state, "os");
     setGlobalNil(lua_state, "package");
@@ -2814,6 +3003,79 @@ test "executeLuaFileCaptureOutputTool supports zoid json decode" {
         output.stdout,
     );
     try std.testing.expectEqualStrings("", output.stderr);
+}
+
+test "executeLuaFileCaptureOutputTool supports zoid time and date" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script = try tmp.dir.createFile("time_date.lua", .{});
+    defer script.close();
+    try script.writeAll(
+        \\local now = zoid.time()
+        \\print(type(now) == "number")
+        \\print(zoid.date("!%Y-%m-%dT%H:%M:%SZ", 0))
+        \\local utc = zoid.date("!*t", 0)
+        \\print(utc.year, utc.month, utc.day, utc.hour, utc.min, utc.sec, utc.wday, utc.yday, utc.isdst == false)
+        \\local local_parts = zoid.date("*t", 0)
+        \\local local_epoch = zoid.time({
+        \\  year = local_parts.year,
+        \\  month = local_parts.month,
+        \\  day = local_parts.day,
+        \\  hour = local_parts.hour,
+        \\  min = local_parts.min,
+        \\  sec = local_parts.sec,
+        \\  isdst = local_parts.isdst,
+        \\})
+        \\print(local_epoch == 0)
+        \\local normalized = { year = 2026, month = 13, day = 40, hour = 0, min = 0, sec = 0 }
+        \\local normalized_epoch = zoid.time(normalized)
+        \\local normalized_back = zoid.date("*t", normalized_epoch)
+        \\print(normalized.year == normalized_back.year and normalized.month == normalized_back.month and normalized.day == normalized_back.day)
+        \\
+    );
+
+    const script_path = try tmp.dir.realpathAlloc(std.testing.allocator, "time_date.lua");
+    defer std.testing.allocator.free(script_path);
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    var output = try executeLuaFileCaptureOutputTool(std.testing.allocator, script_path, .{
+        .workspace_root = workspace_root,
+    });
+    defer output.deinit(std.testing.allocator);
+
+    try std.testing.expect(output.status == .ok);
+    try std.testing.expectEqualStrings(
+        "true\n1970-01-01T00:00:00Z\n1970\t1\t1\t0\t0\t0\t5\t1\ttrue\ntrue\ntrue\n",
+        output.stdout,
+    );
+    try std.testing.expectEqualStrings("", output.stderr);
+}
+
+test "executeLuaFileCaptureOutputTool validates zoid time/date arguments" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script = try tmp.dir.createFile("time_date_invalid.lua", .{});
+    defer script.close();
+    try script.writeAll(
+        \\zoid.time({ month = 1, day = 1 })
+        \\
+    );
+
+    const script_path = try tmp.dir.realpathAlloc(std.testing.allocator, "time_date_invalid.lua");
+    defer std.testing.allocator.free(script_path);
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    var output = try executeLuaFileCaptureOutputTool(std.testing.allocator, script_path, .{
+        .workspace_root = workspace_root,
+    });
+    defer output.deinit(std.testing.allocator);
+
+    try std.testing.expect(output.status == .runtime_failed);
+    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "field 'year' missing in date table") != null);
 }
 
 test "executeLuaFileCaptureOutputTool reports json decode parse errors" {

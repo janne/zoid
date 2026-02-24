@@ -22,6 +22,8 @@ Lua run through Zoid has a `zoid` global with:
 - `zoid.jobs` scheduler handles
 - `zoid.import(path)` Lua module imports
 - `zoid.json.decode(json_text)` JSON decoder
+- `zoid.time([table])` epoch timestamp helper
+- `zoid.date([format[, epoch]])` date/time formatter helper
 - `zoid.exit([code])` script exit helper
 
 File example:
@@ -78,6 +80,16 @@ JSON example:
 ```lua
 local payload = zoid.json.decode('{"ok":true,"count":2,"items":[1,null]}')
 print(payload.ok, payload.count, payload.items[2] == zoid.json.null)
+```
+
+Time/date example:
+
+```lua
+local now = zoid.time()
+print("now", now)
+print(zoid.date("!%Y-%m-%dT%H:%M:%SZ", 0))
+local parts = zoid.date("!*t", 0)
+print(parts.year, parts.month, parts.day, parts.hour, parts.min, parts.sec)
 ```
 
 Scheduler example:
@@ -158,6 +170,8 @@ Supported methods and return values:
 - `zoid.import(path) -> any` (module return value; repeated imports return the cached module value; if module returns `nil`, import returns `true`)
 - `zoid.json.decode(json_text) -> any`
 - `zoid.json.null` sentinel value used when decoded JSON contains `null`
+- `zoid.time([table]) -> integer` (Lua-compatible with `os.time`: `year`/`month`/`day` required, optional `hour`/`min`/`sec`/`isdst`; numeric fields are normalized by `mktime`, and table fields are updated with normalized values)
+- `zoid.date([format[, epoch]]) -> string | table` (`*t` format returns table fields `year`, `month`, `day`, `hour`, `min`, `sec`, `wday`, `yday`, optional `isdst`; `!` prefix forces UTC)
 - `zoid.exit([code]) -> never` (stops Lua script execution; defaults to exit code `0`)
 
 ### APIs Removed or Disabled
