@@ -194,7 +194,7 @@ pub fn main() !void {
                         scheduler_context,
                         .{
                             .path = create_cmd.path,
-                            .run_at = create_cmd.run_at,
+                            .at = create_cmd.at,
                             .cron = create_cmd.cron,
                         },
                     ) catch |err| {
@@ -589,14 +589,14 @@ fn formatScheduleJobList(
     var last_width: usize = "LAST".len;
 
     for (jobs) |*job| {
-        const next_run = try formatEpochUtc(allocator, job.next_run_at);
+        const next_run = try formatEpochDisplay(allocator, job.next_run_at);
         errdefer allocator.free(next_run);
 
         const schedule = try formatJobSchedule(allocator, job);
         errdefer allocator.free(schedule);
 
         const last_run = if (job.last_run_at) |value|
-            try formatEpochUtc(allocator, value)
+            try formatEpochDisplay(allocator, value)
         else
             try allocator.dupe(u8, "-");
         errdefer allocator.free(last_run);
@@ -713,7 +713,7 @@ fn appendPaddedCell(
 
 fn formatJobSchedule(allocator: std.mem.Allocator, job: *const zoid.scheduler_store.Job) ![]u8 {
     if (job.run_at) |run_at| {
-        const run_text = try formatEpochUtc(allocator, run_at);
+        const run_text = try formatEpochDisplay(allocator, run_at);
         defer allocator.free(run_text);
         return std.fmt.allocPrint(allocator, "at:{s}", .{run_text});
     }
@@ -723,8 +723,8 @@ fn formatJobSchedule(allocator: std.mem.Allocator, job: *const zoid.scheduler_st
     return allocator.dupe(u8, "-");
 }
 
-fn formatEpochUtc(allocator: std.mem.Allocator, epoch: i64) ![]u8 {
-    if (epoch < 0) return std.fmt.allocPrint(allocator, "{d}", .{epoch});
+fn formatEpochDisplay(allocator: std.mem.Allocator, epoch: i64) ![]u8 {
+    if (epoch < 0) return allocator.dupe(u8, "invalid");
 
     const epoch_u64 = std.math.cast(u64, epoch) orelse return std.fmt.allocPrint(allocator, "{d}", .{epoch});
     const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = epoch_u64 };
@@ -734,14 +734,13 @@ fn formatEpochUtc(allocator: std.mem.Allocator, epoch: i64) ![]u8 {
 
     return std.fmt.allocPrint(
         allocator,
-        "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z",
+        "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}",
         .{
             year_day.year,
             month_day.month.numeric(),
             month_day.day_index + 1,
             day_seconds.getHoursIntoDay(),
             day_seconds.getMinutesIntoHour(),
-            day_seconds.getSecondsIntoMinute(),
         },
     );
 }
@@ -775,16 +774,23 @@ fn printScheduleJob(
 
     var tail = std.ArrayList(u8).empty;
     defer tail.deinit(allocator);
+
+    const next_run_text = try formatEpochDisplay(allocator, job.next_run_at);
+    defer allocator.free(next_run_text);
     try tail.appendSlice(allocator, "  next_run_at=");
-    try tail.writer(allocator).print("{d}", .{job.next_run_at});
+    try tail.appendSlice(allocator, next_run_text);
     if (job.run_at) |run_at| {
-        try tail.writer(allocator).print(" run_at={d}", .{run_at});
+        const run_at_text = try formatEpochDisplay(allocator, run_at);
+        defer allocator.free(run_at_text);
+        try tail.writer(allocator).print(" at={s}", .{run_at_text});
     }
     if (job.cron) |cron| {
         try tail.writer(allocator).print(" cron={s}", .{cron});
     }
     if (job.last_run_at) |last_run_at| {
-        try tail.writer(allocator).print(" last_run_at={d}", .{last_run_at});
+        const last_run_text = try formatEpochDisplay(allocator, last_run_at);
+        defer allocator.free(last_run_text);
+        try tail.writer(allocator).print(" last_run_at={s}", .{last_run_text});
     }
     try tail.append(allocator, '\n');
     try std.fs.File.stdout().writeAll(tail.items);
@@ -792,8 +798,8 @@ fn printScheduleJob(
 
 fn reportScheduleError(err: anyerror) void {
     switch (err) {
-        error.InvalidSchedule => std.debug.print("Invalid schedule. Provide either --run-at <rfc3339> or --cron \"<min hour dom mon dow>\".\n", .{}),
-        error.InvalidTimestamp => std.debug.print("Invalid run_at timestamp. Expected RFC3339 (for example 2026-02-22T21:00:00Z).\n", .{}),
+        error.InvalidSchedule => std.debug.print("Invalid schedule. Provide either --at <datetime-expression> or --cron \"<min hour dom mon dow>\".\n", .{}),
+        error.InvalidTimestamp => std.debug.print("Invalid --at value. Example values: 2026-02-22T21:00:00Z or \"in 5 minutes\".\n", .{}),
         error.InvalidJobPath => std.debug.print("Invalid job path. Scheduled jobs require a .lua file under workspace root.\n", .{}),
         error.InvalidExpression, error.InvalidField, error.InvalidRange, error.InvalidStep, error.InvalidValue => {
             std.debug.print("Invalid cron expression.\n", .{});
@@ -826,7 +832,7 @@ test "formatScheduleJobList renders ps-like columns" {
             .next_run_at = 120,
             .created_at = 0,
             .updated_at = 0,
-            .last_run_at = 60,
+            .last_run_at = -1,
         },
     };
     defer for (&jobs) |*job| job.deinit(std.testing.allocator);
@@ -842,6 +848,8 @@ test "formatScheduleJobList renders ps-like columns" {
     try std.testing.expect(std.mem.indexOf(u8, header, "SCHEDULE") != null);
     try std.testing.expect(std.mem.indexOf(u8, header, "LAST") != null);
     try std.testing.expect(std.mem.indexOf(u8, header, "PATH") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "1970-01-01 00:00") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "invalid") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "cron:0 21 * * *") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "/first.lua") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "/second.lua") != null);

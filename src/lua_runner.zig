@@ -1293,7 +1293,7 @@ fn pushLuaSchedulerJobTable(
     } else {
         c.lua_pushnil(state);
     }
-    c.lua_setfield(state, -2, "run_at");
+    c.lua_setfield(state, -2, "at");
 
     if (job.cron) |cron| {
         _ = c.lua_pushlstring(state, cron.ptr, cron.len);
@@ -1341,22 +1341,22 @@ fn luaZoidJobsCreate(lua_state: ?*c.lua_State) callconv(.c) c_int {
     defer env.allocator.free(path_value);
     luaPop(state, 1);
 
-    var run_at_value: ?[]u8 = null;
-    defer if (run_at_value) |value| env.allocator.free(value);
-    _ = c.lua_getfield(state, options_index, "run_at");
+    var at_value: ?[]u8 = null;
+    defer if (at_value) |value| env.allocator.free(value);
+    _ = c.lua_getfield(state, options_index, "at");
     switch (c.lua_type(state, -1)) {
         c.LUA_TNIL => {},
         c.LUA_TSTRING => {
-            var run_at_len: usize = 0;
-            const run_at_ptr = c.lua_tolstring(state, -1, &run_at_len) orelse unreachable;
-            run_at_value = env.allocator.dupe(u8, run_at_ptr[0..run_at_len]) catch |err| {
+            var at_len: usize = 0;
+            const at_ptr = c.lua_tolstring(state, -1, &at_len) orelse unreachable;
+            at_value = env.allocator.dupe(u8, at_ptr[0..at_len]) catch |err| {
                 luaPop(state, 1);
                 return pushLuaErrorMessage(state, "zoid.jobs.create failed: {s}", .{@errorName(err)});
             };
         },
         else => {
             luaPop(state, 1);
-            return pushLuaErrorMessage(state, "zoid.jobs.create run_at must be a string", .{});
+            return pushLuaErrorMessage(state, "zoid.jobs.create at must be a string", .{});
         },
     }
     luaPop(state, 1);
@@ -1386,7 +1386,7 @@ fn luaZoidJobsCreate(lua_state: ?*c.lua_State) callconv(.c) c_int {
         .{ .workspace_root = env.workspace_root },
         .{
             .path = path_value,
-            .run_at = run_at_value,
+            .at = at_value,
             .cron = cron_value,
         },
     ) catch |err| {
@@ -3086,8 +3086,9 @@ test "executeLuaFileCaptureOutputTool supports zoid jobs api" {
     try script.writeAll(
         \\local created = zoid.jobs.create({
         \\  path = "note.lua",
-        \\  run_at = "2026-01-10T10:00:00Z"
+        \\  at = "2026-01-10T10:00:00Z"
         \\})
+        \\print(created.at ~= nil)
         \\print(created.path)
         \\print(zoid.jobs.list()[1].path)
         \\print(#zoid.jobs.list())
@@ -3110,7 +3111,7 @@ test "executeLuaFileCaptureOutputTool supports zoid jobs api" {
 
     try std.testing.expect(output.status == .ok);
     try std.testing.expectEqualStrings(
-        "/note.lua\n/note.lua\n1\ntrue\ntrue\ntrue\n0\n",
+        "true\n/note.lua\n/note.lua\n1\ntrue\ntrue\ntrue\n0\n",
         output.stdout,
     );
     try std.testing.expectEqualStrings("", output.stderr);

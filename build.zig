@@ -63,6 +63,41 @@ fn addLuaSupport(b: *std.Build, module: *std.Build.Module, target: std.Build.Res
     }
 }
 
+fn addTimelibSupport(
+    b: *std.Build,
+    module: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) void {
+    const timelib_dep = b.dependency("timelib", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const timelib_root = timelib_dep.path("ext/date/lib");
+
+    module.addIncludePath(timelib_root);
+    module.addCSourceFiles(.{
+        .root = timelib_root,
+        .files = &.{
+            "astro.c",
+            "dow.c",
+            "interval.c",
+            "parse_date.c",
+            "parse_iso_intervals.c",
+            "parse_posix.c",
+            "parse_tz.c",
+            "timelib.c",
+            "tm2unixtime.c",
+            "unixtime2tm.c",
+        },
+        .flags = &.{
+            "-DHAVE_GETTIMEOFDAY",
+            "-DHAVE_UNISTD_H",
+            "-DHAVE_DIRENT_H",
+        },
+    });
+}
+
 // Although this function looks imperative, it does not perform the build
 // directly and instead it mutates the build graph (`b`) that will be then
 // executed by an external runner. The functions in `std.Build` implement a DSL
@@ -114,6 +149,7 @@ pub fn build(b: *std.Build) void {
     mod.addImport("vaxis", vaxis_dep.module("vaxis"));
     mod.addImport("cron", cron_dep.module("cron"));
     addLuaSupport(b, mod, target, optimize);
+    addTimelibSupport(b, mod, target, optimize);
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function

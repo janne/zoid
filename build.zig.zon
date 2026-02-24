@@ -44,6 +44,10 @@
             .url = "https://github.com/dying-will-bullet/cron/archive/refs/heads/master.tar.gz",
             .hash = "cron-0.3.0-joDqxM3nAAC6GdPc2iPAzxRIvJXKHRLfXodnIfNcq0ah",
         },
+        .timelib = .{
+            .url = "https://github.com/php/php-src/archive/refs/tags/php-8.4.0.tar.gz",
+            .hash = "N-V-__8AADY-Swewk00i4lkOs9Gqbl_4rYWGcnSfzBPboEYw",
+        },
     },
     .paths = .{
         "build.zig",

@@ -163,7 +163,7 @@ Supported methods and return values:
 - `zoid.config():get(key) -> string | nil`
 - `zoid.config():set(key, value) -> boolean` (`true` on success)
 - `zoid.config():unset(key) -> boolean` (`true` if key existed and was removed)
-- `zoid.jobs.create({ path, run_at?, cron? }) -> job`
+- `zoid.jobs.create({ path, at?, cron? }) -> job`
 - `zoid.jobs.list() -> { job, ... }`
 - `zoid.jobs.delete(job_id) -> boolean`
 - `zoid.jobs.pause(job_id) -> boolean`
@@ -285,7 +285,7 @@ Method-specific behavior:
 
 - `path` must resolve to an existing file inside workspace root
 - `path` must use the `.lua` extension
-- exactly one schedule input is required: `run_at` (RFC3339) or `cron` (5-field cron)
+- exactly one schedule input is required: `at` (natural-language date/time) or `cron` (5-field cron)
 - no Telegram destination is resolved at create time
 - destination is resolved when the job runs: Telegram DM (if available), otherwise the reply is dropped
 - returned `job.path` values use workspace-absolute format (`/...`)

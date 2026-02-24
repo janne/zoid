@@ -2,6 +2,9 @@ const std = @import("std");
 const cron_adapter = @import("cron_adapter.zig");
 const scheduler_store = @import("scheduler_store.zig");
 const workspace_fs = @import("workspace_fs.zig");
+const c = @cImport({
+    @cInclude("timelib.h");
+});
 const short_job_id_alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
 const short_job_id_len: usize = 5;
 const max_job_id_generate_attempts: usize = 128;
@@ -14,7 +17,7 @@ pub const Context = struct {
 
 pub const CreateRequest = struct {
     path: []const u8,
-    run_at: ?[]const u8 = null,
+    at: ?[]const u8 = null,
     cron: ?[]const u8 = null,
 };
 
@@ -33,9 +36,9 @@ pub fn deinitDueJobs(allocator: std.mem.Allocator, due_jobs: []DueJob) void {
 }
 
 pub fn createJob(allocator: std.mem.Allocator, context: Context, request: CreateRequest) !scheduler_store.Job {
-    const has_run_at = request.run_at != null;
+    const has_at = request.at != null;
     const has_cron = request.cron != null;
-    if (has_run_at == has_cron) return error.InvalidSchedule;
+    if (has_at == has_cron) return error.InvalidSchedule;
 
     const resolved_path = try workspace_fs.resolveAllowedReadPath(
         allocator,
@@ -52,8 +55,8 @@ pub fn createJob(allocator: std.mem.Allocator, context: Context, request: Create
     var cron_text: ?[]u8 = null;
     var next_run_at: i64 = undefined;
 
-    if (request.run_at) |run_at_text| {
-        const parsed = try parseRfc3339ToEpoch(run_at_text);
+    if (request.at) |at_text| {
+        const parsed = try parseAtToEpoch(at_text);
         run_at_epoch = parsed;
         next_run_at = parsed;
     } else if (request.cron) |cron_value| {
@@ -211,44 +214,171 @@ pub fn secondsUntilNextDue(allocator: std.mem.Allocator, context: Context, now: 
     return min_diff;
 }
 
-pub fn parseRfc3339ToEpoch(value: []const u8) !i64 {
-    if (value.len < 20) return error.InvalidTimestamp;
-    if (value[4] != '-' or value[7] != '-' or value[10] != 'T' or value[13] != ':' or value[16] != ':') {
-        return error.InvalidTimestamp;
+pub fn parseAtToEpoch(value: []const u8) !i64 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidTimestamp;
+
+    if (tryParseAtToEpochTimelib(trimmed)) |epoch| return epoch;
+
+    if (stripCaseInsensitivePrefix(trimmed, "in")) |without_in| {
+        if (tryParseAtToEpochTimelib(without_in)) |epoch| return epoch;
     }
 
-    const year = try std.fmt.parseInt(i64, value[0..4], 10);
-    const month = try std.fmt.parseInt(i64, value[5..7], 10);
-    const day = try std.fmt.parseInt(i64, value[8..10], 10);
-    const hour = try std.fmt.parseInt(i64, value[11..13], 10);
-    const minute = try std.fmt.parseInt(i64, value[14..16], 10);
-    const second = try std.fmt.parseInt(i64, value[17..19], 10);
-
-    if (month < 1 or month > 12) return error.InvalidTimestamp;
-    if (day < 1 or day > daysInMonth(year, month)) return error.InvalidTimestamp;
-    if (hour < 0 or hour > 23) return error.InvalidTimestamp;
-    if (minute < 0 or minute > 59) return error.InvalidTimestamp;
-    if (second < 0 or second > 59) return error.InvalidTimestamp;
-
-    var offset_seconds: i64 = 0;
-    if (value.len == 20 and value[19] == 'Z') {
-        offset_seconds = 0;
-    } else if (value.len == 25 and (value[19] == '+' or value[19] == '-')) {
-        if (value[22] != ':') return error.InvalidTimestamp;
-        const offset_hour = try std.fmt.parseInt(i64, value[20..22], 10);
-        const offset_minute = try std.fmt.parseInt(i64, value[23..25], 10);
-        if (offset_hour < 0 or offset_hour > 23) return error.InvalidTimestamp;
-        if (offset_minute < 0 or offset_minute > 59) return error.InvalidTimestamp;
-
-        const sign: i64 = if (value[19] == '+') 1 else -1;
-        offset_seconds = sign * (offset_hour * 3600 + offset_minute * 60);
-    } else {
-        return error.InvalidTimestamp;
+    if (stripCaseInsensitiveSuffix(trimmed, "from now")) |without_from_now| {
+        if (tryParseAtToEpochTimelib(without_from_now)) |epoch| return epoch;
     }
 
-    const days = daysFromCivil(year, month, day);
-    const day_seconds = hour * 3600 + minute * 60 + second;
-    return days * 86400 + day_seconds - offset_seconds;
+    var normalization_buffer: [512]u8 = undefined;
+    if (replaceCaseInsensitive(trimmed, "stockholm time", "Europe/Stockholm", &normalization_buffer)) |with_timezone| {
+        if (tryParseAtToEpochTimelib(with_timezone)) |epoch| return epoch;
+
+        var at_cleanup_buffer: [512]u8 = undefined;
+        const without_at = removeFirstStandaloneWord(with_timezone, "at", &at_cleanup_buffer) orelse with_timezone;
+        if (tryParseAtToEpochTimelib(without_at)) |epoch| return epoch;
+
+        var hour_buffer: [512]u8 = undefined;
+        if (addMinutesToStandaloneHour(without_at, &hour_buffer)) |with_hour_minutes| {
+            if (tryParseAtToEpochTimelib(with_hour_minutes)) |epoch| return epoch;
+        }
+    }
+
+    return error.InvalidTimestamp;
+}
+
+fn tryParseAtToEpochTimelib(value: []const u8) ?i64 {
+    return parseAtToEpochTimelib(value) catch null;
+}
+
+fn parseAtToEpochTimelib(value: []const u8) !i64 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidTimestamp;
+
+    var parsed_errors: ?*c.timelib_error_container = null;
+    const parsed = c.timelib_strtotime(
+        trimmed.ptr,
+        trimmed.len,
+        &parsed_errors,
+        c.timelib_builtin_db(),
+        c.timelib_parse_tzfile,
+    ) orelse return error.InvalidTimestamp;
+    defer c.timelib_time_dtor(parsed);
+    defer if (parsed_errors) |errors| c.timelib_error_container_dtor(errors);
+    if (hasTimelibParseErrors(parsed_errors)) return error.InvalidTimestamp;
+
+    const now_epoch = std.time.timestamp();
+    const now = c.timelib_time_ctor() orelse return error.InvalidTimestamp;
+    defer c.timelib_time_dtor(now);
+    c.timelib_unixtime2gmt(now, @as(c.timelib_sll, @intCast(now_epoch)));
+
+    c.timelib_fill_holes(parsed, now, c.TIMELIB_NO_CLONE);
+    c.timelib_update_ts(parsed, null);
+    return std.math.cast(i64, parsed.*.sse) orelse return error.InvalidTimestamp;
+}
+
+fn stripCaseInsensitivePrefix(value: []const u8, prefix: []const u8) ?[]const u8 {
+    if (value.len <= prefix.len) return null;
+    if (!std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix)) return null;
+    if (value[prefix.len] != ' ' and value[prefix.len] != '\t') return null;
+    return std.mem.trim(u8, value[prefix.len + 1 ..], " \t");
+}
+
+fn stripCaseInsensitiveSuffix(value: []const u8, suffix: []const u8) ?[]const u8 {
+    if (value.len <= suffix.len) return null;
+    const suffix_start = value.len - suffix.len;
+    if (!std.ascii.eqlIgnoreCase(value[suffix_start..], suffix)) return null;
+    if (suffix_start > 0 and value[suffix_start - 1] != ' ' and value[suffix_start - 1] != '\t') return null;
+    return std.mem.trim(u8, value[0..suffix_start], " \t");
+}
+
+fn replaceCaseInsensitive(
+    value: []const u8,
+    needle: []const u8,
+    replacement: []const u8,
+    buffer: []u8,
+) ?[]const u8 {
+    if (needle.len == 0 or value.len < needle.len) return null;
+
+    var index: usize = 0;
+    while (index + needle.len <= value.len) : (index += 1) {
+        if (!std.ascii.eqlIgnoreCase(value[index .. index + needle.len], needle)) continue;
+
+        const new_len = value.len - needle.len + replacement.len;
+        if (new_len > buffer.len) return null;
+
+        @memcpy(buffer[0..index], value[0..index]);
+        @memcpy(buffer[index .. index + replacement.len], replacement);
+        @memcpy(buffer[index + replacement.len .. new_len], value[index + needle.len ..]);
+
+        return std.mem.trim(u8, buffer[0..new_len], " \t");
+    }
+
+    return null;
+}
+
+fn removeFirstStandaloneWord(value: []const u8, word: []const u8, buffer: []u8) ?[]const u8 {
+    if (word.len == 0 or value.len < word.len) return null;
+
+    var index: usize = 0;
+    while (index + word.len <= value.len) : (index += 1) {
+        if (!std.ascii.eqlIgnoreCase(value[index .. index + word.len], word)) continue;
+
+        const left_ok = index == 0 or value[index - 1] == ' ' or value[index - 1] == '\t';
+        const right_index = index + word.len;
+        const right_ok = right_index == value.len or value[right_index] == ' ' or value[right_index] == '\t';
+        if (!left_ok or !right_ok) continue;
+
+        const prefix = std.mem.trimRight(u8, value[0..index], " \t");
+        var after = right_index;
+        while (after < value.len and (value[after] == ' ' or value[after] == '\t')) : (after += 1) {}
+        const suffix = std.mem.trimLeft(u8, value[after..], " \t");
+
+        const separator_len: usize = if (prefix.len > 0 and suffix.len > 0) 1 else 0;
+        const new_len = prefix.len + separator_len + suffix.len;
+        if (new_len > buffer.len) return null;
+
+        @memcpy(buffer[0..prefix.len], prefix);
+        if (separator_len == 1) buffer[prefix.len] = ' ';
+        @memcpy(buffer[prefix.len + separator_len .. new_len], suffix);
+
+        return buffer[0..new_len];
+    }
+
+    return null;
+}
+
+fn addMinutesToStandaloneHour(value: []const u8, buffer: []u8) ?[]const u8 {
+    var index: usize = 0;
+    while (index < value.len) : (index += 1) {
+        if (!std.ascii.isDigit(value[index])) continue;
+        if (index > 0 and value[index - 1] != ' ' and value[index - 1] != '\t') continue;
+
+        var token_end = index;
+        while (token_end < value.len and std.ascii.isDigit(value[token_end])) : (token_end += 1) {}
+        const token_len = token_end - index;
+        if (token_len == 0 or token_len > 2) continue;
+        if (token_end < value.len and value[token_end] == ':') continue;
+        if (token_end < value.len and value[token_end] != ' ' and value[token_end] != '\t') continue;
+
+        const hour = std.fmt.parseInt(u8, value[index..token_end], 10) catch continue;
+        if (hour > 23) continue;
+
+        const new_len = value.len + 3;
+        if (new_len > buffer.len) return null;
+
+        @memcpy(buffer[0..token_end], value[0..token_end]);
+        @memcpy(buffer[token_end .. token_end + 3], ":00");
+        @memcpy(buffer[token_end + 3 .. new_len], value[token_end..]);
+        return buffer[0..new_len];
+    }
+
+    return null;
+}
+
+fn hasTimelibParseErrors(errors: ?*c.timelib_error_container) bool {
+    if (errors) |container| {
+        return container.*.error_count > 0;
+    }
+    return false;
 }
 
 fn updatePausedState(
@@ -368,35 +498,28 @@ fn jobIdExists(jobs: []const scheduler_store.Job, id: []const u8) bool {
     return false;
 }
 
-fn isLeapYear(year: i64) bool {
-    return @mod(year, 4) == 0 and (@mod(year, 100) != 0 or @mod(year, 400) == 0);
-}
-
-fn daysInMonth(year: i64, month: i64) i64 {
-    return switch (month) {
-        1, 3, 5, 7, 8, 10, 12 => 31,
-        4, 6, 9, 11 => 30,
-        2 => if (isLeapYear(year)) 29 else 28,
-        else => 0,
-    };
-}
-
-fn daysFromCivil(year: i64, month: i64, day: i64) i64 {
-    var y = year;
-    y -= if (month <= 2) 1 else 0;
-
-    const era = @divFloor(if (y >= 0) y else y - 399, 400);
-    const yoe = y - era * 400;
-    const adjusted_month: i64 = month + (if (month > 2) @as(i64, -3) else @as(i64, 9));
-    const doy = @divFloor(153 * adjusted_month + 2, 5) + day - 1;
-    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
-    return era * 146097 + doe - 719468;
-}
-
-test "parseRfc3339ToEpoch parses Zulu and offset timestamps" {
-    const zulu = try parseRfc3339ToEpoch("2026-01-10T10:00:00Z");
-    const offset = try parseRfc3339ToEpoch("2026-01-10T11:00:00+01:00");
+test "parseAtToEpoch parses absolute timestamps and named timezone text" {
+    const zulu = try parseAtToEpoch("2026-01-10T10:00:00Z");
+    const offset = try parseAtToEpoch("2026-01-10T11:00:00+01:00");
+    const natural = try parseAtToEpoch("January 10 2026 10:00 UTC");
     try std.testing.expectEqual(zulu, offset);
+    try std.testing.expectEqual(zulu, natural);
+
+    const now = std.time.timestamp();
+    const stockholm = try parseAtToEpoch("tomorrow at 12 stockholm time");
+    try std.testing.expect(stockholm > now);
+}
+
+test "parseAtToEpoch parses relative expressions around current time" {
+    const now = std.time.timestamp();
+
+    const from_now = try parseAtToEpoch("5 minutes from now");
+    try std.testing.expect(from_now >= now + 4 * 60);
+    try std.testing.expect(from_now <= now + 6 * 60);
+
+    const in_minutes = try parseAtToEpoch("in 5 minutes");
+    try std.testing.expect(in_minutes >= now + 4 * 60);
+    try std.testing.expect(in_minutes <= now + 6 * 60);
 }
 
 test "create/list/delete/pause/resume lifecycle" {
@@ -416,7 +539,7 @@ test "create/list/delete/pause/resume lifecycle" {
 
     const created = try createJob(std.testing.allocator, context, .{
         .path = "task.lua",
-        .run_at = "2026-01-10T10:00:00Z",
+        .at = "2026-01-10T10:00:00Z",
     });
     defer {
         var copy = created;
@@ -430,6 +553,33 @@ test "create/list/delete/pause/resume lifecycle" {
     try std.testing.expect(try pauseJob(std.testing.allocator, context, created.id));
     try std.testing.expect(try resumeJob(std.testing.allocator, context, created.id));
     try std.testing.expect(try deleteJob(std.testing.allocator, context, created.id));
+}
+
+test "createJob with relative at schedules in the future" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    {
+        const file = try tmp.dir.createFile("task.lua", .{});
+        defer file.close();
+        try file.writeAll("print('ok')\n");
+    }
+
+    const now = std.time.timestamp();
+    const created = try createJob(std.testing.allocator, .{ .workspace_root = workspace_root }, .{
+        .path = "task.lua",
+        .at = "5 minutes from now",
+    });
+    defer {
+        var copy = created;
+        copy.deinit(std.testing.allocator);
+    }
+
+    try std.testing.expect(created.next_run_at >= now + 4 * 60);
+    try std.testing.expect(created.next_run_at <= now + 6 * 60);
 }
 
 test "createJob no longer requires chat context" {
@@ -447,7 +597,7 @@ test "createJob no longer requires chat context" {
 
     const created = try createJob(std.testing.allocator, .{ .workspace_root = workspace_root }, .{
         .path = "task.lua",
-        .run_at = "2026-01-10T10:00:00Z",
+        .at = "2026-01-10T10:00:00Z",
     });
     defer {
         var copy = created;

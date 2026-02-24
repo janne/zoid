@@ -12,7 +12,7 @@ pub const ConfigCommand = union(enum) {
 
 pub const JobsCreateCommand = struct {
     path: []const u8,
-    run_at: ?[]const u8,
+    at: ?[]const u8,
     cron: ?[]const u8,
 };
 
@@ -168,17 +168,17 @@ fn parseJobsCommand(args: []const []const u8) ParseCommandError!JobsCommand {
 
 fn parseJobsCreate(args: []const []const u8) ParseCommandError!JobsCreateCommand {
     var path: ?[]const u8 = null;
-    var run_at: ?[]const u8 = null;
+    var at: ?[]const u8 = null;
     var cron: ?[]const u8 = null;
 
     var index: usize = 0;
     while (index < args.len) {
         const flag = args[index];
 
-        if (std.mem.eql(u8, flag, "--run-at")) {
-            if (run_at != null) return error.InvalidJobsArguments;
+        if (std.mem.eql(u8, flag, "--at")) {
+            if (at != null) return error.InvalidJobsArguments;
             if (index + 1 >= args.len) return error.MissingJobsArgument;
-            run_at = args[index + 1];
+            at = args[index + 1];
             index += 2;
             continue;
         }
@@ -197,13 +197,13 @@ fn parseJobsCreate(args: []const []const u8) ParseCommandError!JobsCreateCommand
     }
 
     if (path == null) return error.InvalidJobsArguments;
-    if ((run_at == null and cron == null) or (run_at != null and cron != null)) return error.InvalidJobsArguments;
+    if ((at == null and cron == null) or (at != null and cron != null)) return error.InvalidJobsArguments;
 
     if (!std.mem.endsWith(u8, path.?, ".lua")) return error.InvalidJobsArguments;
 
     return .{
         .path = path.?,
-        .run_at = run_at,
+        .at = at,
         .cron = cron,
     };
 }
@@ -225,7 +225,7 @@ pub fn printHelp() void {
         \\zoid serve
         \\  Starts long-running service mode.
         \\
-        \\zoid jobs create <path.lua> (--run-at <rfc3339> | --cron "<min hour dom mon dow>")
+        \\zoid jobs create <path.lua> (--at <datetime-expression> | --cron "<min hour dom mon dow>")
         \\  Creates a scheduled Lua job from a relative path or /path under workspace root.
         \\
         \\zoid jobs list
@@ -281,15 +281,15 @@ test "execute rejects invalid timeout flag value" {
     try std.testing.expectError(error.InvalidExecuteArguments, parseCommand(&args));
 }
 
-test "jobs create lua with run-at parses" {
-    const args = [_][]const u8{ "zoid", "jobs", "create", "scripts/a.lua", "--run-at", "2026-02-22T21:00:00Z" };
+test "jobs create lua with at parses" {
+    const args = [_][]const u8{ "zoid", "jobs", "create", "scripts/a.lua", "--at", "2026-02-22T21:00:00Z" };
     const command = try parseCommand(&args);
 
     switch (command) {
         .jobs => |jobs_cmd| switch (jobs_cmd) {
             .create => |create| {
                 try std.testing.expectEqualStrings("scripts/a.lua", create.path);
-                try std.testing.expectEqualStrings("2026-02-22T21:00:00Z", create.run_at.?);
+                try std.testing.expectEqualStrings("2026-02-22T21:00:00Z", create.at.?);
                 try std.testing.expect(create.cron == null);
             },
             else => return error.UnexpectedCommand,
@@ -306,7 +306,7 @@ test "jobs create lua with cron parses" {
         .jobs => |jobs_cmd| switch (jobs_cmd) {
             .create => |create| {
                 try std.testing.expectEqualStrings("note.lua", create.path);
-                try std.testing.expect(create.run_at == null);
+                try std.testing.expect(create.at == null);
                 try std.testing.expectEqualStrings("0 21 * * *", create.cron.?);
             },
             else => return error.UnexpectedCommand,
@@ -331,17 +331,22 @@ test "jobs requires one schedule variant" {
 }
 
 test "jobs rejects duplicate schedule variants" {
-    const args = [_][]const u8{ "zoid", "jobs", "create", "task.lua", "--run-at", "2026-01-01T00:00:00Z", "--cron", "0 * * * *" };
+    const args = [_][]const u8{ "zoid", "jobs", "create", "task.lua", "--at", "2026-01-01T00:00:00Z", "--cron", "0 * * * *" };
     try std.testing.expectError(error.InvalidJobsArguments, parseCommand(&args));
 }
 
 test "jobs rejects unsupported chat id flag" {
-    const args = [_][]const u8{ "zoid", "jobs", "create", "task.lua", "--run-at", "2026-01-01T00:00:00Z", "--chat-id", "123" };
+    const args = [_][]const u8{ "zoid", "jobs", "create", "task.lua", "--at", "2026-01-01T00:00:00Z", "--chat-id", "123" };
     try std.testing.expectError(error.InvalidJobsArguments, parseCommand(&args));
 }
 
 test "jobs rejects unsupported path extension" {
-    const args = [_][]const u8{ "zoid", "jobs", "create", "task.txt", "--run-at", "2026-01-01T00:00:00Z" };
+    const args = [_][]const u8{ "zoid", "jobs", "create", "task.txt", "--at", "2026-01-01T00:00:00Z" };
+    try std.testing.expectError(error.InvalidJobsArguments, parseCommand(&args));
+}
+
+test "jobs rejects deprecated run-at flag" {
+    const args = [_][]const u8{ "zoid", "jobs", "create", "task.lua", "--run-at", "2026-01-01T00:00:00Z" };
     try std.testing.expectError(error.InvalidJobsArguments, parseCommand(&args));
 }
 

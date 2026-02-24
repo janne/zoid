@@ -46,6 +46,8 @@ If you change command behavior, error handling, config format, or Lua execution 
   - Update execution flow and user-visible errors in `src/main.zig`.
   - Jobs CLI commands live under `zoid jobs ...` with create/list/delete/pause/resume.
   - `zoid jobs create` takes a single path argument and requires a `.lua` extension.
+  - `zoid jobs create` accepts exactly one schedule input: `--at <datetime-expression>` or `--cron "<min hour dom mon dow>"`.
+  - `--at` is parsed via timelib and accepts natural-language date/time text.
   - Scheduler job ids are short random 5-character base36 strings; generation retries under scheduler lock to avoid collisions.
   - `zoid jobs list` renders a compact single-line table (`JOB ST NEXT SCHEDULE LAST PATH`); `JOB` is the job id.
   - Workspace paths accept both relative paths and leading-slash workspace-absolute paths (`/path/from/workspace/root`) for `zoid execute` and `zoid jobs create`; `zoid jobs list` prints paths in this workspace-absolute `/...` format.
@@ -115,7 +117,8 @@ If you change command behavior, error handling, config format, or Lua execution 
   - `zoid.uri(...):get/delete/post/put` accept optional request options with `headers` table (string->string); header names/values are validated and dangerous overrides such as `Host`/`Content-Length` are rejected.
   - `zoid.json.decode` maps JSON values to Lua tables/scalars and maps JSON `null` to the sentinel `zoid.json.null`.
   - `zoid.time([table])` and `zoid.date([format[, epoch]])` provide safe time/date helpers while global `os` remains disabled; behavior is aligned with Lua `os.time`/`os.date`, including date-table normalization in `zoid.time`.
-  - `jobs` tool supports `create/list/delete/pause/resume`; create supports `.lua` paths with exactly one schedule input (`run_at` RFC3339 or 5-field `cron`), and does not resolve Telegram destination at create time.
+  - `jobs` tool supports `create/list/delete/pause/resume`; create supports `.lua` paths with exactly one schedule input (`at` natural-language date-time or 5-field `cron`), and does not resolve Telegram destination at create time.
+  - Timelib integration is compiled from the timelib sources vendored in `php-src` (`ext/date/lib`) because that tree includes generated parser files (`parse_date.c`, `parse_iso_intervals.c`) without requiring local `re2c`.
   - In `telegram_bot` scheduled processing, skip agent dispatch when Lua stdout+stderr are both empty (after trim).
   - Tool-mode routes stderr through `zoid.eprint(...)` and stdout through global `print(...)`, both captured for agent inspection without enabling general file I/O APIs.
   - `shell_command` and `exec` are intentionally disabled for OpenAI tool calls; unknown/disabled tool calls must return `error.ToolDisabled`.

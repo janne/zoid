@@ -799,7 +799,7 @@ fn executeScheduler(
     if (std.mem.eql(u8, action, "create")) {
         const path = try requireStringProperty(root_object, "path");
 
-        const run_at: ?[]const u8 = if (root_object.get("run_at")) |value|
+        const at: ?[]const u8 = if (root_object.get("at")) |value|
             switch (value) {
                 .string => |text| text,
                 .null => null,
@@ -822,7 +822,7 @@ fn executeScheduler(
             context,
             .{
                 .path = path,
-                .run_at = run_at,
+                .at = at,
                 .cron = cron,
             },
         );
@@ -898,7 +898,7 @@ fn writeSchedulerJobJson(
     try writeJsonString(allocator, writer, workspace_path);
     try writer.writeAll(",\"paused\":");
     try writer.writeAll(if (job.paused) "true" else "false");
-    try writer.writeAll(",\"run_at\":");
+    try writer.writeAll(",\"at\":");
     if (job.run_at) |run_at| {
         try writer.print("{d}", .{run_at});
     } else {
@@ -1167,7 +1167,7 @@ test "jobs tool can create and list jobs" {
         &policy,
         .{ .request_chat_id = 777 },
         "jobs",
-        "{\"action\":\"create\",\"path\":\"task.lua\",\"run_at\":\"2026-01-10T10:00:00Z\"}",
+        "{\"action\":\"create\",\"path\":\"task.lua\",\"at\":\"2026-01-10T10:00:00Z\"}",
     );
     defer std.testing.allocator.free(create_result);
 
@@ -1179,6 +1179,8 @@ test "jobs tool can create and list jobs" {
     try std.testing.expectEqualStrings("create", create_object.get("action").?.string);
     const created_job = create_object.get("job").?.object;
     try std.testing.expectEqualStrings("/task.lua", created_job.get("path").?.string);
+    try std.testing.expect(created_job.get("at") != null);
+    try std.testing.expect(created_job.get("run_at") == null);
 
     const list_result = try executeToolCallWithContext(
         std.testing.allocator,
