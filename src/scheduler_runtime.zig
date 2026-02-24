@@ -2,6 +2,9 @@ const std = @import("std");
 const cron_adapter = @import("cron_adapter.zig");
 const scheduler_store = @import("scheduler_store.zig");
 const workspace_fs = @import("workspace_fs.zig");
+const short_job_id_alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
+const short_job_id_len: usize = 5;
+const max_job_id_generate_attempts: usize = 128;
 
 pub const telegram_dm_chat_id_state_file_name = "telegram_dm_chat_id.txt";
 
@@ -72,7 +75,7 @@ pub fn createJob(allocator: std.mem.Allocator, context: Context, request: Create
         jobs.deinit(allocator);
     }
 
-    const id = try generateJobId(allocator);
+    const id = try generateJobId(allocator, jobs.items);
 
     const new_job: scheduler_store.Job = .{
         .id = id,
@@ -112,17 +115,11 @@ pub fn deleteJob(allocator: std.mem.Allocator, context: Context, job_id: []const
         jobs.deinit(allocator);
     }
 
-    var index: usize = 0;
-    while (index < jobs.items.len) : (index += 1) {
-        if (std.mem.eql(u8, jobs.items[index].id, job_id)) {
-            var removed = jobs.orderedRemove(index);
-            removed.deinit(allocator);
-            try scheduler_store.saveJobs(allocator, context.workspace_root, jobs.items);
-            return true;
-        }
-    }
-
-    return false;
+    const index = findJobIndexById(jobs.items, job_id) orelse return false;
+    var removed = jobs.orderedRemove(index);
+    removed.deinit(allocator);
+    try scheduler_store.saveJobs(allocator, context.workspace_root, jobs.items);
+    return true;
 }
 
 pub fn pauseJob(allocator: std.mem.Allocator, context: Context, job_id: []const u8) !bool {
@@ -274,23 +271,27 @@ fn updatePausedState(
 
     const now = std.time.timestamp();
 
-    for (jobs.items) |*job| {
-        if (!std.mem.eql(u8, job.id, job_id)) continue;
-        job.paused = paused;
-        job.updated_at = now;
+    const index = findJobIndexById(jobs.items, job_id) orelse return false;
+    var job = &jobs.items[index];
+    job.paused = paused;
+    job.updated_at = now;
 
-        if (!paused) {
-            if (job.cron) |cron_value| {
-                const next_run_at = (try cron_adapter.nextRunAt(cron_value, now - 60)) orelse return error.InvalidSchedule;
-                job.next_run_at = next_run_at;
-            }
+    if (!paused) {
+        if (job.cron) |cron_value| {
+            const next_run_at = (try cron_adapter.nextRunAt(cron_value, now - 60)) orelse return error.InvalidSchedule;
+            job.next_run_at = next_run_at;
         }
-
-        try scheduler_store.saveJobs(allocator, context.workspace_root, jobs.items);
-        return true;
     }
 
-    return false;
+    try scheduler_store.saveJobs(allocator, context.workspace_root, jobs.items);
+    return true;
+}
+
+fn findJobIndexById(jobs: []const scheduler_store.Job, id: []const u8) ?usize {
+    for (jobs, 0..) |job, index| {
+        if (std.mem.eql(u8, job.id, id)) return index;
+    }
+    return null;
 }
 
 fn validateJobPath(job_type: scheduler_store.JobType, resolved_path: []const u8) !void {
@@ -349,10 +350,31 @@ pub fn loadDefaultDmChatId(allocator: std.mem.Allocator) !?i64 {
     return loadDefaultDmChatIdAtPath(allocator, state_path);
 }
 
-fn generateJobId(allocator: std.mem.Allocator) ![]u8 {
-    var random_value: u64 = undefined;
-    std.crypto.random.bytes(std.mem.asBytes(&random_value));
-    return std.fmt.allocPrint(allocator, "job-{d}-{x}", .{ std.time.nanoTimestamp(), random_value });
+fn generateJobId(allocator: std.mem.Allocator, existing_jobs: []const scheduler_store.Job) ![]u8 {
+    var candidate: [short_job_id_len]u8 = undefined;
+
+    var attempts: usize = 0;
+    while (attempts < max_job_id_generate_attempts) : (attempts += 1) {
+        var random_bytes: [short_job_id_len]u8 = undefined;
+        std.crypto.random.bytes(&random_bytes);
+
+        for (random_bytes, 0..) |byte, index| {
+            candidate[index] = short_job_id_alphabet[@as(usize, byte) % short_job_id_alphabet.len];
+        }
+
+        if (!jobIdExists(existing_jobs, candidate[0..])) {
+            return allocator.dupe(u8, candidate[0..]);
+        }
+    }
+
+    return error.JobIdGenerationFailed;
+}
+
+fn jobIdExists(jobs: []const scheduler_store.Job, id: []const u8) bool {
+    for (jobs) |job| {
+        if (std.mem.eql(u8, job.id, id)) return true;
+    }
+    return false;
 }
 
 fn isLeapYear(year: i64) bool {
@@ -444,6 +466,10 @@ test "createJob no longer requires chat context" {
     }
 
     try std.testing.expectEqual(@as(i64, 0), created.chat_id);
+    try std.testing.expectEqual(short_job_id_len, created.id.len);
+    for (created.id) |char| {
+        try std.testing.expect(std.mem.indexOfScalar(u8, short_job_id_alphabet, char) != null);
+    }
 }
 
 test "loadDefaultDmChatIdAtPath parses stored id" {
@@ -459,4 +485,55 @@ test "loadDefaultDmChatIdAtPath parses stored id" {
 
     const loaded = try loadDefaultDmChatIdAtPath(std.testing.allocator, dm_state_path);
     try std.testing.expectEqual(@as(i64, 555), loaded.?);
+}
+
+test "job id matching requires exact id" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    var jobs = [_]scheduler_store.Job{
+        .{
+            .id = try std.testing.allocator.dupe(u8, "job-abc"),
+            .job_type = .lua,
+            .path = try std.testing.allocator.dupe(u8, "/tmp/one.lua"),
+            .chat_id = 0,
+            .paused = false,
+            .run_at = 100,
+            .cron = null,
+            .next_run_at = 100,
+            .created_at = 1,
+            .updated_at = 1,
+            .last_run_at = null,
+        },
+        .{
+            .id = try std.testing.allocator.dupe(u8, "job-abcde"),
+            .job_type = .markdown,
+            .path = try std.testing.allocator.dupe(u8, "/tmp/two.md"),
+            .chat_id = 0,
+            .paused = false,
+            .run_at = null,
+            .cron = try std.testing.allocator.dupe(u8, "*/5 * * * *"),
+            .next_run_at = 200,
+            .created_at = 1,
+            .updated_at = 1,
+            .last_run_at = null,
+        },
+    };
+    defer for (&jobs) |*job| job.deinit(std.testing.allocator);
+
+    try scheduler_store.saveJobs(std.testing.allocator, workspace_root, &jobs);
+
+    const context = Context{ .workspace_root = workspace_root };
+    try std.testing.expect(try deleteJob(std.testing.allocator, context, "job-abc"));
+    try std.testing.expect(!(try pauseJob(std.testing.allocator, context, "job-abcd")));
+    try std.testing.expect(try pauseJob(std.testing.allocator, context, "job-abcde"));
+
+    const listed = try listJobs(std.testing.allocator, context);
+    defer scheduler_store.deinitJobs(std.testing.allocator, listed);
+    try std.testing.expectEqual(@as(usize, 1), listed.len);
+    try std.testing.expectEqualStrings("job-abcde", listed[0].id);
+    try std.testing.expect(listed[0].paused);
 }

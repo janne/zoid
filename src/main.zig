@@ -213,13 +213,12 @@ pub fn main() !void {
                     };
                     defer zoid.scheduler_store.deinitJobs(allocator, jobs);
 
-                    if (jobs.len == 0) {
-                        try std.fs.File.stdout().writeAll("No scheduled jobs.\n");
-                    } else {
-                        for (jobs) |*job| {
-                            try printScheduleJob(allocator, job);
-                        }
-                    }
+                    const output = formatScheduleJobList(allocator, workspace_root, jobs) catch |err| {
+                        std.debug.print("Failed to format job list: {s}\n", .{@errorName(err)});
+                        std.process.exit(1);
+                    };
+                    defer allocator.free(output);
+                    try std.fs.File.stdout().writeAll(output);
                 },
                 .delete => |job_id| {
                     const removed = zoid.scheduler_runtime.deleteJob(allocator, scheduler_context, job_id) catch |err| {
@@ -553,6 +552,214 @@ fn getWorkspaceRoot(allocator: std.mem.Allocator) ![]u8 {
     return std.fs.cwd().realpathAlloc(allocator, cwd);
 }
 
+const JobListRow = struct {
+    id: []const u8,
+    state: []const u8,
+    job_type: []const u8,
+    next_run: []u8,
+    schedule: []u8,
+    last_run: []u8,
+    path: []u8,
+
+    fn deinit(self: *JobListRow, allocator: std.mem.Allocator) void {
+        allocator.free(self.next_run);
+        allocator.free(self.schedule);
+        allocator.free(self.last_run);
+        allocator.free(self.path);
+    }
+};
+
+fn formatScheduleJobList(
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    jobs: []zoid.scheduler_store.Job,
+) ![]u8 {
+    if (jobs.len == 0) return allocator.dupe(u8, "No scheduled jobs.\n");
+
+    std.mem.sort(zoid.scheduler_store.Job, jobs, {}, sortJobsForList);
+
+    var rows = std.ArrayList(JobListRow).empty;
+    defer {
+        for (rows.items) |*row| row.deinit(allocator);
+        rows.deinit(allocator);
+    }
+
+    var id_width: usize = "JOB".len;
+    var state_width: usize = "ST".len;
+    var type_width: usize = "TYPE".len;
+    var next_width: usize = "NEXT".len;
+    var schedule_width: usize = "SCHEDULE".len;
+    var last_width: usize = "LAST".len;
+
+    for (jobs) |*job| {
+        const next_run = try formatEpochUtc(allocator, job.next_run_at);
+        errdefer allocator.free(next_run);
+
+        const schedule = try formatJobSchedule(allocator, job);
+        errdefer allocator.free(schedule);
+
+        const last_run = if (job.last_run_at) |value|
+            try formatEpochUtc(allocator, value)
+        else
+            try allocator.dupe(u8, "-");
+        errdefer allocator.free(last_run);
+
+        const relative_path = try std.fs.path.relative(allocator, workspace_root, job.path);
+        errdefer allocator.free(relative_path);
+
+        const row: JobListRow = .{
+            .id = job.id,
+            .state = if (job.paused) "P" else "R",
+            .job_type = zoid.scheduler_store.jobTypeToString(job.job_type),
+            .next_run = next_run,
+            .schedule = schedule,
+            .last_run = last_run,
+            .path = relative_path,
+        };
+
+        id_width = @max(id_width, row.id.len);
+        state_width = @max(state_width, row.state.len);
+        type_width = @max(type_width, row.job_type.len);
+        next_width = @max(next_width, row.next_run.len);
+        schedule_width = @max(schedule_width, row.schedule.len);
+        last_width = @max(last_width, row.last_run.len);
+
+        try rows.append(allocator, row);
+    }
+
+    var output = std.ArrayList(u8).empty;
+    errdefer output.deinit(allocator);
+
+    try appendScheduleListLine(
+        &output,
+        allocator,
+        "JOB",
+        id_width,
+        "ST",
+        state_width,
+        "TYPE",
+        type_width,
+        "NEXT",
+        next_width,
+        "SCHEDULE",
+        schedule_width,
+        "LAST",
+        last_width,
+        "PATH",
+    );
+
+    for (rows.items) |row| {
+        try appendScheduleListLine(
+            &output,
+            allocator,
+            row.id,
+            id_width,
+            row.state,
+            state_width,
+            row.job_type,
+            type_width,
+            row.next_run,
+            next_width,
+            row.schedule,
+            schedule_width,
+            row.last_run,
+            last_width,
+            row.path,
+        );
+    }
+
+    return output.toOwnedSlice(allocator);
+}
+
+fn appendScheduleListLine(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    id_width: usize,
+    state: []const u8,
+    state_width: usize,
+    job_type: []const u8,
+    type_width: usize,
+    next_run: []const u8,
+    next_width: usize,
+    schedule: []const u8,
+    schedule_width: usize,
+    last_run: []const u8,
+    last_width: usize,
+    path: []const u8,
+) !void {
+    try appendPaddedCell(output, allocator, id, id_width);
+    try output.append(allocator, ' ');
+    try appendPaddedCell(output, allocator, state, state_width);
+    try output.append(allocator, ' ');
+    try appendPaddedCell(output, allocator, job_type, type_width);
+    try output.append(allocator, ' ');
+    try appendPaddedCell(output, allocator, next_run, next_width);
+    try output.append(allocator, ' ');
+    try appendPaddedCell(output, allocator, schedule, schedule_width);
+    try output.append(allocator, ' ');
+    try appendPaddedCell(output, allocator, last_run, last_width);
+    try output.append(allocator, ' ');
+    try output.appendSlice(allocator, path);
+    try output.append(allocator, '\n');
+}
+
+fn appendPaddedCell(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    value: []const u8,
+    width: usize,
+) !void {
+    try output.appendSlice(allocator, value);
+    if (width <= value.len) return;
+
+    var remaining = width - value.len;
+    while (remaining > 0) : (remaining -= 1) {
+        try output.append(allocator, ' ');
+    }
+}
+
+fn formatJobSchedule(allocator: std.mem.Allocator, job: *const zoid.scheduler_store.Job) ![]u8 {
+    if (job.run_at) |run_at| {
+        const run_text = try formatEpochUtc(allocator, run_at);
+        defer allocator.free(run_text);
+        return std.fmt.allocPrint(allocator, "at:{s}", .{run_text});
+    }
+    if (job.cron) |cron| {
+        return std.fmt.allocPrint(allocator, "cron:{s}", .{cron});
+    }
+    return allocator.dupe(u8, "-");
+}
+
+fn formatEpochUtc(allocator: std.mem.Allocator, epoch: i64) ![]u8 {
+    if (epoch < 0) return std.fmt.allocPrint(allocator, "{d}", .{epoch});
+
+    const epoch_u64 = std.math.cast(u64, epoch) orelse return std.fmt.allocPrint(allocator, "{d}", .{epoch});
+    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = epoch_u64 };
+    const year_day = epoch_seconds.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_seconds = epoch_seconds.getDaySeconds();
+
+    return std.fmt.allocPrint(
+        allocator,
+        "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z",
+        .{
+            year_day.year,
+            month_day.month.numeric(),
+            month_day.day_index + 1,
+            day_seconds.getHoursIntoDay(),
+            day_seconds.getMinutesIntoHour(),
+            day_seconds.getSecondsIntoMinute(),
+        },
+    );
+}
+
+fn sortJobsForList(_: void, a: zoid.scheduler_store.Job, b: zoid.scheduler_store.Job) bool {
+    if (a.paused != b.paused) return !a.paused and b.paused;
+    if (a.next_run_at != b.next_run_at) return a.next_run_at < b.next_run_at;
+    return std.mem.order(u8, a.id, b.id) == .lt;
+}
+
 fn printScheduleJob(allocator: std.mem.Allocator, job: *const zoid.scheduler_store.Job) !void {
     const line1 = try std.fmt.allocPrint(allocator, "id={s} type={s} path={s} paused={}\n", .{
         job.id,
@@ -590,6 +797,54 @@ fn reportScheduleError(err: anyerror) void {
         },
         else => std.debug.print("Schedule operation failed: {s}\n", .{@errorName(err)}),
     }
+}
+
+test "formatScheduleJobList renders ps-like columns" {
+    var jobs = [_]zoid.scheduler_store.Job{
+        .{
+            .id = try std.testing.allocator.dupe(u8, "job-aaa111"),
+            .job_type = .lua,
+            .path = try std.testing.allocator.dupe(u8, "/tmp/first.lua"),
+            .chat_id = 0,
+            .paused = false,
+            .run_at = 0,
+            .cron = null,
+            .next_run_at = 0,
+            .created_at = 0,
+            .updated_at = 0,
+            .last_run_at = null,
+        },
+        .{
+            .id = try std.testing.allocator.dupe(u8, "job-bbb111"),
+            .job_type = .markdown,
+            .path = try std.testing.allocator.dupe(u8, "/tmp/second.md"),
+            .chat_id = 0,
+            .paused = true,
+            .run_at = null,
+            .cron = try std.testing.allocator.dupe(u8, "0 21 * * *"),
+            .next_run_at = 120,
+            .created_at = 0,
+            .updated_at = 0,
+            .last_run_at = 60,
+        },
+    };
+    defer for (&jobs) |*job| job.deinit(std.testing.allocator);
+
+    const output = try formatScheduleJobList(std.testing.allocator, "/tmp", &jobs);
+    defer std.testing.allocator.free(output);
+
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    const header = lines.next().?;
+    try std.testing.expect(std.mem.indexOf(u8, header, "JOB") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "ST") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "TYPE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "NEXT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "SCHEDULE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "LAST") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "PATH") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "cron:0 21 * * *") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "first.lua") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "second.md") != null);
 }
 
 test "executeLuaAsTool runs script with lua_execute sandbox policy" {

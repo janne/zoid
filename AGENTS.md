@@ -46,6 +46,8 @@ If you change command behavior, error handling, config format, or Lua execution 
   - Update execution flow and user-visible errors in `src/main.zig`.
   - Jobs CLI commands live under `zoid jobs ...` with create/list/delete/pause/resume.
   - `zoid jobs create` takes a single path argument and infers job type from extension: `.lua` or `.md`.
+  - Scheduler job ids are short random 5-character base36 strings; generation retries under scheduler lock to avoid collisions.
+  - `zoid jobs list` renders a compact single-line table (`JOB ST TYPE NEXT SCHEDULE LAST PATH`); `JOB` is the job id.
   - `zoid execute <file.lua> [args...]` must forward extra positional args to Lua global `arg` (`arg[0]` script path, `arg[1..]` forwarded args).
   - `zoid execute` supports optional `--timeout <seconds>` before `<file.lua>` to override Lua runtime timeout for that invocation.
   - `zoid execute <file.lua>` must use the same sandbox restrictions and `.lua` path policy as `lua_execute` so local script runs match tool-mode behavior.
