@@ -12,6 +12,8 @@ pub const enabled_tools = [_][]const u8{
     "filesystem_list",
     "filesystem_grep",
     "filesystem_write",
+    "filesystem_mkdir",
+    "filesystem_rmdir",
     "filesystem_delete",
     "lua_execute",
     "config",
@@ -113,6 +115,12 @@ pub fn executeToolCallWithContext(
     }
     if (std.mem.eql(u8, tool_name, "filesystem_write")) {
         return executeFilesystemWrite(allocator, policy, arguments_json);
+    }
+    if (std.mem.eql(u8, tool_name, "filesystem_mkdir")) {
+        return executeFilesystemMkdir(allocator, policy, arguments_json);
+    }
+    if (std.mem.eql(u8, tool_name, "filesystem_rmdir")) {
+        return executeFilesystemRmdir(allocator, policy, arguments_json);
     }
     if (std.mem.eql(u8, tool_name, "filesystem_delete")) {
         return executeFilesystemDelete(allocator, policy, arguments_json);
@@ -289,6 +297,78 @@ fn executeFilesystemList(
         try writePathMetadataJson(allocator, writer, &entry);
     }
     try writer.writeAll("]}");
+
+    return output.toOwnedSlice();
+}
+
+fn executeFilesystemMkdir(
+    allocator: std.mem.Allocator,
+    policy: *const Policy,
+    arguments_json: []const u8,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{});
+    defer parsed.deinit();
+
+    const root_object = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidToolArguments,
+    };
+
+    const requested_path = switch (root_object.get("path") orelse return error.InvalidToolArguments) {
+        .string => |value| value,
+        else => return error.InvalidToolArguments,
+    };
+
+    const mkdir_result = try workspace_fs.createDirectory(
+        allocator,
+        policy.workspace_root,
+        requested_path,
+    );
+    defer mkdir_result.deinit(allocator);
+
+    var output = std.Io.Writer.Allocating.init(allocator);
+    errdefer output.deinit();
+
+    const writer = &output.writer;
+    try writer.writeAll("{\"ok\":true,\"tool\":\"filesystem_mkdir\",\"path\":");
+    try writeJsonString(allocator, writer, mkdir_result.path);
+    try writer.writeAll(",\"created\":true}");
+
+    return output.toOwnedSlice();
+}
+
+fn executeFilesystemRmdir(
+    allocator: std.mem.Allocator,
+    policy: *const Policy,
+    arguments_json: []const u8,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{});
+    defer parsed.deinit();
+
+    const root_object = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidToolArguments,
+    };
+
+    const requested_path = switch (root_object.get("path") orelse return error.InvalidToolArguments) {
+        .string => |value| value,
+        else => return error.InvalidToolArguments,
+    };
+
+    const rmdir_result = try workspace_fs.removeDirectory(
+        allocator,
+        policy.workspace_root,
+        requested_path,
+    );
+    defer rmdir_result.deinit(allocator);
+
+    var output = std.Io.Writer.Allocating.init(allocator);
+    errdefer output.deinit();
+
+    const writer = &output.writer;
+    try writer.writeAll("{\"ok\":true,\"tool\":\"filesystem_rmdir\",\"path\":");
+    try writeJsonString(allocator, writer, rmdir_result.path);
+    try writer.writeAll(",\"removed\":true}");
 
     return output.toOwnedSlice();
 }
@@ -941,7 +1021,7 @@ test "buildPolicyJson emits required fields" {
     const root_object = parsed.value.object;
     try std.testing.expectEqualStrings("workspace-write", root_object.get("sandbox_mode").?.string);
     try std.testing.expectEqualStrings(policy.workspace_root, root_object.get("writable_roots").?.array.items[0].string);
-    try std.testing.expectEqual(@as(usize, 12), root_object.get("tools_enabled").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 14), root_object.get("tools_enabled").?.array.items.len);
 }
 
 test "jobs tool can create and list jobs" {
@@ -1024,6 +1104,145 @@ test "filesystem write and read stay within workspace root" {
     const read_object = parsed_read.value.object;
     try std.testing.expect(read_object.get("ok").?.bool);
     try std.testing.expectEqualStrings("hello", read_object.get("content").?.string);
+}
+
+test "filesystem mkdir creates a directory within workspace root" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+
+    const mkdir_result = try executeToolCall(
+        std.testing.allocator,
+        &policy,
+        "filesystem_mkdir",
+        "{\"path\":\"new-dir\"}",
+    );
+    defer std.testing.allocator.free(mkdir_result);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, mkdir_result, .{});
+    defer parsed.deinit();
+
+    const mkdir_object = parsed.value.object;
+    try std.testing.expect(mkdir_object.get("ok").?.bool);
+    try std.testing.expectEqualStrings("filesystem_mkdir", mkdir_object.get("tool").?.string);
+    try std.testing.expect(mkdir_object.get("created").?.bool);
+    try tmp.dir.access("new-dir", .{});
+}
+
+test "filesystem mkdir rejects traversal outside workspace root" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+
+    try std.testing.expectError(
+        error.PathNotAllowed,
+        executeToolCall(
+            std.testing.allocator,
+            &policy,
+            "filesystem_mkdir",
+            "{\"path\":\"../outside-dir\"}",
+        ),
+    );
+}
+
+test "filesystem rmdir removes an empty directory within workspace root" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+
+    const mkdir_result = try executeToolCall(
+        std.testing.allocator,
+        &policy,
+        "filesystem_mkdir",
+        "{\"path\":\"empty-dir\"}",
+    );
+    defer std.testing.allocator.free(mkdir_result);
+
+    const rmdir_result = try executeToolCall(
+        std.testing.allocator,
+        &policy,
+        "filesystem_rmdir",
+        "{\"path\":\"empty-dir\"}",
+    );
+    defer std.testing.allocator.free(rmdir_result);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, rmdir_result, .{});
+    defer parsed.deinit();
+
+    const rmdir_object = parsed.value.object;
+    try std.testing.expect(rmdir_object.get("ok").?.bool);
+    try std.testing.expectEqualStrings("filesystem_rmdir", rmdir_object.get("tool").?.string);
+    try std.testing.expect(rmdir_object.get("removed").?.bool);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("empty-dir", .{}));
+}
+
+test "filesystem rmdir rejects traversal outside workspace root" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+
+    try std.testing.expectError(
+        error.PathNotAllowed,
+        executeToolCall(
+            std.testing.allocator,
+            &policy,
+            "filesystem_rmdir",
+            "{\"path\":\"../outside-dir\"}",
+        ),
+    );
+}
+
+test "filesystem rmdir rejects non-empty directory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+
+    try tmp.dir.makeDir("non-empty");
+    {
+        const file = try tmp.dir.createFile("non-empty/file.txt", .{});
+        defer file.close();
+        try file.writeAll("x");
+    }
+
+    executeToolCall(
+        std.testing.allocator,
+        &policy,
+        "filesystem_rmdir",
+        "{\"path\":\"non-empty\"}",
+    ) catch |err| {
+        const err_name = @errorName(err);
+        const is_non_empty =
+            std.mem.eql(u8, err_name, "DirNotEmpty") or
+            std.mem.eql(u8, err_name, "DirectoryNotEmpty");
+        try std.testing.expect(is_non_empty);
+        return;
+    };
+    return error.TestExpectedError;
 }
 
 test "filesystem list returns metadata entries" {

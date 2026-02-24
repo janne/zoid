@@ -354,6 +354,10 @@ fn buildChatCompletionsPayloadWithTools(
     try writer.writeAll(",");
     try writeFilesystemWriteToolDefinition(allocator, writer, policy.workspace_root);
     try writer.writeAll(",");
+    try writeFilesystemMkdirToolDefinition(allocator, writer, policy.workspace_root);
+    try writer.writeAll(",");
+    try writeFilesystemRmdirToolDefinition(allocator, writer, policy.workspace_root);
+    try writer.writeAll(",");
     try writeFilesystemDeleteToolDefinition(allocator, writer, policy.workspace_root);
     try writer.writeAll(",");
     try writeLuaExecuteToolDefinition(allocator, writer, policy.workspace_root);
@@ -444,6 +448,40 @@ fn writeFilesystemWriteToolDefinition(
     try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"filesystem_write\",\"description\":");
     try writeJsonString(allocator, writer, description);
     try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"],\"additionalProperties\":false}}}");
+}
+
+fn writeFilesystemMkdirToolDefinition(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    workspace_root: []const u8,
+) !void {
+    const description = try std.fmt.allocPrint(
+        allocator,
+        "Create a directory under workspace root {s}. Path must resolve inside this root and must not already exist.",
+        .{workspace_root},
+    );
+    defer allocator.free(description);
+
+    try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"filesystem_mkdir\",\"description\":");
+    try writeJsonString(allocator, writer, description);
+    try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false}}}");
+}
+
+fn writeFilesystemRmdirToolDefinition(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    workspace_root: []const u8,
+) !void {
+    const description = try std.fmt.allocPrint(
+        allocator,
+        "Remove an empty directory under workspace root {s}. Path must resolve inside this root.",
+        .{workspace_root},
+    );
+    defer allocator.free(description);
+
+    try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"filesystem_rmdir\",\"description\":");
+    try writeJsonString(allocator, writer, description);
+    try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false}}}");
 }
 
 fn writeFilesystemDeleteToolDefinition(
@@ -806,7 +844,7 @@ test "buildChatCompletionsPayload creates valid payload" {
     try std.testing.expectEqualStrings("general kenobi", payload_messages[1].object.get("content").?.string);
 
     const tools = root.get("tools").?.array.items;
-    try std.testing.expectEqual(@as(usize, 12), tools.len);
+    try std.testing.expectEqual(@as(usize, 14), tools.len);
     try std.testing.expectEqualStrings("filesystem_read", tools[0].object.get("function").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("filesystem_list", tools[1].object.get("function").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("filesystem_grep", tools[2].object.get("function").?.object.get("name").?.string);
@@ -816,9 +854,11 @@ test "buildChatCompletionsPayload creates valid payload" {
     try std.testing.expectEqualStrings("boolean", grep_properties.get("recursive").?.object.get("type").?.string);
     try std.testing.expectEqual(@as(i64, tool_runtime.max_allowed_grep_matches), grep_properties.get("max_matches").?.object.get("maximum").?.integer);
     try std.testing.expectEqualStrings("filesystem_write", tools[3].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("filesystem_delete", tools[4].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("lua_execute", tools[5].object.get("function").?.object.get("name").?.string);
-    const lua_parameters = tools[5].object.get("function").?.object.get("parameters").?.object;
+    try std.testing.expectEqualStrings("filesystem_mkdir", tools[4].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("filesystem_rmdir", tools[5].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("filesystem_delete", tools[6].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("lua_execute", tools[7].object.get("function").?.object.get("name").?.string);
+    const lua_parameters = tools[7].object.get("function").?.object.get("parameters").?.object;
     const lua_properties = lua_parameters.get("properties").?.object;
     try std.testing.expect(lua_properties.get("path") != null);
     const args_property = lua_properties.get("args").?.object;
@@ -828,12 +868,12 @@ test "buildChatCompletionsPayload creates valid payload" {
     try std.testing.expectEqualStrings("integer", timeout_property.get("type").?.string);
     try std.testing.expectEqual(@as(i64, 1), timeout_property.get("minimum").?.integer);
     try std.testing.expectEqual(@as(i64, tool_runtime.max_allowed_lua_timeout_seconds), timeout_property.get("maximum").?.integer);
-    try std.testing.expectEqualStrings("config", tools[6].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("jobs", tools[7].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("http_get", tools[8].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("http_post", tools[9].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("http_put", tools[10].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("http_delete", tools[11].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("config", tools[8].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("jobs", tools[9].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("http_get", tools[10].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("http_post", tools[11].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("http_put", tools[12].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("http_delete", tools[13].object.get("function").?.object.get("name").?.string);
 }
 
 test "parseAssistantReply extracts assistant content" {
