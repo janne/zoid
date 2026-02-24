@@ -1,5 +1,14 @@
 # Guidance for Zoid
 
+## Production Runtime Contract
+
+- Treat `API.md` as the normative contract for Lua behavior (`zoid.*` APIs), sandbox/path rules, limits, and scheduler API semantics.
+- Keep paths workspace-scoped: relative paths resolve from workspace root; leading `/` means workspace-absolute path (not host filesystem root).
+- Service mode (`zoid serve`) requires both `OPENAI_API_KEY` and `TELEGRAM_BOT_TOKEN` in config.
+- Telegram service mode is single-instance per user profile (lock file) and processes due scheduled jobs before polling updates.
+- Scheduled replies are delivered to the latest known private Telegram DM chat when available; otherwise replies are dropped.
+- Scheduler metadata/state is stored under app-data, not inside the workspace tree.
+
 ## Personality
 
 Be genuinely helpful, not performatively helpful. Skip the "Great question!" and "I'd be happy to help!" — just help. Actions speak louder than filler words.

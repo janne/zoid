@@ -10,6 +10,7 @@ Zoid runs Lua in two ways:
 2. `lua_execute` (agent tool mode used through tool calls)
 
 Both modes use sandbox restrictions and Lua API surface.
+`zoid execute` uses the same `lua_execute` policy path, then writes captured `stdout`/`stderr` back to the process streams.
 
 ### Extra API Added by Zoid
 
@@ -25,6 +26,7 @@ Lua run through Zoid has a `zoid` global with:
 - `zoid.time([table])` epoch timestamp helper
 - `zoid.date([format[, epoch]])` date/time formatter helper
 - `zoid.exit([code])` script exit helper
+- `zoid.eprint(...)` stderr output helper
 
 File example:
 
@@ -173,7 +175,7 @@ Supported methods and return values:
 - `zoid.time([table]) -> integer` (Lua-compatible with `os.time`: `year`/`month`/`day` required, optional `hour`/`min`/`sec`/`isdst`; numeric fields are normalized by `mktime`, and table fields are updated with normalized values)
 - `zoid.date([format[, epoch]]) -> string | table` (`*t` format returns table fields `year`, `month`, `day`, `hour`, `min`, `sec`, `wday`, `yday`, optional `isdst`; `!` prefix forces UTC)
 - `zoid.exit([code]) -> never` (stops Lua script execution; defaults to exit code `0`)
-- `zoid.eprint(...)` writes to captured `stderr` (tab-separated arguments, newline appended)
+- `zoid.eprint(...)` writes to captured `stderr` (arguments are stringified and concatenated; no automatic tab/newline)
 
 ### APIs Removed or Disabled
 
@@ -185,6 +187,7 @@ The following standard Lua escape hatches are removed:
 - `require`
 - `dofile`
 - `loadfile`
+- `io`
 
 Use `zoid.import(path)` for sandboxed module loading instead.
 
@@ -193,7 +196,7 @@ Use `zoid.import(path)` for sandboxed module loading instead.
 The output APIs are replaced to capture script output safely:
 
 - `print(...)` is captured to `stdout` (tab-separated arguments, newline appended)
-- `zoid.eprint(...)` is captured to `stderr` (tab-separated arguments, newline appended)
+- `zoid.eprint(...)` is captured to `stderr` (arguments are stringified and concatenated; no automatic tab/newline)
 
 Captured streams are returned in tool JSON fields (`stdout`, `stderr`) instead of writing directly to terminal stdout/stderr. Tool-mode results also include `exit_code` (`null` unless the script called `zoid.exit`).
 
@@ -265,6 +268,8 @@ Method-specific behavior:
 - `:post([body], [options])` and `:put([body], [options])` accept an optional string body
 - `options.headers` accepts a table of string header names to string values
 - Header names/values are validated (invalid bytes and dangerous headers are rejected)
+- Header limits: at most 64 headers and 16 KiB total header bytes
+- Blocked header names: `Host`, `Content-Length`, `Transfer-Encoding` (case-insensitive)
 - Response body size is capped by sandbox policy
 
 ### Scheduler Rules
@@ -272,7 +277,7 @@ Method-specific behavior:
 `zoid.jobs.create` enforces:
 
 - `job_type` must be `"lua"` or `"markdown"`
-- `path` must resolve inside workspace root
+- `path` must resolve to an existing file inside workspace root
 - `.lua` jobs require `.lua` extension, markdown jobs require `.md` extension
 - exactly one schedule input is required: `run_at` (RFC3339) or `cron` (5-field cron)
 - no Telegram destination is resolved at create time
@@ -283,8 +288,8 @@ Method-specific behavior:
 
 `zoid.file(path):read([max_bytes])` is limited by sandbox policy:
 
-- Default read limit in tool sandbox: 128 KiB
-- Tool runtime policy can raise this limit (currently up to 1 MiB for `lua_execute`)
+- Base Lua tool sandbox default read limit: 128 KiB
+- `lua_execute` policy currently sets read limit to 1 MiB
 
 If requested `max_bytes` is invalid or above policy limit, the script receives a runtime error.
 
