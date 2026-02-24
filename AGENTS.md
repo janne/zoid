@@ -111,10 +111,10 @@ If you change command behavior, error handling, config format, or Lua execution 
   - `filesystem_grep` searches file content under a workspace path with optional recursion and match limits; tool result includes match path/line/column/text, files scanned, and truncation status.
   - Filesystem/tool/Lua/jobs path outputs should use workspace-absolute `/...` paths for user-facing JSON/tables/CLI output instead of host filesystem absolute paths.
   - `zoid.dir(path):grep(pattern, [options])` uses the same workspace sandbox/path rules as filesystem tools and supports `options.recursive` (default `true`) and `options.max_matches` (default `200`, max `5000`).
-  - `zoid.uri(uri)` allows only HTTP/HTTPS requests and returns a Lua table with `status`, `body`, and `ok`; response body capture is capped by sandbox policy (currently 1 MiB in `lua_execute`).
+  - `zoid.uri(uri)` allows only HTTP/HTTPS requests and returns a Lua table with `status`, `body`, and `ok`; response body capture is capped by tool policy (currently 1 MiB in `lua_execute`).
   - `zoid.uri(...):get/delete/post/put` accept optional request options with `headers` table (string->string); header names/values are validated and dangerous overrides such as `Host`/`Content-Length` are rejected.
   - `zoid.json.decode` maps JSON values to Lua tables/scalars and maps JSON `null` to the sentinel `zoid.json.null`.
-  - `zoid.time([table])` and `zoid.date([format[, epoch]])` provide safe time/date helpers inside sandboxed Lua while global `os` remains disabled; behavior is aligned with Lua `os.time`/`os.date`, including date-table normalization in `zoid.time`.
+  - `zoid.time([table])` and `zoid.date([format[, epoch]])` provide safe time/date helpers while global `os` remains disabled; behavior is aligned with Lua `os.time`/`os.date`, including date-table normalization in `zoid.time`.
   - `jobs` tool supports `create/list/delete/pause/resume`; create supports `.lua` and `.md` paths with exactly one schedule input (`run_at` RFC3339 or 5-field `cron`), and does not resolve Telegram destination at create time.
   - In `telegram_bot` scheduled processing, skip agent dispatch when Lua stdout+stderr are both empty (after trim), or when markdown content is empty (after trim).
   - Tool-mode routes stderr through `zoid.eprint(...)` and stdout through global `print(...)`, both captured for agent inspection without enabling general file I/O APIs.
@@ -129,10 +129,11 @@ If you change command behavior, error handling, config format, or Lua execution 
 ### Lua runner changes:
   - Keep clear load/runtime error reporting.
   - Preserve current error contract (`LuaStateInitFailed`, `LuaLoadFailed`, `LuaRuntimeFailed`).
+  - Keep Lua execution entrypoints tool-policy-only.
   - Tool-mode `zoid.jobs` API mirrors scheduler operations: `create/list/delete/pause/resume`.
 
 ### Lua script examples (`scripts/*.lua`) changes:
-  - Keep scripts compatible with the sandboxed `zoid` API surface (`zoid.file`, `zoid.dir`, `zoid.uri`, `zoid.config`, `zoid.jobs`, `zoid.import`, `zoid.json`, `zoid.time`, `zoid.date`, `zoid.exit`) and do not rely on removed globals like `os`/`package`/`require`.
+  - Keep scripts compatible with the `zoid` API surface (`zoid.file`, `zoid.dir`, `zoid.uri`, `zoid.config`, `zoid.jobs`, `zoid.import`, `zoid.json`, `zoid.time`, `zoid.date`, `zoid.exit`, `zoid.eprint`) and do not rely on removed globals like `os`/`package`/`require`.
   - `zoid execute <file.lua> [args...]` exposes Lua global `arg` with `arg[0]` as script path and `arg[1..]` as forwarded positional arguments.
   - `scripts/gmail.lua` is a CLI-style utility; it supports `--query`, `--limit`, `--id`, and `--labels`, with default query `is:unread in:inbox`.
   - `scripts/counter.lua` creates `counter.txt` with `1` when missing; otherwise it reads the current integer value, increments by `1`, and writes it back.

@@ -1,5 +1,5 @@
 -- scripts/gmail.lua
--- Gmail message listing utility using Zoid's sandboxed HTTP + config APIs.
+-- Gmail message listing utility using Zoid's HTTP + config APIs.
 --
 -- Required config keys:
 -- - GMAIL_CLIENT_ID
@@ -53,7 +53,7 @@ end
 local function parse_positive_integer(raw, flag_name)
   local value = tonumber(raw)
   if value == nil or value < 1 or value > 500 or math.floor(value) ~= value then
-    io.stderr:write("Invalid value for ", flag_name, ": ", tostring(raw), " (expected integer in range 1-500)\n")
+    zoid.eprint("Invalid value for", flag_name .. ":", tostring(raw), "(expected integer in range 1-500)")
     return nil
   end
   return value
@@ -80,7 +80,7 @@ local function parse_options()
     elseif token == "-q" or token == "--query" then
       local value = args[index + 1]
       if type(value) ~= "string" or value == "" then
-        io.stderr:write("Missing value for ", token, "\n")
+        zoid.eprint("Missing value for", token)
         usage()
         return nil, false
       end
@@ -89,7 +89,7 @@ local function parse_options()
     elseif token == "-n" or token == "--limit" then
       local value = args[index + 1]
       if type(value) ~= "string" or value == "" then
-        io.stderr:write("Missing value for ", token, "\n")
+        zoid.eprint("Missing value for", token)
         usage()
         return nil, false
       end
@@ -103,18 +103,18 @@ local function parse_options()
     elseif token == "--id" then
       local value = args[index + 1]
       if type(value) ~= "string" or value == "" then
-        io.stderr:write("Missing value for --id\n")
+        zoid.eprint("Missing value for --id")
         usage()
         return nil, false
       end
       options.message_id = value
       index = index + 1
     elseif string.sub(token, 1, 1) == "-" then
-      io.stderr:write("Unknown option: ", token, "\n")
+      zoid.eprint("Unknown option:", token)
       usage()
       return nil, false
     else
-      io.stderr:write("Unexpected argument: ", token, "\n")
+      zoid.eprint("Unexpected argument:", token)
       usage()
       return nil, false
     end

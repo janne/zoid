@@ -1,5 +1,5 @@
 -- scripts/ls.lua
--- ls -l-like directory listing using Zoid's sandboxed Lua API.
+-- ls -l-like directory listing using Zoid's Lua API.
 -- Usage:
 --   zoid execute scripts/ls.lua
 --   lua scripts/ls.lua [-a|--all] [path]
@@ -131,11 +131,11 @@ for _, token in ipairs(collect_args()) do
     usage()
     return
   elseif string.sub(token, 1, 1) == "-" then
-    io.stderr:write("Unknown option: ", token, "\n")
+    zoid.eprint("Unknown option:", token)
     usage()
     return
   elseif target_set then
-    io.stderr:write("Only one path argument is supported.\n")
+    zoid.eprint("Only one path argument is supported.")
     usage()
     return
   else
@@ -150,7 +150,7 @@ local ok_dir, dir_or_error = pcall(function()
 end)
 
 if not ok_dir then
-  io.stderr:write("Failed to open directory metadata: ", tostring(dir_or_error), "\n")
+  zoid.eprint("Failed to open directory metadata:", tostring(dir_or_error))
   return
 end
 directory = dir_or_error
@@ -161,7 +161,7 @@ local ok_list, list_or_error = pcall(function()
 end)
 
 if not ok_list then
-  io.stderr:write("Failed to list directory '", target_path, "': ", tostring(list_or_error), "\n")
+  zoid.eprint("Failed to list directory '" .. target_path .. "':", tostring(list_or_error))
   return
 end
 raw_entries = list_or_error
@@ -219,5 +219,5 @@ for _, entry in ipairs(entries) do
     format_modified_at(entry.modified_at),
     name
   )
-  io.write(listing, "\n")
+  print(listing)
 end

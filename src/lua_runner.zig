@@ -12,12 +12,6 @@ const c = @cImport({
     @cInclude("time.h");
 });
 
-pub const ExecuteLuaError = std.mem.Allocator.Error || error{
-    LuaStateInitFailed,
-    LuaLoadFailed,
-    LuaRuntimeFailed,
-};
-
 pub const CaptureError = std.mem.Allocator.Error;
 pub const default_tool_max_read_bytes: usize = 128 * 1024;
 pub const default_tool_max_http_response_bytes: usize = 1024 * 1024;
@@ -368,7 +362,7 @@ fn setLuaMetadataFields(state: *c.lua_State, metadata: *const workspace_fs.PathM
 
 fn luaZoidFileRead(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
-    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace context unavailable", .{});
     const nargs = c.lua_gettop(state);
 
     if (c.lua_type(state, 1) != c.LUA_TTABLE) {
@@ -393,7 +387,7 @@ fn luaZoidFileRead(lua_state: ?*c.lua_State) callconv(.c) c_int {
             return pushLuaErrorMessage(state, "zoid.file(path):read max_bytes is too large", .{});
         };
         if (converted > env.max_read_bytes) {
-            return pushLuaErrorMessage(state, "zoid.file(path):read max_bytes exceeds sandbox limit ({d})", .{env.max_read_bytes});
+            return pushLuaErrorMessage(state, "zoid.file(path):read max_bytes exceeds allowed limit ({d})", .{env.max_read_bytes});
         }
         max_bytes = converted;
     }
@@ -414,7 +408,7 @@ fn luaZoidFileRead(lua_state: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaZoidFileWrite(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
-    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace context unavailable", .{});
 
     if (c.lua_type(state, 1) != c.LUA_TTABLE) {
         return pushLuaErrorMessage(state, "zoid.file(path):write requires file handle", .{});
@@ -447,7 +441,7 @@ fn luaZoidFileWrite(lua_state: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaZoidFileDelete(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
-    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace context unavailable", .{});
 
     if (c.lua_type(state, 1) != c.LUA_TTABLE) {
         return pushLuaErrorMessage(state, "zoid.file(path):delete requires file handle", .{});
@@ -475,7 +469,7 @@ fn luaZoidFileDelete(lua_state: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaZoidFile(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
-    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace context unavailable", .{});
 
     var path_len: usize = 0;
     const path_ptr = c.luaL_checklstring(state, 1, &path_len) orelse return pushLuaErrorMessage(state, "zoid.file requires path", .{});
@@ -516,7 +510,7 @@ fn luaZoidFile(lua_state: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaZoidDirList(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
-    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace context unavailable", .{});
 
     if (c.lua_type(state, 1) != c.LUA_TTABLE) {
         return pushLuaErrorMessage(state, "zoid.dir(path):list requires directory handle", .{});
@@ -558,7 +552,7 @@ fn luaZoidDirList(lua_state: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaZoidDirCreate(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
-    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace context unavailable", .{});
 
     if (c.lua_type(state, 1) != c.LUA_TTABLE) {
         return pushLuaErrorMessage(state, "zoid.dir(path):create requires directory handle", .{});
@@ -585,7 +579,7 @@ fn luaZoidDirCreate(lua_state: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaZoidDirRemove(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
-    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace context unavailable", .{});
 
     if (c.lua_type(state, 1) != c.LUA_TTABLE) {
         return pushLuaErrorMessage(state, "zoid.dir(path):remove requires directory handle", .{});
@@ -612,7 +606,7 @@ fn luaZoidDirRemove(lua_state: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaZoidDirGrep(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
-    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace context unavailable", .{});
     const nargs = c.lua_gettop(state);
 
     if (c.lua_type(state, 1) != c.LUA_TTABLE) {
@@ -677,7 +671,7 @@ fn luaZoidDirGrep(lua_state: ?*c.lua_State) callconv(.c) c_int {
                     c.lua_settop(state, options_table);
                     return pushLuaErrorMessage(
                         state,
-                        "zoid.dir(path):grep option max_matches exceeds sandbox limit ({d})",
+                        "zoid.dir(path):grep option max_matches exceeds allowed limit ({d})",
                         .{workspace_fs.max_allowed_grep_matches},
                     );
                 }
@@ -736,7 +730,7 @@ fn luaZoidDirGrep(lua_state: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaZoidDir(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
-    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace context unavailable", .{});
 
     var path_len: usize = 0;
     const path_ptr = c.luaL_checklstring(state, 1, &path_len) orelse return pushLuaErrorMessage(state, "zoid.dir requires path", .{});
@@ -812,7 +806,7 @@ fn moduleStackContains(module_stack: []const []u8, module_path: []const u8) bool
 
 fn luaZoidImport(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
-    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace context unavailable", .{});
 
     const nargs = c.lua_gettop(state);
     if (nargs != 1) {
@@ -996,7 +990,7 @@ fn luaZoidUriRequest(
     method_name: []const u8,
     allows_body: bool,
 ) c_int {
-    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace context unavailable", .{});
     const nargs = c.lua_gettop(state);
 
     if (c.lua_type(state, 1) != c.LUA_TTABLE) {
@@ -1138,7 +1132,7 @@ fn luaZoidUri(lua_state: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaZoidConfigList(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
-    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace context unavailable", .{});
 
     if (c.lua_type(state, 1) != c.LUA_TTABLE) {
         return pushLuaErrorMessage(state, "zoid.config():list requires config handle", .{});
@@ -1169,7 +1163,7 @@ fn luaZoidConfigList(lua_state: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaZoidConfigGet(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
-    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace context unavailable", .{});
 
     if (c.lua_type(state, 1) != c.LUA_TTABLE) {
         return pushLuaErrorMessage(state, "zoid.config():get requires config handle", .{});
@@ -1203,7 +1197,7 @@ fn luaZoidConfigGet(lua_state: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaZoidConfigSet(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
-    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace context unavailable", .{});
 
     if (c.lua_type(state, 1) != c.LUA_TTABLE) {
         return pushLuaErrorMessage(state, "zoid.config():set requires config handle", .{});
@@ -1232,7 +1226,7 @@ fn luaZoidConfigSet(lua_state: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaZoidConfigUnset(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
-    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace context unavailable", .{});
 
     if (c.lua_type(state, 1) != c.LUA_TTABLE) {
         return pushLuaErrorMessage(state, "zoid.config():unset requires config handle", .{});
@@ -1331,7 +1325,7 @@ fn pushLuaSchedulerJobTable(
 
 fn luaZoidJobsCreate(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
-    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace context unavailable", .{});
 
     if (c.lua_type(state, 1) != c.LUA_TTABLE) {
         return pushLuaErrorMessage(state, "zoid.jobs.create requires a table argument", .{});
@@ -1430,7 +1424,7 @@ fn luaZoidJobsCreate(lua_state: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaZoidJobsList(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
-    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace context unavailable", .{});
 
     const jobs = scheduler_runtime.listJobs(
         env.allocator,
@@ -1453,7 +1447,7 @@ fn luaZoidJobsList(lua_state: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaZoidJobsDelete(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
-    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace context unavailable", .{});
 
     var job_id_len: usize = 0;
     const job_id_ptr = c.luaL_checklstring(state, 1, &job_id_len) orelse return pushLuaErrorMessage(state, "zoid.jobs.delete requires job id", .{});
@@ -1473,7 +1467,7 @@ fn luaZoidJobsDelete(lua_state: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaZoidJobsPause(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
-    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace context unavailable", .{});
 
     var job_id_len: usize = 0;
     const job_id_ptr = c.luaL_checklstring(state, 1, &job_id_len) orelse return pushLuaErrorMessage(state, "zoid.jobs.pause requires job id", .{});
@@ -1493,7 +1487,7 @@ fn luaZoidJobsPause(lua_state: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaZoidJobsResume(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
-    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace context unavailable", .{});
 
     var job_id_len: usize = 0;
     const job_id_ptr = c.luaL_checklstring(state, 1, &job_id_len) orelse return pushLuaErrorMessage(state, "zoid.jobs.resume requires job id", .{});
@@ -1530,7 +1524,7 @@ fn luaZoidJobs(lua_state: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaZoidJsonDecode(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
-    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace sandbox unavailable", .{});
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace context unavailable", .{});
 
     var json_len: usize = 0;
     const json_ptr = c.luaL_checklstring(state, 1, &json_len) orelse return pushLuaErrorMessage(state, "zoid.json.decode requires JSON string", .{});
@@ -1840,7 +1834,7 @@ fn setGlobalNil(lua_state: *c.lua_State, name: [*:0]const u8) void {
 fn restrictToolLuaEnvironment(lua_state: *c.lua_State, sandbox: *ToolLuaEnvironment) void {
     installZoidTable(lua_state, sandbox);
 
-    // Remove standard escape hatches; zoid.file(...), zoid.dir(...), zoid.uri(...), zoid.config(), zoid.import(...), zoid.json.decode, zoid.time, zoid.date, and zoid.eprint(...) are sandbox APIs.
+    // Remove standard escape hatches; zoid.file(...), zoid.dir(...), zoid.uri(...), zoid.config(), zoid.import(...), zoid.json.decode, zoid.time, zoid.date, and zoid.eprint(...) are tool APIs.
     setGlobalNil(lua_state, "workspace");
     setGlobalNil(lua_state, "os");
     setGlobalNil(lua_state, "package");
@@ -1854,7 +1848,7 @@ fn restrictToolLuaEnvironment(lua_state: *c.lua_State, sandbox: *ToolLuaEnvironm
 fn executeLuaFileCaptureOutputInternal(
     allocator: std.mem.Allocator,
     file_path: []const u8,
-    sandbox: ?ToolSandbox,
+    sandbox: ToolSandbox,
     script_args: []const []const u8,
 ) CaptureError!CapturedExecution {
     const c_file_path = try allocator.dupeZ(u8, file_path);
@@ -1877,41 +1871,37 @@ fn executeLuaFileCaptureOutputInternal(
     installOutputCapture(lua_state, &capture);
     installScriptArgs(lua_state, file_path, script_args);
 
-    var active_tool_env: ?*ToolLuaEnvironment = null;
-    defer if (active_tool_env) |env| {
+    const allocated_tool_env = try allocator.create(ToolLuaEnvironment);
+    errdefer allocator.destroy(allocated_tool_env);
+    allocated_tool_env.* = .{
+        .allocator = allocator,
+        .workspace_root = sandbox.workspace_root,
+        .max_read_bytes = sandbox.max_read_bytes,
+        .max_http_response_bytes = sandbox.max_http_response_bytes,
+        .config_path_override = sandbox.config_path_override,
+    };
+    defer {
+        const env = allocated_tool_env;
         env.deinit(lua_state);
         allocator.destroy(env);
-    };
-
-    var execution_timeout: ?LuaExecutionTimeout = null;
-    if (sandbox) |tool_sandbox| {
-        const allocated_tool_env = try allocator.create(ToolLuaEnvironment);
-        errdefer allocator.destroy(allocated_tool_env);
-        allocated_tool_env.* = .{
-            .allocator = allocator,
-            .workspace_root = tool_sandbox.workspace_root,
-            .max_read_bytes = tool_sandbox.max_read_bytes,
-            .max_http_response_bytes = tool_sandbox.max_http_response_bytes,
-            .config_path_override = tool_sandbox.config_path_override,
-        };
-        active_tool_env = allocated_tool_env;
-        restrictToolLuaEnvironment(lua_state, allocated_tool_env);
-
-        if (tool_sandbox.execution_timeout_ns) |timeout_ns| {
-            const timeout_seconds_u64 = timeout_ns / std.time.ns_per_s;
-            const timeout_seconds = std.math.cast(u32, timeout_seconds_u64) orelse std.math.maxInt(u32);
-            execution_timeout = .{
-                .deadline_ns = std.time.nanoTimestamp() + @as(i128, @intCast(timeout_ns)),
-                .timeout_seconds = if (timeout_seconds == 0) 1 else timeout_seconds,
-            };
-            installExecutionTimeout(lua_state, &execution_timeout.?);
-        }
-
-        try allocated_tool_env.pushModuleStackPath(file_path);
     }
 
-    const load_mode: ?[*:0]const u8 = if (sandbox != null) "t" else null;
-    if (c.luaL_loadfilex(lua_state, c_file_path.ptr, load_mode) != c.LUA_OK) {
+    var execution_timeout: ?LuaExecutionTimeout = null;
+    restrictToolLuaEnvironment(lua_state, allocated_tool_env);
+
+    if (sandbox.execution_timeout_ns) |timeout_ns| {
+        const timeout_seconds_u64 = timeout_ns / std.time.ns_per_s;
+        const timeout_seconds = std.math.cast(u32, timeout_seconds_u64) orelse std.math.maxInt(u32);
+        execution_timeout = .{
+            .deadline_ns = std.time.nanoTimestamp() + @as(i128, @intCast(timeout_ns)),
+            .timeout_seconds = if (timeout_seconds == 0) 1 else timeout_seconds,
+        };
+        installExecutionTimeout(lua_state, &execution_timeout.?);
+    }
+
+    try allocated_tool_env.pushModuleStackPath(file_path);
+
+    if (c.luaL_loadfilex(lua_state, c_file_path.ptr, "t") != c.LUA_OK) {
         capture.appendStderrSlice(luaErrorMessage(lua_state));
         return finalizeCapture(allocator, &capture, .load_failed, null);
     }
@@ -1955,33 +1945,6 @@ fn finalizeCapture(
     };
 }
 
-pub fn executeLuaFile(allocator: std.mem.Allocator, file_path: []const u8) ExecuteLuaError!void {
-    const c_file_path = try allocator.dupeZ(u8, file_path);
-    defer allocator.free(c_file_path);
-
-    const lua_state = c.luaL_newstate() orelse return error.LuaStateInitFailed;
-    defer c.lua_close(lua_state);
-
-    c.luaL_openlibs(lua_state);
-
-    if (c.luaL_loadfilex(lua_state, c_file_path.ptr, null) != c.LUA_OK) {
-        std.debug.print("Lua load error in '{s}': {s}\n", .{ file_path, luaErrorMessage(lua_state) });
-        return error.LuaLoadFailed;
-    }
-
-    if (c.lua_pcallk(lua_state, 0, c.LUA_MULTRET, 0, 0, null) != c.LUA_OK) {
-        std.debug.print("Lua runtime error in '{s}': {s}\n", .{ file_path, luaErrorMessage(lua_state) });
-        return error.LuaRuntimeFailed;
-    }
-}
-
-pub fn executeLuaFileCaptureOutput(
-    allocator: std.mem.Allocator,
-    file_path: []const u8,
-) CaptureError!CapturedExecution {
-    return executeLuaFileCaptureOutputInternal(allocator, file_path, null, &.{});
-}
-
 pub fn executeLuaFileCaptureOutputTool(
     allocator: std.mem.Allocator,
     file_path: []const u8,
@@ -1999,7 +1962,7 @@ pub fn executeLuaFileCaptureOutputToolWithArgs(
     return executeLuaFileCaptureOutputInternal(allocator, file_path, sandbox, script_args);
 }
 
-test "executeLuaFile runs a valid script" {
+test "executeLuaFileCaptureOutputTool runs a valid script" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2014,11 +1977,20 @@ test "executeLuaFile runs a valid script" {
 
     const abs_path = try tmp.dir.realpathAlloc(std.testing.allocator, file_path);
     defer std.testing.allocator.free(abs_path);
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
 
-    try executeLuaFile(std.testing.allocator, abs_path);
+    var output = try executeLuaFileCaptureOutputTool(std.testing.allocator, abs_path, .{
+        .workspace_root = workspace_root,
+    });
+    defer output.deinit(std.testing.allocator);
+
+    try std.testing.expect(output.status == .ok);
+    try std.testing.expectEqualStrings("", output.stdout);
+    try std.testing.expectEqualStrings("", output.stderr);
 }
 
-test "executeLuaFile returns runtime error for failing script" {
+test "executeLuaFileCaptureOutputTool returns runtime error for failing script" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2032,11 +2004,19 @@ test "executeLuaFile returns runtime error for failing script" {
 
     const abs_path = try tmp.dir.realpathAlloc(std.testing.allocator, file_path);
     defer std.testing.allocator.free(abs_path);
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
 
-    try std.testing.expectError(error.LuaRuntimeFailed, executeLuaFile(std.testing.allocator, abs_path));
+    var output = try executeLuaFileCaptureOutputTool(std.testing.allocator, abs_path, .{
+        .workspace_root = workspace_root,
+    });
+    defer output.deinit(std.testing.allocator);
+
+    try std.testing.expect(output.status == .runtime_failed);
+    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "boom") != null);
 }
 
-test "executeLuaFileCaptureOutput captures print output" {
+test "executeLuaFileCaptureOutputTool captures print output" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2051,8 +2031,12 @@ test "executeLuaFileCaptureOutput captures print output" {
 
     const abs_path = try tmp.dir.realpathAlloc(std.testing.allocator, file_path);
     defer std.testing.allocator.free(abs_path);
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
 
-    var output = try executeLuaFileCaptureOutput(std.testing.allocator, abs_path);
+    var output = try executeLuaFileCaptureOutputTool(std.testing.allocator, abs_path, .{
+        .workspace_root = workspace_root,
+    });
     defer output.deinit(std.testing.allocator);
 
     try std.testing.expect(output.status == .ok);
@@ -2060,7 +2044,7 @@ test "executeLuaFileCaptureOutput captures print output" {
     try std.testing.expectEqualStrings("", output.stderr);
 }
 
-test "executeLuaFileCaptureOutput captures runtime errors" {
+test "executeLuaFileCaptureOutputTool captures runtime errors" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2072,7 +2056,11 @@ test "executeLuaFileCaptureOutput captures runtime errors" {
 
     const boom_path = try tmp.dir.realpathAlloc(std.testing.allocator, "boom.lua");
     defer std.testing.allocator.free(boom_path);
-    var boom_output = try executeLuaFileCaptureOutput(std.testing.allocator, boom_path);
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+    var boom_output = try executeLuaFileCaptureOutputTool(std.testing.allocator, boom_path, .{
+        .workspace_root = workspace_root,
+    });
     defer boom_output.deinit(std.testing.allocator);
     try std.testing.expect(boom_output.status == .runtime_failed);
     try std.testing.expect(std.mem.indexOf(u8, boom_output.stderr, "boom") != null);
@@ -2082,7 +2070,7 @@ test "executeLuaFileCaptureOutputTool allows zoid file read/write/delete and cap
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const file_path = "sandbox_ok.lua";
+    const file_path = "tool_ok.lua";
     const file = try tmp.dir.createFile(file_path, .{});
     defer file.close();
     try file.writeAll(

@@ -1863,14 +1863,14 @@ test "lua execute rejects invalid timeout" {
     );
 }
 
-test "lua execute sandbox exposes zoid fs and blocks os" {
+test "lua execute exposes zoid fs and blocks os" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const file = try tmp.dir.createFile("sandbox.lua", .{});
+    const file = try tmp.dir.createFile("fs.lua", .{});
     defer file.close();
     try file.writeAll(
-        \\local file = zoid.file("sandbox.txt")
+        \\local file = zoid.file("file.txt")
         \\file:write("hello")
         \\print(file:read())
         \\file:delete()
@@ -1888,7 +1888,7 @@ test "lua execute sandbox exposes zoid fs and blocks os" {
         std.testing.allocator,
         &policy,
         "lua_execute",
-        "{\"path\":\"sandbox.lua\"}",
+        "{\"path\":\"fs.lua\"}",
     );
     defer std.testing.allocator.free(result);
 
@@ -1901,12 +1901,12 @@ test "lua execute sandbox exposes zoid fs and blocks os" {
     try std.testing.expect(std.mem.indexOf(u8, root_object.get("stderr").?.string, "os") != null);
     try std.testing.expectEqualStrings("LuaRuntimeFailed", root_object.get("error").?.string);
 
-    const deleted_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "sandbox.txt" });
+    const deleted_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "file.txt" });
     defer std.testing.allocator.free(deleted_path);
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(deleted_path, .{}));
 }
 
-test "lua execute sandbox exposes zoid uri handles" {
+test "lua execute exposes zoid uri handles" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 

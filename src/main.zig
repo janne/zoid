@@ -864,7 +864,7 @@ test "formatScheduleJobList renders ps-like columns" {
     try std.testing.expect(std.mem.indexOf(u8, output, "/second.md") != null);
 }
 
-test "executeLuaAsTool runs script with lua_execute sandbox policy" {
+test "executeLuaAsTool runs script with lua_execute policy" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
