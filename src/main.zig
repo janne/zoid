@@ -238,7 +238,9 @@ pub fn main() !void {
                     };
                     defer created.deinit(allocator);
 
-                    try printScheduleJob(allocator, workspace_root, &created);
+                    const output = try formatCreatedJobOutput(allocator, created.id);
+                    defer allocator.free(output);
+                    try std.fs.File.stdout().writeAll(output);
                 },
                 .list => {
                     const jobs = zoid.scheduler_runtime.listJobs(allocator, scheduler_context) catch |err| {
@@ -786,49 +788,8 @@ fn sortJobsForList(_: void, a: zoid.scheduler_store.Job, b: zoid.scheduler_store
     return std.mem.order(u8, a.id, b.id) == .lt;
 }
 
-fn printScheduleJob(
-    allocator: std.mem.Allocator,
-    workspace_root: []const u8,
-    job: *const zoid.scheduler_store.Job,
-) !void {
-    const relative_path = try std.fs.path.relative(allocator, workspace_root, job.path);
-    defer allocator.free(relative_path);
-    const workspace_absolute_path = if (relative_path.len == 0 or std.mem.eql(u8, relative_path, "."))
-        try allocator.dupe(u8, "/")
-    else
-        try std.fmt.allocPrint(allocator, "/{s}", .{relative_path});
-    defer allocator.free(workspace_absolute_path);
-
-    const line1 = try std.fmt.allocPrint(allocator, "id={s} path={s} paused={}\n", .{
-        job.id,
-        workspace_absolute_path,
-        job.paused,
-    });
-    defer allocator.free(line1);
-    try std.fs.File.stdout().writeAll(line1);
-
-    var tail = std.ArrayList(u8).empty;
-    defer tail.deinit(allocator);
-
-    const next_run_text = try formatEpochDisplay(allocator, job.next_run_at);
-    defer allocator.free(next_run_text);
-    try tail.appendSlice(allocator, "  next_run_at=");
-    try tail.appendSlice(allocator, next_run_text);
-    if (job.run_at) |run_at| {
-        const run_at_text = try formatEpochDisplay(allocator, run_at);
-        defer allocator.free(run_at_text);
-        try tail.writer(allocator).print(" at={s}", .{run_at_text});
-    }
-    if (job.cron) |cron| {
-        try tail.writer(allocator).print(" cron={s}", .{cron});
-    }
-    if (job.last_run_at) |last_run_at| {
-        const last_run_text = try formatEpochDisplay(allocator, last_run_at);
-        defer allocator.free(last_run_text);
-        try tail.writer(allocator).print(" last_run_at={s}", .{last_run_text});
-    }
-    try tail.append(allocator, '\n');
-    try std.fs.File.stdout().writeAll(tail.items);
+fn formatCreatedJobOutput(allocator: std.mem.Allocator, job_id: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}\n", .{job_id});
 }
 
 fn reportScheduleError(err: anyerror) void {
@@ -888,6 +849,13 @@ test "formatScheduleJobList renders ps-like columns" {
     try std.testing.expect(std.mem.indexOf(u8, output, "cron:0 21 * * *") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "/first.lua") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "/second.lua") != null);
+}
+
+test "formatCreatedJobOutput prints only id" {
+    const output = try formatCreatedJobOutput(std.testing.allocator, "0r55g");
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expectEqualStrings("0r55g\n", output);
 }
 
 test "executeLuaAsTool runs script with lua_execute policy" {
