@@ -11,6 +11,11 @@ pub fn main() !void {
 
     const command = zoid.cli.parseCommand(args) catch |err| {
         switch (err) {
+            error.InvalidInitArguments => {
+                std.debug.print("Invalid arguments for 'init'.\n\n", .{});
+                zoid.cli.printHelp();
+                return;
+            },
             error.MissingExecuteArgument => {
                 std.debug.print("Missing argument for 'execute'.\n\n", .{});
                 zoid.cli.printHelp();
@@ -77,6 +82,36 @@ pub fn main() !void {
 
     switch (command) {
         .help => zoid.cli.printHelp(),
+        .init => |init_cmd| {
+            var outcome = zoid.workspace_init.initWorkspace(
+                allocator,
+                init_cmd.path,
+                init_cmd.force,
+            ) catch |err| {
+                switch (err) {
+                    error.NotDir => std.debug.print("Init path is not a directory: {s}\n", .{init_cmd.path}),
+                    else => std.debug.print("Failed to initialize workspace: {s}\n", .{@errorName(err)}),
+                }
+                std.process.exit(1);
+            };
+            defer outcome.deinit(allocator);
+
+            if (outcome.conflict_path) |conflict_path| {
+                std.debug.print(
+                    "Init aborted because target file already exists: {s}. Use --force to overwrite.\n",
+                    .{conflict_path},
+                );
+                std.process.exit(1);
+            }
+
+            const message = try std.fmt.allocPrint(
+                allocator,
+                "Initialized workspace in {s} ({d} files copied).\n",
+                .{ init_cmd.path, outcome.copied_files },
+            );
+            defer allocator.free(message);
+            try std.fs.File.stdout().writeAll(message);
+        },
         .execute => |execute_cmd| {
             var outcome = executeLuaAsTool(
                 allocator,

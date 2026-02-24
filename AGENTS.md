@@ -6,6 +6,7 @@ Zoid is a Zig CLI project with embedded Lua support.
 ## Implementation
 The project provides:
 - A CLI binary (`zoid`) with command parsing in `src/cli.zig` and app entrypoint in `src/main.zig`.
+- Workspace bootstrap via `zoid init [<path>] [--force]` in `src/workspace_init.zig`, copying embedded template files sourced from `workspace/`.
 - Lua script execution via `zoid execute <file.lua>` in `src/lua_runner.zig`.
 - JSON config key/value storage via `zoid config set|get|unset|list` in `src/config_store.zig`.
 - Service mode via `zoid serve` in `src/telegram_bot.zig` (currently Telegram long-polling), maintaining conversation context per Telegram `chat_id`, persisting it under the app-data directory, forwarding messages to OpenAI, replying with `sendMessage`, and running scheduled jobs from app-data scheduler storage (workspace-scoped namespace).
@@ -13,6 +14,7 @@ The project provides:
 - Shared scheduler persistence/runtime in `src/scheduler_store.zig` + `src/scheduler_runtime.zig` with cron helper logic in `src/cron_adapter.zig`.
 - Shared OpenAI model policy in `src/model_catalog.zig` (default model, picker fallback models, and chat-model ID filtering rules).
 - Build + test pipeline in `build.zig`, including embedded Lua (static library from dependency `lua` in `build.zig.zon`).
+- Workspace template file contents are embedded at compile-time by recursively scanning `workspace/` in `build.zig`, generating module `workspace_templates`, and consuming it from `src/workspace_init.zig`.
 
 When documentation conflicts, prefer: `src/` and tests for current behavior.
 
@@ -20,7 +22,7 @@ When documentation conflicts, prefer: `src/` and tests for current behavior.
 - Keep all code, commit messages, and user-facing copy in English.
 - Do not preserve backward compatibility for command naming before first release; prefer replacing old names entirely (for example, `zoid schedule` -> `zoid jobs`).
 - Keep this `AGENTS.md` file updated whenever adding code or changing behavior.
-- Keep `API.md` updated when Lua runtime behavior or Lua sandbox APIs change.
+- Keep `workspace/API.md` updated when Lua runtime behavior or Lua sandbox APIs change.
 - Add notable implementation learnings to `AGENTS.md` so future changes can reuse them.
 - For adding Zig packages/dependencies, use `https://zigistry.dev/` as an input source.
 - Keep tests updated with behavior changes.
@@ -44,6 +46,8 @@ If you change command behavior, error handling, config format, or Lua execution 
 ### CLI changes:
   - Update parsing + help text in `src/cli.zig`.
   - Update execution flow and user-visible errors in `src/main.zig`.
+  - `zoid init [<path>] [--force]` copies embedded template files from `workspace/` into `<path>` (default current directory), fails on any existing target file unless `--force` is provided.
+  - `zoid init` template payload is generated recursively from all files under `workspace/` at build time; adding/removing files under `workspace/` requires rebuild but no code changes.
   - Jobs CLI commands live under `zoid jobs ...` with create/list/delete/pause/resume.
   - `zoid jobs create` takes a single path argument and requires a `.lua` extension.
   - `zoid jobs create` accepts exactly one schedule input: `--at <datetime-expression>` or `--cron "<min hour dom mon dow>"`.
@@ -135,11 +139,11 @@ If you change command behavior, error handling, config format, or Lua execution 
   - Keep Lua execution entrypoints tool-policy-only.
   - Tool-mode `zoid.jobs` API mirrors scheduler operations: `create/list/delete/pause/resume`.
 
-### Lua script examples (`scripts/*.lua`) changes:
+### Lua script examples (`workspace/scripts/*.lua`) changes:
   - Keep scripts compatible with the `zoid` API surface (`zoid.file`, `zoid.dir`, `zoid.uri`, `zoid.config`, `zoid.jobs`, `zoid.import`, `zoid.json`, `zoid.time`, `zoid.date`, `zoid.exit`, `zoid.eprint`) and do not rely on removed globals like `os`/`package`/`require`.
   - `zoid execute <file.lua> [args...]` exposes Lua global `arg` with `arg[0]` as script path and `arg[1..]` as forwarded positional arguments.
-  - `scripts/gmail.lua` is a CLI-style utility; it supports `--query`, `--limit`, `--id`, and `--labels`, with default query `is:unread in:inbox`.
-  - `scripts/counter.lua` creates `counter.txt` with `1` when missing; otherwise it reads the current integer value, increments by `1`, and writes it back.
+  - `workspace/scripts/gmail.lua` is a CLI-style utility; it supports `--query`, `--limit`, `--id`, and `--labels`, with default query `is:unread in:inbox`.
+  - `workspace/scripts/counter.lua` creates `counter.txt` with `1` when missing; otherwise it reads the current integer value, increments by `1`, and writes it back.
 
 ### Public module surface:
   - Keep `src/root.zig` exports aligned with intended package API.

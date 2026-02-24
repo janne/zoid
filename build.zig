@@ -1,5 +1,109 @@
 const std = @import("std");
 
+const WorkspaceTemplateFile = struct {
+    path: []const u8,
+    contents: []const u8,
+};
+
+fn readWorkspaceTemplateFile(b: *std.Build, path: []const u8) []const u8 {
+    return std.fs.cwd().readFileAlloc(b.allocator, path, std.math.maxInt(usize)) catch |err| {
+        std.debug.panic("failed to read workspace template {s}: {s}", .{ path, @errorName(err) });
+    };
+}
+
+fn appendZigStringLiteral(output: *std.ArrayList(u8), allocator: std.mem.Allocator, bytes: []const u8) !void {
+    try output.append(allocator, '"');
+    for (bytes) |byte| {
+        switch (byte) {
+            '\\' => try output.appendSlice(allocator, "\\\\"),
+            '"' => try output.appendSlice(allocator, "\\\""),
+            '\n' => try output.appendSlice(allocator, "\\n"),
+            '\r' => try output.appendSlice(allocator, "\\r"),
+            '\t' => try output.appendSlice(allocator, "\\t"),
+            else => {
+                if (byte >= 0x20 and byte <= 0x7e) {
+                    try output.append(allocator, byte);
+                } else {
+                    try output.writer(allocator).print("\\x{x:0>2}", .{byte});
+                }
+            },
+        }
+    }
+    try output.append(allocator, '"');
+}
+
+fn collectWorkspaceTemplateFilesInDir(
+    b: *std.Build,
+    root_path: []const u8,
+    relative_dir_path: []const u8,
+    files: *std.ArrayList(WorkspaceTemplateFile),
+) void {
+    const open_path = if (relative_dir_path.len == 0)
+        root_path
+    else
+        b.fmt("{s}/{s}", .{ root_path, relative_dir_path });
+
+    var dir = std.fs.cwd().openDir(open_path, .{ .iterate = true }) catch |err| {
+        std.debug.panic("failed to open workspace directory {s}: {s}", .{ open_path, @errorName(err) });
+    };
+    defer dir.close();
+
+    var iterator = dir.iterate();
+    while ((iterator.next() catch |err| {
+        std.debug.panic("failed to iterate workspace directory {s}: {s}", .{ open_path, @errorName(err) });
+    })) |entry| {
+        const relative_path = if (relative_dir_path.len == 0)
+            b.fmt("{s}", .{entry.name})
+        else
+            b.fmt("{s}/{s}", .{ relative_dir_path, entry.name });
+
+        switch (entry.kind) {
+            .directory => collectWorkspaceTemplateFilesInDir(b, root_path, relative_path, files),
+            .file => {
+                const content_path = b.fmt("{s}/{s}", .{ root_path, relative_path });
+                const contents = readWorkspaceTemplateFile(b, content_path);
+                files.append(b.allocator, .{
+                    .path = relative_path,
+                    .contents = contents,
+                }) catch @panic("out of memory while collecting workspace templates");
+            },
+            else => {},
+        }
+    }
+}
+
+fn sortWorkspaceTemplateFiles(_: void, a: WorkspaceTemplateFile, b: WorkspaceTemplateFile) bool {
+    return std.mem.order(u8, a.path, b.path) == .lt;
+}
+
+fn generateWorkspaceTemplatesModuleSource(b: *std.Build, root_path: []const u8) []const u8 {
+    var files = std.ArrayList(WorkspaceTemplateFile).empty;
+    defer files.deinit(b.allocator);
+
+    collectWorkspaceTemplateFilesInDir(b, root_path, "", &files);
+    std.mem.sort(WorkspaceTemplateFile, files.items, {}, sortWorkspaceTemplateFiles);
+
+    var output = std.ArrayList(u8).empty;
+    defer output.deinit(b.allocator);
+
+    output.appendSlice(b.allocator, "pub const EmbeddedFile = struct {\n") catch @panic("out of memory");
+    output.appendSlice(b.allocator, "    path: []const u8,\n") catch @panic("out of memory");
+    output.appendSlice(b.allocator, "    contents: []const u8,\n") catch @panic("out of memory");
+    output.appendSlice(b.allocator, "};\n\n") catch @panic("out of memory");
+    output.appendSlice(b.allocator, "pub const files = [_]EmbeddedFile{\n") catch @panic("out of memory");
+
+    for (files.items) |file| {
+        output.appendSlice(b.allocator, "    .{ .path = ") catch @panic("out of memory");
+        appendZigStringLiteral(&output, b.allocator, file.path) catch @panic("out of memory");
+        output.appendSlice(b.allocator, ", .contents = ") catch @panic("out of memory");
+        appendZigStringLiteral(&output, b.allocator, file.contents) catch @panic("out of memory");
+        output.appendSlice(b.allocator, " },\n") catch @panic("out of memory");
+    }
+
+    output.appendSlice(b.allocator, "};\n") catch @panic("out of memory");
+    return output.toOwnedSlice(b.allocator) catch @panic("out of memory");
+}
+
 fn addLuaSupport(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
     const lua_dep = b.dependency("lua", .{});
     const lua_root = lua_dep.path("");
@@ -138,6 +242,13 @@ pub fn build(b: *std.Build) void {
         // which requires us to specify a target.
         .target = target,
     });
+    const workspace_templates_source = generateWorkspaceTemplatesModuleSource(b, "workspace");
+    const generated = b.addWriteFiles();
+    const workspace_templates_path = generated.add("workspace_templates.zig", workspace_templates_source);
+    mod.addAnonymousImport("workspace_templates", .{
+        .root_source_file = workspace_templates_path,
+    });
+
     const vaxis_dep = b.dependency("vaxis", .{
         .target = target,
         .optimize = optimize,

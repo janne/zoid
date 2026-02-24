@@ -98,7 +98,7 @@ Scheduler example:
 
 ```lua
 local created = zoid.jobs.create({
-  path = "scripts/clean_up_docs.lua",
+  path = "scripts/cleanup.lua",
   cron = "0 21 * * *"
 })
 

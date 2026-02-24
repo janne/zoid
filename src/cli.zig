@@ -24,8 +24,14 @@ pub const JobsCommand = union(enum) {
     @"resume": []const u8,
 };
 
+pub const InitCommand = struct {
+    path: []const u8,
+    force: bool,
+};
+
 pub const Command = union(enum) {
     help,
+    init: InitCommand,
     execute: struct {
         file_path: []const u8,
         timeout: ?u32,
@@ -39,6 +45,7 @@ pub const Command = union(enum) {
 };
 
 pub const ParseCommandError = error{
+    InvalidInitArguments,
     MissingExecuteArgument,
     InvalidExecuteArguments,
     MissingRunArgument,
@@ -60,6 +67,10 @@ pub fn parseCommand(args: []const []const u8) ParseCommandError!Command {
 
     if (std.mem.eql(u8, cmd, "help")) {
         return .help;
+    }
+
+    if (std.mem.eql(u8, cmd, "init")) {
+        return .{ .init = try parseInitCommand(args[2..]) };
     }
 
     if (std.mem.eql(u8, cmd, "execute")) {
@@ -131,6 +142,29 @@ pub fn parseCommand(args: []const []const u8) ParseCommandError!Command {
     }
 
     return error.UnknownCommand;
+}
+
+fn parseInitCommand(args: []const []const u8) ParseCommandError!InitCommand {
+    var path: []const u8 = ".";
+    var force = false;
+    var saw_path = false;
+
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--force")) {
+            if (force) return error.InvalidInitArguments;
+            force = true;
+            continue;
+        }
+
+        if (saw_path) return error.InvalidInitArguments;
+        path = arg;
+        saw_path = true;
+    }
+
+    return .{
+        .path = path,
+        .force = force,
+    };
 }
 
 fn parseJobsCommand(args: []const []const u8) ParseCommandError!JobsCommand {
@@ -213,6 +247,9 @@ pub fn printHelp() void {
         \\zoid help
         \\  Show this help message.
         \\
+        \\zoid init [<path>] [--force]
+        \\  Copies embedded workspace template files into <path> (default: current directory). Fails when a target file already exists unless --force is provided.
+        \\
         \\zoid execute [--timeout <seconds>] <file.lua> [args...]
         \\  Executes <file.lua> (relative path or /path from workspace root), forwards [args...] to Lua `arg`, and enforces timeout (default 10s) in seconds.
         \\
@@ -258,6 +295,55 @@ test "default command is chat" {
     const args = [_][]const u8{"zoid"};
     const command = try parseCommand(&args);
     try std.testing.expect(command == .chat);
+}
+
+test "init parses with default path" {
+    const args = [_][]const u8{ "zoid", "init" };
+    const command = try parseCommand(&args);
+
+    switch (command) {
+        .init => |init_cmd| {
+            try std.testing.expectEqualStrings(".", init_cmd.path);
+            try std.testing.expect(!init_cmd.force);
+        },
+        else => return error.UnexpectedCommand,
+    }
+}
+
+test "init parses path with force" {
+    const args = [_][]const u8{ "zoid", "init", "my-workspace", "--force" };
+    const command = try parseCommand(&args);
+
+    switch (command) {
+        .init => |init_cmd| {
+            try std.testing.expectEqualStrings("my-workspace", init_cmd.path);
+            try std.testing.expect(init_cmd.force);
+        },
+        else => return error.UnexpectedCommand,
+    }
+}
+
+test "init parses force without explicit path" {
+    const args = [_][]const u8{ "zoid", "init", "--force" };
+    const command = try parseCommand(&args);
+
+    switch (command) {
+        .init => |init_cmd| {
+            try std.testing.expectEqualStrings(".", init_cmd.path);
+            try std.testing.expect(init_cmd.force);
+        },
+        else => return error.UnexpectedCommand,
+    }
+}
+
+test "init rejects extra path arguments" {
+    const args = [_][]const u8{ "zoid", "init", "a", "b" };
+    try std.testing.expectError(error.InvalidInitArguments, parseCommand(&args));
+}
+
+test "init rejects duplicate force flag" {
+    const args = [_][]const u8{ "zoid", "init", "--force", "--force" };
+    try std.testing.expectError(error.InvalidInitArguments, parseCommand(&args));
 }
 
 test "execute parses timeout flag" {

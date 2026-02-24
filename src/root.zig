@@ -10,3 +10,4 @@ pub const scheduler_runtime = @import("scheduler_runtime.zig");
 pub const scheduler_store = @import("scheduler_store.zig");
 pub const telegram_bot = @import("telegram_bot.zig");
 pub const tool_runtime = @import("tool_runtime.zig");
+pub const workspace_init = @import("workspace_init.zig");

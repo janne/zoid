@@ -4,7 +4,7 @@ Zoid
 A simple, lightweight, secure alternative to OpenClaw. Built on Zig and Lua.
 
 ## Simple
-- One small binary, including [Lua support](API.md), and integration with AI agents and Telegram.
+- One small binary, including [Lua support](workspace/API.md), and integration with AI agents and Telegram.
 - No external dependencies, all built into one binary.
 - One friendly CLI command for maintaining the service - zoid.
 
@@ -33,12 +33,20 @@ Zoid includes a shared scheduler backend that can be used from:
 Examples:
 
 ```sh
-zoid jobs create scripts/clean_up_docs.lua --cron "0 21 * * *"
+zoid jobs create scripts/cleanup.lua --cron "0 21 * * *"
 zoid jobs create reminders/pasta.lua --at "in 5 minutes"
 zoid jobs list
 zoid jobs pause <job_id>
 zoid jobs resume <job_id>
 zoid jobs delete <job_id>
+```
+
+Bootstrap a workspace with bundled templates:
+
+```sh
+zoid init
+zoid init /path/to/workspace
+zoid init /path/to/workspace --force
 ```
 
 Telegram routing for scheduled output:
