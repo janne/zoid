@@ -373,6 +373,8 @@ fn buildChatCompletionsPayloadWithTools(
     try writeHttpPutToolDefinition(allocator, writer);
     try writer.writeAll(",");
     try writeHttpDeleteToolDefinition(allocator, writer);
+    try writer.writeAll(",");
+    try writeDateTimeNowToolDefinition(allocator, writer);
     try writer.writeAll("],\"tool_choice\":");
     try writeJsonString(allocator, writer, tool_choice);
     try writer.writeAll("}");
@@ -605,6 +607,18 @@ fn writeHttpDeleteToolDefinition(
     try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"http_delete\",\"description\":");
     try writeJsonString(allocator, writer, description);
     try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"uri\":{\"type\":\"string\"}},\"required\":[\"uri\"],\"additionalProperties\":false}}}");
+}
+
+fn writeDateTimeNowToolDefinition(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+) !void {
+    const description =
+        "Get current date/time from the local runtime clock. " ++
+        "Returns current Unix epoch seconds and both UTC/local ISO-8601 timestamps.";
+    try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"datetime_now\",\"description\":");
+    try writeJsonString(allocator, writer, description);
+    try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}}");
 }
 
 fn buildRoleContentMessageJson(
@@ -844,7 +858,7 @@ test "buildChatCompletionsPayload creates valid payload" {
     try std.testing.expectEqualStrings("general kenobi", payload_messages[1].object.get("content").?.string);
 
     const tools = root.get("tools").?.array.items;
-    try std.testing.expectEqual(@as(usize, 14), tools.len);
+    try std.testing.expectEqual(@as(usize, 15), tools.len);
     try std.testing.expectEqualStrings("filesystem_read", tools[0].object.get("function").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("filesystem_list", tools[1].object.get("function").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("filesystem_grep", tools[2].object.get("function").?.object.get("name").?.string);
@@ -874,6 +888,7 @@ test "buildChatCompletionsPayload creates valid payload" {
     try std.testing.expectEqualStrings("http_post", tools[11].object.get("function").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("http_put", tools[12].object.get("function").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("http_delete", tools[13].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("datetime_now", tools[14].object.get("function").?.object.get("name").?.string);
 }
 
 test "parseAssistantReply extracts assistant content" {

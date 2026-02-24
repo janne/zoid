@@ -5,6 +5,9 @@ const lua_runner = @import("lua_runner.zig");
 const scheduler_runtime = @import("scheduler_runtime.zig");
 const scheduler_store = @import("scheduler_store.zig");
 const workspace_fs = @import("workspace_fs.zig");
+const c = @cImport({
+    @cInclude("time.h");
+});
 
 pub const sandbox_mode: []const u8 = "workspace-write";
 pub const enabled_tools = [_][]const u8{
@@ -22,6 +25,7 @@ pub const enabled_tools = [_][]const u8{
     "http_post",
     "http_put",
     "http_delete",
+    "datetime_now",
 };
 pub const disabled_tools = [_][]const u8{};
 pub const default_max_read_bytes: usize = 128 * 1024;
@@ -145,6 +149,9 @@ pub fn executeToolCallWithContext(
     }
     if (std.mem.eql(u8, tool_name, "http_delete")) {
         return executeHttpDelete(allocator, arguments_json);
+    }
+    if (std.mem.eql(u8, tool_name, "datetime_now")) {
+        return executeDateTimeNow(allocator, arguments_json);
     }
     return error.ToolDisabled;
 }
@@ -937,6 +944,46 @@ fn executeHttpDelete(allocator: std.mem.Allocator, arguments_json: []const u8) !
     return executeHttpRequestTool(allocator, "http_delete", .DELETE, false, arguments_json);
 }
 
+fn executeDateTimeNow(allocator: std.mem.Allocator, arguments_json: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{});
+    defer parsed.deinit();
+
+    const root_object = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidToolArguments,
+    };
+    if (root_object.count() != 0) return error.InvalidToolArguments;
+
+    const now_seconds = std.time.timestamp();
+    const timestamp: c.time_t = std.math.cast(c.time_t, now_seconds) orelse return error.TimeOutOfRange;
+
+    var utc_tm: c.struct_tm = std.mem.zeroes(c.struct_tm);
+    if (!tmFromTimestamp(timestamp, true, &utc_tm)) return error.TimeConversionFailed;
+
+    var local_tm: c.struct_tm = std.mem.zeroes(c.struct_tm);
+    if (!tmFromTimestamp(timestamp, false, &local_tm)) return error.TimeConversionFailed;
+
+    const utc_iso8601 = try formatTimestampAlloc(allocator, &utc_tm, "%Y-%m-%dT%H:%M:%SZ");
+    defer allocator.free(utc_iso8601);
+
+    const local_iso8601 = try formatTimestampAlloc(allocator, &local_tm, "%Y-%m-%dT%H:%M:%S%z");
+    defer allocator.free(local_iso8601);
+
+    var output = std.Io.Writer.Allocating.init(allocator);
+    errdefer output.deinit();
+    const writer = &output.writer;
+
+    try writer.writeAll("{\"ok\":true,\"tool\":\"datetime_now\",\"epoch\":");
+    try writer.print("{d}", .{now_seconds});
+    try writer.writeAll(",\"utc\":");
+    try writeJsonString(allocator, writer, utc_iso8601);
+    try writer.writeAll(",\"local\":");
+    try writeJsonString(allocator, writer, local_iso8601);
+    try writer.writeAll("}");
+
+    return output.toOwnedSlice();
+}
+
 fn executeHttpRequestTool(
     allocator: std.mem.Allocator,
     tool_name: []const u8,
@@ -996,6 +1043,30 @@ fn executeHttpRequestTool(
     return output.toOwnedSlice();
 }
 
+fn tmFromTimestamp(timestamp: c.time_t, utc: bool, out_tm: *c.struct_tm) bool {
+    var value = timestamp;
+    const tm_ptr = if (utc) c.gmtime(&value) else c.localtime(&value);
+    if (tm_ptr == null) return false;
+    out_tm.* = tm_ptr.*;
+    return true;
+}
+
+fn formatTimestampAlloc(
+    allocator: std.mem.Allocator,
+    tm_value: *const c.struct_tm,
+    comptime format: [:0]const u8,
+) ![]u8 {
+    var output_buffer: [64]u8 = undefined;
+    const written = c.strftime(
+        output_buffer[0..].ptr,
+        output_buffer.len,
+        format.ptr,
+        tm_value,
+    );
+    if (written == 0) return error.TimeFormattingFailed;
+    return allocator.dupe(u8, output_buffer[0..written]);
+}
+
 fn writeJsonString(allocator: std.mem.Allocator, writer: *std.Io.Writer, value: []const u8) !void {
     const escaped = try std.json.Stringify.valueAlloc(allocator, value, .{});
     defer allocator.free(escaped);
@@ -1021,7 +1092,40 @@ test "buildPolicyJson emits required fields" {
     const root_object = parsed.value.object;
     try std.testing.expectEqualStrings("workspace-write", root_object.get("sandbox_mode").?.string);
     try std.testing.expectEqualStrings(policy.workspace_root, root_object.get("writable_roots").?.array.items[0].string);
-    try std.testing.expectEqual(@as(usize, 14), root_object.get("tools_enabled").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 15), root_object.get("tools_enabled").?.array.items.len);
+}
+
+test "datetime_now returns current timestamp and formatted values" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+
+    const before = std.time.timestamp();
+    const result = try executeToolCall(
+        std.testing.allocator,
+        &policy,
+        "datetime_now",
+        "{}",
+    );
+    defer std.testing.allocator.free(result);
+    const after = std.time.timestamp();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expect(object.get("ok").?.bool);
+    try std.testing.expectEqualStrings("datetime_now", object.get("tool").?.string);
+
+    const epoch = object.get("epoch").?.integer;
+    try std.testing.expect(epoch >= before);
+    try std.testing.expect(epoch <= after);
+    try std.testing.expect(object.get("utc").?.string.len > 0);
+    try std.testing.expect(object.get("local").?.string.len > 0);
 }
 
 test "jobs tool can create and list jobs" {
