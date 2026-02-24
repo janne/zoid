@@ -18,6 +18,7 @@ const max_send_response_bytes: usize = 512 * 1024;
 const max_telegram_message_bytes: usize = 4000;
 const poll_backoff_ns: u64 = 3 * std.time.ns_per_s;
 const max_conversation_messages_per_chat: usize = 80;
+const user_inactivity_reset_seconds: i64 = 8 * std.time.s_per_hour;
 const max_conversation_state_file_bytes: usize = 8 * 1024 * 1024;
 const conversation_state_file_name = "telegram_context.json";
 const serve_lock_file_name = "telegram_serve.lock";
@@ -38,6 +39,7 @@ const InboundMessage = struct {
 
 const Conversation = struct {
     messages: std.ArrayList(openai_client.Message) = .empty,
+    last_user_message_at: ?i64 = null,
 
     fn deinit(self: *Conversation, allocator: std.mem.Allocator) void {
         for (self.messages.items) |message| allocator.free(message.content);
@@ -321,7 +323,21 @@ fn processPromptForChat(
     prompt: []const u8,
     workspace_instruction: ?[]const u8,
 ) !void {
+    const now = std.time.timestamp();
+    if (conversations.getPtr(chat_id)) |existing| {
+        if (shouldResetConversationForInactivity(existing, now)) {
+            _ = clearConversationForChat(allocator, conversations, chat_id);
+            persistConversationStoreAtPath(allocator, state_path, conversations) catch |err| {
+                std.debug.print(
+                    "Failed to persist Telegram conversation state after inactivity reset: {s}\n",
+                    .{@errorName(err)},
+                );
+            };
+        }
+    }
+
     const conversation = try getOrCreateConversation(conversations, chat_id);
+    conversation.last_user_message_at = now;
     try conversation.appendMessage(allocator, .user, prompt);
 
     var conversation_turn_committed = false;
@@ -373,6 +389,12 @@ fn processPromptForChat(
     persistConversationStoreAtPath(allocator, state_path, conversations) catch |err| {
         std.debug.print("Failed to persist Telegram conversation state: {s}\n", .{@errorName(err)});
     };
+}
+
+fn shouldResetConversationForInactivity(conversation: *const Conversation, now: i64) bool {
+    const last_user_message_at = conversation.last_user_message_at orelse return false;
+    if (now <= last_user_message_at) return false;
+    return now - last_user_message_at >= user_inactivity_reset_seconds;
 }
 
 fn processDueScheduledJobs(
@@ -531,6 +553,7 @@ fn persistConversationStoreAtPath(
 
 const StoredChat = struct {
     chat_id: i64,
+    last_user_message_at: ?i64,
     messages: []const openai_client.Message,
 };
 
@@ -547,6 +570,7 @@ fn writeConversationStoreJson(
         if (entry.value_ptr.messages.items.len == 0) continue;
         try chats.append(allocator, .{
             .chat_id = entry.key_ptr.*,
+            .last_user_message_at = entry.value_ptr.last_user_message_at,
             .messages = entry.value_ptr.messages.items,
         });
     }
@@ -561,6 +585,14 @@ fn writeConversationStoreJson(
         const chat_id_text = try std.fmt.allocPrint(allocator, "{d}", .{chat.chat_id});
         defer allocator.free(chat_id_text);
         try file.writeAll(chat_id_text);
+        try file.writeAll(",\"last_user_message_at\":");
+        if (chat.last_user_message_at) |last_user_message_at| {
+            const last_user_message_text = try std.fmt.allocPrint(allocator, "{d}", .{last_user_message_at});
+            defer allocator.free(last_user_message_text);
+            try file.writeAll(last_user_message_text);
+        } else {
+            try file.writeAll("null");
+        }
         try file.writeAll(",\"messages\":[");
 
         for (chat.messages, 0..) |message, message_index| {
@@ -622,6 +654,10 @@ fn loadConversationStoreAtPath(
         };
 
         const chat_id = parseJsonI64(chat_object.get("chat_id") orelse continue) orelse continue;
+        const last_user_message_at = if (chat_object.get("last_user_message_at")) |value|
+            parseJsonI64(value)
+        else
+            null;
         const messages_value = switch (chat_object.get("messages") orelse continue) {
             .array => |array| array,
             else => continue,
@@ -655,6 +691,7 @@ fn loadConversationStoreAtPath(
             continue;
         }
 
+        loaded.last_user_message_at = last_user_message_at;
         enforceConversationLimit(&loaded, allocator);
 
         const entry = try conversations.getOrPut(chat_id);
@@ -1248,10 +1285,12 @@ test "conversation state round-trips through disk persistence" {
     defer deinitConversationStore(std.testing.allocator, &original);
 
     const chat_a = try getOrCreateConversation(&original, 101);
+    chat_a.last_user_message_at = 1_700_000_000;
     try chat_a.appendMessage(std.testing.allocator, .user, "hello");
     try chat_a.appendMessage(std.testing.allocator, .assistant, "world");
 
     const chat_b = try getOrCreateConversation(&original, 202);
+    chat_b.last_user_message_at = 1_700_000_123;
     try chat_b.appendMessage(std.testing.allocator, .user, "hej");
 
     try persistConversationStoreAtPath(std.testing.allocator, state_path, &original);
@@ -1267,12 +1306,14 @@ test "conversation state round-trips through disk persistence" {
     try std.testing.expectEqualStrings("hello", restored_a.messages.items[0].content);
     try std.testing.expectEqual(openai_client.Role.assistant, restored_a.messages.items[1].role);
     try std.testing.expectEqualStrings("world", restored_a.messages.items[1].content);
+    try std.testing.expectEqual(@as(?i64, 1_700_000_000), restored_a.last_user_message_at);
 
     try std.testing.expect(restored.get(202) != null);
     const restored_b = restored.get(202).?;
     try std.testing.expectEqual(@as(usize, 1), restored_b.messages.items.len);
     try std.testing.expectEqual(openai_client.Role.user, restored_b.messages.items[0].role);
     try std.testing.expectEqualStrings("hej", restored_b.messages.items[0].content);
+    try std.testing.expectEqual(@as(?i64, 1_700_000_123), restored_b.last_user_message_at);
 }
 
 test "buildScheduledPrompt skips empty lua output" {
@@ -1336,4 +1377,15 @@ test "enforceConversationLimit removes oldest messages" {
         "m82",
         conversation.messages.items[conversation.messages.items.len - 1].content,
     );
+}
+
+test "shouldResetConversationForInactivity honors 8-hour threshold" {
+    var conversation = Conversation{};
+    defer conversation.deinit(std.testing.allocator);
+
+    try std.testing.expect(!shouldResetConversationForInactivity(&conversation, 1_000));
+
+    conversation.last_user_message_at = 1_000;
+    try std.testing.expect(!shouldResetConversationForInactivity(&conversation, 1_000 + user_inactivity_reset_seconds - 1));
+    try std.testing.expect(shouldResetConversationForInactivity(&conversation, 1_000 + user_inactivity_reset_seconds));
 }

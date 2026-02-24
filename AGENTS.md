@@ -62,6 +62,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - `zoid serve` is the long-running service entrypoint; currently it requires both `OPENAI_API_KEY` and `TELEGRAM_BOT_TOKEN` in config and runs a Telegram long-polling loop until interrupted.
   - `zoid chat` and `zoid serve` load `ZOID.md` from the workspace root on startup when present, and pass its content as additional agent instructions in OpenAI system context.
   - Telegram service mode keeps conversation history per `chat_id` (similar to local chat session continuity), persists it to app-data (`telegram_context.json` next to `config.json`), and enforces a per-chat history cap (`max_conversation_messages_per_chat` in `src/telegram_bot.zig`).
+  - Telegram service mode clears a chat's stored context before handling a new prompt when the last inbound user message for that `chat_id` is older than 8 hours.
   - Telegram service mode acquires an app-data lock file (`telegram_serve.lock`) so only one `zoid serve` instance runs per user profile; a second instance fails with `error.ServiceAlreadyRunning`.
   - `/new` or `/reset` clears that chat's stored Telegram context.
   - While generating a reply in Telegram service mode, send the native `sendChatAction` typing indicator periodically so users see Telegram's built-in "typing..." state until `sendMessage` completes.
