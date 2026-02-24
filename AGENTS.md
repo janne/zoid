@@ -9,7 +9,7 @@ The project provides:
 - Workspace bootstrap via `zoid init [<path>] [--force]` in `src/workspace_init.zig`, copying embedded template files sourced from `workspace/`.
 - Lua script execution via `zoid execute <file.lua>` in `src/lua_runner.zig`.
 - JSON config key/value storage via `zoid config set|get|unset|list` in `src/config_store.zig`.
-- Service mode via `zoid serve` in `src/telegram_bot.zig` (currently Telegram long-polling), maintaining conversation context per Telegram `chat_id`, persisting it under the app-data directory, forwarding messages to OpenAI, replying with `sendMessage`, and running scheduled jobs from app-data scheduler storage (workspace-scoped namespace).
+- Service mode via `zoid serve` in `src/telegram_bot.zig` (Telegram long-polling), maintaining conversation context per Telegram conversation key (`chat_id` + optional `message_thread_id`), persisting it under the app-data directory, forwarding messages to OpenAI, replying with `sendMessage`, and running scheduled jobs from app-data scheduler storage (workspace-scoped namespace).
 - OpenAI chat + one-shot run flows in `src/openai_client.zig` and `src/chat_session.zig`, including local tools (`filesystem_read`, `filesystem_list`, `filesystem_grep`, `filesystem_write`, `filesystem_mkdir`, `filesystem_rmdir`, `filesystem_delete`, `lua_execute`, `config`, `jobs`, `http_get`, `http_post`, `http_put`, `http_delete`, `datetime_now`) with workspace-root policy handling via `src/tool_runtime.zig`.
 - Shared scheduler persistence/runtime in `src/scheduler_store.zig` + `src/scheduler_runtime.zig` with cron helper logic in `src/cron_adapter.zig`.
 - Shared OpenAI model policy in `src/model_catalog.zig` (default model, picker fallback models, and chat-model ID filtering rules).
@@ -61,10 +61,11 @@ If you change command behavior, error handling, config format, or Lua execution 
   - Default command is `chat` when running `zoid` with no arguments.
   - `zoid serve` is the long-running service entrypoint; currently it requires both `OPENAI_API_KEY` and `TELEGRAM_BOT_TOKEN` in config and runs a Telegram long-polling loop until interrupted.
   - `zoid chat` and `zoid serve` load `ZOID.md` from the workspace root on startup when present, and pass its content as additional agent instructions in OpenAI system context.
-  - Telegram service mode keeps conversation history per `chat_id` (similar to local chat session continuity), persists it to app-data (`telegram_context.json` next to `config.json`), and enforces a per-chat history cap (`max_conversation_messages_per_chat` in `src/telegram_bot.zig`).
-  - Telegram service mode clears a chat's stored context before handling a new prompt when the last inbound user message for that `chat_id` is older than 8 hours.
+  - Telegram service mode keeps conversation history per conversation key (`chat_id` + optional `message_thread_id`), persists it to app-data (`telegram_context.json` next to `config.json`), and enforces a per-conversation history cap (`max_conversation_messages_per_chat` in `src/telegram_bot.zig`).
+  - Telegram service mode treats forum topics as separate sessions by keying context with `message_thread_id`, and sends replies/typing actions back to the same topic thread when present.
+  - Telegram service mode clears a conversation key's stored context before handling a new prompt when the last inbound user message for that key is older than 8 hours.
   - Telegram service mode acquires an app-data lock file (`telegram_serve.lock`) so only one `zoid serve` instance runs per user profile; a second instance fails with `error.ServiceAlreadyRunning`.
-  - `/new` or `/reset` clears that chat's stored Telegram context.
+  - `/new` or `/reset` clears stored Telegram context for the current conversation key (`chat_id` + optional `message_thread_id`).
   - While generating a reply in Telegram service mode, send the native `sendChatAction` typing indicator periodically so users see Telegram's built-in "typing..." state until `sendMessage` completes.
   - Telegram `sendMessage` requests set `parse_mode` to `MarkdownV2`.
   - Service mode processes due scheduled jobs before polling updates; scheduler output is sent to the assistant and assistant replies are delivered to Telegram DM when a DM chat id is available.

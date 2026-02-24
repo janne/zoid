@@ -33,8 +33,14 @@ const InboundChatKind = enum {
 
 const InboundMessage = struct {
     chat_id: i64,
+    thread_id: ?i64,
     chat_kind: InboundChatKind,
     text: []u8,
+};
+
+const ConversationKey = struct {
+    chat_id: i64,
+    thread_id: ?i64 = null,
 };
 
 const Conversation = struct {
@@ -67,7 +73,7 @@ const Conversation = struct {
     }
 };
 
-const ConversationStore = std.AutoHashMap(i64, Conversation);
+const ConversationStore = std.AutoHashMap(ConversationKey, Conversation);
 
 const PollBatch = struct {
     messages: []InboundMessage,
@@ -85,11 +91,13 @@ const TypingNotifier = struct {
     thread: ?std.Thread = null,
     bot_token: []const u8 = "",
     chat_id: i64 = 0,
+    thread_id: ?i64 = null,
 
-    fn start(self: *TypingNotifier, bot_token: []const u8, chat_id: i64) !void {
+    fn start(self: *TypingNotifier, bot_token: []const u8, chat_id: i64, thread_id: ?i64) !void {
         if (self.thread != null) return;
         self.bot_token = bot_token;
         self.chat_id = chat_id;
+        self.thread_id = thread_id;
         self.stop_flag.store(false, .release);
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
@@ -104,7 +112,7 @@ const TypingNotifier = struct {
 
     fn run(self: *TypingNotifier) void {
         while (!self.stop_flag.load(.acquire)) {
-            sendTypingAction(std.heap.page_allocator, self.bot_token, self.chat_id) catch |err| {
+            sendTypingAction(std.heap.page_allocator, self.bot_token, self.chat_id, self.thread_id) catch |err| {
                 std.debug.print(
                     "Telegram sendChatAction failed for chat {d}: {s}\n",
                     .{ self.chat_id, @errorName(err) },
@@ -206,6 +214,7 @@ pub fn runLongPolling(allocator: std.mem.Allocator, settings: Settings) !void {
                 settings.openai_model,
                 settings.bot_token,
                 message.chat_id,
+                message.thread_id,
                 message.text,
                 settings.workspace_instruction,
             ) catch |err| {
@@ -217,6 +226,7 @@ pub fn runLongPolling(allocator: std.mem.Allocator, settings: Settings) !void {
                     allocator,
                     settings.bot_token,
                     message.chat_id,
+                    message.thread_id,
                     "Failed to process your request. Please try again.",
                 ) catch |send_err| {
                     std.debug.print(
@@ -237,17 +247,29 @@ fn processInboundMessage(
     model: []const u8,
     bot_token: []const u8,
     chat_id: i64,
+    thread_id: ?i64,
     raw_text: []const u8,
     workspace_instruction: ?[]const u8,
 ) !void {
     const prompt = std.mem.trim(u8, raw_text, " \t\r\n");
     if (prompt.len == 0) {
-        try sendMessageInChunks(allocator, bot_token, chat_id, "Please send a non-empty message.");
+        try sendMessageInChunks(
+            allocator,
+            bot_token,
+            chat_id,
+            thread_id,
+            "Please send a non-empty message.",
+        );
         return;
     }
 
+    const conversation_key: ConversationKey = .{
+        .chat_id = chat_id,
+        .thread_id = thread_id,
+    };
+
     if (isResetCommand(prompt)) {
-        const had_conversation = clearConversationForChat(allocator, conversations, chat_id);
+        const had_conversation = clearConversationForKey(allocator, conversations, conversation_key);
         if (had_conversation) {
             persistConversationStoreAtPath(allocator, state_path, conversations) catch |err| {
                 std.debug.print("Failed to persist Telegram conversation state: {s}\n", .{@errorName(err)});
@@ -257,6 +279,7 @@ fn processInboundMessage(
             allocator,
             bot_token,
             chat_id,
+            thread_id,
             "Started a new session. Previous context cleared.",
         );
         return;
@@ -269,7 +292,7 @@ fn processInboundMessage(
         api_key,
         model,
         bot_token,
-        chat_id,
+        conversation_key,
         prompt,
         workspace_instruction,
     );
@@ -288,19 +311,19 @@ fn deinitConversationStore(
 
 fn getOrCreateConversation(
     conversations: *ConversationStore,
-    chat_id: i64,
+    key: ConversationKey,
 ) !*Conversation {
-    const entry = try conversations.getOrPut(chat_id);
+    const entry = try conversations.getOrPut(key);
     if (!entry.found_existing) entry.value_ptr.* = .{};
     return entry.value_ptr;
 }
 
-fn clearConversationForChat(
+fn clearConversationForKey(
     allocator: std.mem.Allocator,
     conversations: *ConversationStore,
-    chat_id: i64,
+    key: ConversationKey,
 ) bool {
-    if (conversations.fetchRemove(chat_id)) |entry| {
+    if (conversations.fetchRemove(key)) |entry| {
         var conversation = entry.value;
         conversation.deinit(allocator);
         return true;
@@ -319,14 +342,14 @@ fn processPromptForChat(
     api_key: []const u8,
     model: []const u8,
     bot_token: []const u8,
-    chat_id: i64,
+    key: ConversationKey,
     prompt: []const u8,
     workspace_instruction: ?[]const u8,
 ) !void {
     const now = std.time.timestamp();
-    if (conversations.getPtr(chat_id)) |existing| {
+    if (conversations.getPtr(key)) |existing| {
         if (shouldResetConversationForInactivity(existing, now)) {
-            _ = clearConversationForChat(allocator, conversations, chat_id);
+            _ = clearConversationForKey(allocator, conversations, key);
             persistConversationStoreAtPath(allocator, state_path, conversations) catch |err| {
                 std.debug.print(
                     "Failed to persist Telegram conversation state after inactivity reset: {s}\n",
@@ -336,7 +359,7 @@ fn processPromptForChat(
         }
     }
 
-    const conversation = try getOrCreateConversation(conversations, chat_id);
+    const conversation = try getOrCreateConversation(conversations, key);
     conversation.last_user_message_at = now;
     try conversation.appendMessage(allocator, .user, prompt);
 
@@ -348,10 +371,10 @@ fn processPromptForChat(
     }
 
     var typing_notifier: TypingNotifier = .{};
-    typing_notifier.start(bot_token, chat_id) catch |err| {
+    typing_notifier.start(bot_token, key.chat_id, key.thread_id) catch |err| {
         std.debug.print(
             "Failed to start Telegram typing notifier for chat {d}: {s}\n",
-            .{ chat_id, @errorName(err) },
+            .{ key.chat_id, @errorName(err) },
         );
     };
     defer typing_notifier.stop();
@@ -362,7 +385,7 @@ fn processPromptForChat(
         model,
         conversation.messages.items,
         .{
-            .request_chat_id = chat_id,
+            .request_chat_id = key.chat_id,
             .workspace_instruction = workspace_instruction,
         },
     );
@@ -375,13 +398,14 @@ fn processPromptForChat(
         try sendMessageInChunks(
             allocator,
             bot_token,
-            chat_id,
+            key.chat_id,
+            key.thread_id,
             "Assistant returned an empty response.",
         );
         return;
     }
 
-    try sendMessageInChunks(allocator, bot_token, chat_id, trimmed_reply);
+    try sendMessageInChunks(allocator, bot_token, key.chat_id, key.thread_id, trimmed_reply);
     try conversation.appendMessage(allocator, .assistant, trimmed_reply);
     enforceConversationLimit(conversation, allocator);
     conversation_turn_committed = true;
@@ -462,7 +486,7 @@ fn processDueScheduledJobs(
             break :blk null;
         };
         if (dm_chat_id) |chat_id| {
-            sendMessageInChunks(allocator, bot_token, chat_id, trimmed_reply) catch |err| {
+            sendMessageInChunks(allocator, bot_token, chat_id, null, trimmed_reply) catch |err| {
                 std.debug.print(
                     "Failed to send scheduled reply to Telegram DM {d}: {s}\n",
                     .{ chat_id, @errorName(err) },
@@ -552,7 +576,7 @@ fn persistConversationStoreAtPath(
 }
 
 const StoredChat = struct {
-    chat_id: i64,
+    key: ConversationKey,
     last_user_message_at: ?i64,
     messages: []const openai_client.Message,
 };
@@ -569,7 +593,7 @@ fn writeConversationStoreJson(
     while (iterator.next()) |entry| {
         if (entry.value_ptr.messages.items.len == 0) continue;
         try chats.append(allocator, .{
-            .chat_id = entry.key_ptr.*,
+            .key = entry.key_ptr.*,
             .last_user_message_at = entry.value_ptr.last_user_message_at,
             .messages = entry.value_ptr.messages.items,
         });
@@ -582,9 +606,17 @@ fn writeConversationStoreJson(
         if (chat_index > 0) try file.writeAll(",");
 
         try file.writeAll("{\"chat_id\":");
-        const chat_id_text = try std.fmt.allocPrint(allocator, "{d}", .{chat.chat_id});
+        const chat_id_text = try std.fmt.allocPrint(allocator, "{d}", .{chat.key.chat_id});
         defer allocator.free(chat_id_text);
         try file.writeAll(chat_id_text);
+        try file.writeAll(",\"message_thread_id\":");
+        if (chat.key.thread_id) |thread_id| {
+            const thread_id_text = try std.fmt.allocPrint(allocator, "{d}", .{thread_id});
+            defer allocator.free(thread_id_text);
+            try file.writeAll(thread_id_text);
+        } else {
+            try file.writeAll("null");
+        }
         try file.writeAll(",\"last_user_message_at\":");
         if (chat.last_user_message_at) |last_user_message_at| {
             const last_user_message_text = try std.fmt.allocPrint(allocator, "{d}", .{last_user_message_at});
@@ -616,7 +648,10 @@ fn writeConversationStoreJson(
 }
 
 fn sortStoredChatsAsc(_: void, lhs: StoredChat, rhs: StoredChat) bool {
-    return lhs.chat_id < rhs.chat_id;
+    if (lhs.key.chat_id != rhs.key.chat_id) return lhs.key.chat_id < rhs.key.chat_id;
+    if (lhs.key.thread_id == null) return rhs.key.thread_id != null;
+    if (rhs.key.thread_id == null) return false;
+    return lhs.key.thread_id.? < rhs.key.thread_id.?;
 }
 
 fn loadConversationStoreAtPath(
@@ -654,6 +689,10 @@ fn loadConversationStoreAtPath(
         };
 
         const chat_id = parseJsonI64(chat_object.get("chat_id") orelse continue) orelse continue;
+        const thread_id = if (chat_object.get("message_thread_id")) |value|
+            parseJsonI64(value)
+        else
+            null;
         const last_user_message_at = if (chat_object.get("last_user_message_at")) |value|
             parseJsonI64(value)
         else
@@ -694,7 +733,10 @@ fn loadConversationStoreAtPath(
         loaded.last_user_message_at = last_user_message_at;
         enforceConversationLimit(&loaded, allocator);
 
-        const entry = try conversations.getOrPut(chat_id);
+        const entry = try conversations.getOrPut(.{
+            .chat_id = chat_id,
+            .thread_id = thread_id,
+        });
         if (entry.found_existing) {
             entry.value_ptr.deinit(allocator);
         }
@@ -905,19 +947,18 @@ fn parsePollBatch(
             .object => |object| object,
             else => continue,
         };
-        const text = switch (message.get("text") orelse continue) {
-            .string => |value| value,
-            else => continue,
-        };
+        const text = parseInboundMessageText(message) orelse continue;
         const chat = switch (message.get("chat") orelse continue) {
             .object => |object| object,
             else => continue,
         };
         const chat_id = parseJsonI64(chat.get("id") orelse continue) orelse continue;
+        const thread_id = parseJsonI64(message.get("message_thread_id") orelse .null);
         const chat_kind = parseInboundChatKind(chat.get("type") orelse .null);
 
         try messages.append(allocator, .{
             .chat_id = chat_id,
+            .thread_id = thread_id,
             .chat_kind = chat_kind,
             .text = try allocator.dupe(u8, text),
         });
@@ -933,10 +974,11 @@ fn sendMessageInChunks(
     allocator: std.mem.Allocator,
     bot_token: []const u8,
     chat_id: i64,
+    thread_id: ?i64,
     text: []const u8,
 ) !void {
     if (text.len == 0) {
-        try sendMessage(allocator, bot_token, chat_id, " ");
+        try sendMessage(allocator, bot_token, chat_id, thread_id, " ");
         return;
     }
 
@@ -944,7 +986,7 @@ fn sendMessageInChunks(
     while (start < text.len) {
         const end = nextChunkBoundary(text, start, max_telegram_message_bytes);
         if (end <= start) return error.InvalidUtf8;
-        try sendMessage(allocator, bot_token, chat_id, text[start..end]);
+        try sendMessage(allocator, bot_token, chat_id, thread_id, text[start..end]);
         start = end;
     }
 }
@@ -973,6 +1015,7 @@ fn sendMessage(
     allocator: std.mem.Allocator,
     bot_token: []const u8,
     chat_id: i64,
+    thread_id: ?i64,
     text: []const u8,
 ) !void {
     const uri = try std.fmt.allocPrint(
@@ -982,7 +1025,7 @@ fn sendMessage(
     );
     defer allocator.free(uri);
 
-    const payload = try buildSendMessagePayload(allocator, chat_id, text);
+    const payload = try buildSendMessagePayload(allocator, chat_id, thread_id, text);
     defer allocator.free(payload);
 
     const headers = [_]http_client.RequestHeader{
@@ -1035,6 +1078,7 @@ fn sendTypingAction(
     allocator: std.mem.Allocator,
     bot_token: []const u8,
     chat_id: i64,
+    thread_id: ?i64,
 ) !void {
     const uri = try std.fmt.allocPrint(
         allocator,
@@ -1043,7 +1087,7 @@ fn sendTypingAction(
     );
     defer allocator.free(uri);
 
-    const payload = try buildChatActionPayload(allocator, chat_id, "typing");
+    const payload = try buildChatActionPayload(allocator, chat_id, thread_id, "typing");
     defer allocator.free(payload);
 
     const headers = [_]http_client.RequestHeader{
@@ -1095,31 +1139,43 @@ fn sendTypingAction(
 fn buildSendMessagePayload(
     allocator: std.mem.Allocator,
     chat_id: i64,
+    thread_id: ?i64,
     text: []const u8,
 ) ![]u8 {
     const escaped_text = try std.json.Stringify.valueAlloc(allocator, text, .{});
     defer allocator.free(escaped_text);
 
-    return try std.fmt.allocPrint(
-        allocator,
-        "{{\"chat_id\":{d},\"text\":{s},\"parse_mode\":\"{s}\"}}",
-        .{ chat_id, escaped_text, telegram_message_parse_mode },
-    );
+    var payload = std.ArrayList(u8).empty;
+    errdefer payload.deinit(allocator);
+    const writer = payload.writer(allocator);
+
+    try writer.print("{{\"chat_id\":{d}", .{chat_id});
+    if (thread_id) |value| {
+        try writer.print(",\"message_thread_id\":{d}", .{value});
+    }
+    try writer.print(",\"text\":{s},\"parse_mode\":\"{s}\"}}", .{ escaped_text, telegram_message_parse_mode });
+    return payload.toOwnedSlice(allocator);
 }
 
 fn buildChatActionPayload(
     allocator: std.mem.Allocator,
     chat_id: i64,
+    thread_id: ?i64,
     action: []const u8,
 ) ![]u8 {
     const escaped_action = try std.json.Stringify.valueAlloc(allocator, action, .{});
     defer allocator.free(escaped_action);
 
-    return try std.fmt.allocPrint(
-        allocator,
-        "{{\"chat_id\":{d},\"action\":{s}}}",
-        .{ chat_id, escaped_action },
-    );
+    var payload = std.ArrayList(u8).empty;
+    errdefer payload.deinit(allocator);
+    const writer = payload.writer(allocator);
+
+    try writer.print("{{\"chat_id\":{d}", .{chat_id});
+    if (thread_id) |value| {
+        try writer.print(",\"message_thread_id\":{d}", .{value});
+    }
+    try writer.print(",\"action\":{s}}}", .{escaped_action});
+    return payload.toOwnedSlice(allocator);
 }
 
 fn parseTelegramOk(allocator: std.mem.Allocator, response_body: []const u8) !bool {
@@ -1166,6 +1222,22 @@ fn parseJsonI64(value: std.json.Value) ?i64 {
     };
 }
 
+fn parseInboundMessageText(message: std.json.ObjectMap) ?[]const u8 {
+    if (message.get("text")) |text_value| {
+        return switch (text_value) {
+            .string => |value| value,
+            else => null,
+        };
+    }
+    if (message.get("caption")) |caption_value| {
+        return switch (caption_value) {
+            .string => |value| value,
+            else => null,
+        };
+    }
+    return null;
+}
+
 fn parseInboundChatKind(value: std.json.Value) InboundChatKind {
     const name = switch (value) {
         .string => |text| text,
@@ -1175,12 +1247,12 @@ fn parseInboundChatKind(value: std.json.Value) InboundChatKind {
     return .group_like;
 }
 
-test "parsePollBatch extracts text messages and advances offset" {
+test "parsePollBatch extracts text or caption and preserves thread ids" {
     const response =
         \\{"ok":true,"result":[
-        \\{"update_id":10,"message":{"chat":{"id":111,"type":"private"},"text":"hello"}},
+        \\{"update_id":10,"message":{"chat":{"id":111,"type":"private"},"text":"hello","message_thread_id":7}},
         \\{"update_id":11,"message":{"chat":{"id":111,"type":"private"}}},
-        \\{"update_id":12,"channel_post":{"chat":{"id":-222,"type":"channel"},"text":"hej"}}
+        \\{"update_id":12,"channel_post":{"chat":{"id":-222,"type":"channel"},"caption":"hej"}}
         \\]}
     ;
 
@@ -1190,9 +1262,11 @@ test "parsePollBatch extracts text messages and advances offset" {
     try std.testing.expectEqual(@as(i64, 13), batch.next_offset);
     try std.testing.expectEqual(@as(usize, 2), batch.messages.len);
     try std.testing.expectEqual(@as(i64, 111), batch.messages[0].chat_id);
+    try std.testing.expectEqual(@as(?i64, 7), batch.messages[0].thread_id);
     try std.testing.expectEqual(InboundChatKind.private, batch.messages[0].chat_kind);
     try std.testing.expectEqualStrings("hello", batch.messages[0].text);
     try std.testing.expectEqual(@as(i64, -222), batch.messages[1].chat_id);
+    try std.testing.expectEqual(@as(?i64, null), batch.messages[1].thread_id);
     try std.testing.expectEqual(InboundChatKind.group_like, batch.messages[1].chat_kind);
     try std.testing.expectEqualStrings("hej", batch.messages[1].text);
 }
@@ -1210,36 +1284,40 @@ test "nextChunkBoundary keeps utf-8 boundaries" {
     try std.testing.expectEqual(text.len, third);
 }
 
-test "conversation store keeps separate history per chat id" {
+test "conversation store keeps separate history per chat and thread key" {
     var conversations = ConversationStore.init(std.testing.allocator);
     defer deinitConversationStore(std.testing.allocator, &conversations);
 
-    const chat_1 = try getOrCreateConversation(&conversations, 111);
+    const key_a: ConversationKey = .{ .chat_id = 111, .thread_id = 5 };
+    const key_b: ConversationKey = .{ .chat_id = 111, .thread_id = 9 };
+    const chat_1 = try getOrCreateConversation(&conversations, key_a);
     try chat_1.appendMessage(std.testing.allocator, .user, "hello");
 
-    const chat_1_again = try getOrCreateConversation(&conversations, 111);
+    const chat_1_again = try getOrCreateConversation(&conversations, key_a);
     try std.testing.expectEqual(@as(usize, 1), chat_1_again.messages.items.len);
     try std.testing.expectEqual(openai_client.Role.user, chat_1_again.messages.items[0].role);
     try std.testing.expectEqualStrings("hello", chat_1_again.messages.items[0].content);
 
-    const chat_2 = try getOrCreateConversation(&conversations, 222);
+    const chat_2 = try getOrCreateConversation(&conversations, key_b);
     try std.testing.expectEqual(@as(usize, 0), chat_2.messages.items.len);
 }
 
-test "clearConversationForChat clears only target conversation" {
+test "clearConversationForKey clears only target conversation key" {
     var conversations = ConversationStore.init(std.testing.allocator);
     defer deinitConversationStore(std.testing.allocator, &conversations);
 
-    const chat_1 = try getOrCreateConversation(&conversations, 1);
+    const key_1: ConversationKey = .{ .chat_id = 1, .thread_id = 11 };
+    const key_2: ConversationKey = .{ .chat_id = 1, .thread_id = 22 };
+    const chat_1 = try getOrCreateConversation(&conversations, key_1);
     try chat_1.appendMessage(std.testing.allocator, .user, "one");
-    const chat_2 = try getOrCreateConversation(&conversations, 2);
+    const chat_2 = try getOrCreateConversation(&conversations, key_2);
     try chat_2.appendMessage(std.testing.allocator, .user, "two");
 
-    try std.testing.expect(clearConversationForChat(std.testing.allocator, &conversations, 1));
-    try std.testing.expect(!clearConversationForChat(std.testing.allocator, &conversations, 1));
+    try std.testing.expect(clearConversationForKey(std.testing.allocator, &conversations, key_1));
+    try std.testing.expect(!clearConversationForKey(std.testing.allocator, &conversations, key_1));
 
-    try std.testing.expect(conversations.get(1) == null);
-    const remaining = conversations.get(2) orelse unreachable;
+    try std.testing.expect(conversations.get(key_1) == null);
+    const remaining = conversations.get(key_2) orelse unreachable;
     try std.testing.expectEqual(@as(usize, 1), remaining.messages.items.len);
     try std.testing.expectEqualStrings("two", remaining.messages.items[0].content);
 }
@@ -1252,7 +1330,7 @@ test "isResetCommand matches supported telegram commands" {
 }
 
 test "buildChatActionPayload encodes chat action request" {
-    const payload = try buildChatActionPayload(std.testing.allocator, 42, "typing");
+    const payload = try buildChatActionPayload(std.testing.allocator, 42, null, "typing");
     defer std.testing.allocator.free(payload);
 
     try std.testing.expectEqualStrings(
@@ -1262,11 +1340,21 @@ test "buildChatActionPayload encodes chat action request" {
 }
 
 test "buildSendMessagePayload includes markdown parse mode" {
-    const payload = try buildSendMessagePayload(std.testing.allocator, 42, "*bold*");
+    const payload = try buildSendMessagePayload(std.testing.allocator, 42, null, "*bold*");
     defer std.testing.allocator.free(payload);
 
     try std.testing.expectEqualStrings(
         "{\"chat_id\":42,\"text\":\"*bold*\",\"parse_mode\":\"MarkdownV2\"}",
+        payload,
+    );
+}
+
+test "buildSendMessagePayload includes message thread when present" {
+    const payload = try buildSendMessagePayload(std.testing.allocator, -100, 123, "hello");
+    defer std.testing.allocator.free(payload);
+
+    try std.testing.expectEqualStrings(
+        "{\"chat_id\":-100,\"message_thread_id\":123,\"text\":\"hello\",\"parse_mode\":\"MarkdownV2\"}",
         payload,
     );
 }
@@ -1284,12 +1372,15 @@ test "conversation state round-trips through disk persistence" {
     var original = ConversationStore.init(std.testing.allocator);
     defer deinitConversationStore(std.testing.allocator, &original);
 
-    const chat_a = try getOrCreateConversation(&original, 101);
+    const key_a: ConversationKey = .{ .chat_id = 101, .thread_id = 10 };
+    const key_b: ConversationKey = .{ .chat_id = 202, .thread_id = null };
+
+    const chat_a = try getOrCreateConversation(&original, key_a);
     chat_a.last_user_message_at = 1_700_000_000;
     try chat_a.appendMessage(std.testing.allocator, .user, "hello");
     try chat_a.appendMessage(std.testing.allocator, .assistant, "world");
 
-    const chat_b = try getOrCreateConversation(&original, 202);
+    const chat_b = try getOrCreateConversation(&original, key_b);
     chat_b.last_user_message_at = 1_700_000_123;
     try chat_b.appendMessage(std.testing.allocator, .user, "hej");
 
@@ -1299,8 +1390,8 @@ test "conversation state round-trips through disk persistence" {
     defer deinitConversationStore(std.testing.allocator, &restored);
     try loadConversationStoreAtPath(std.testing.allocator, state_path, &restored);
 
-    try std.testing.expect(restored.get(101) != null);
-    const restored_a = restored.get(101).?;
+    try std.testing.expect(restored.get(key_a) != null);
+    const restored_a = restored.get(key_a).?;
     try std.testing.expectEqual(@as(usize, 2), restored_a.messages.items.len);
     try std.testing.expectEqual(openai_client.Role.user, restored_a.messages.items[0].role);
     try std.testing.expectEqualStrings("hello", restored_a.messages.items[0].content);
@@ -1308,8 +1399,8 @@ test "conversation state round-trips through disk persistence" {
     try std.testing.expectEqualStrings("world", restored_a.messages.items[1].content);
     try std.testing.expectEqual(@as(?i64, 1_700_000_000), restored_a.last_user_message_at);
 
-    try std.testing.expect(restored.get(202) != null);
-    const restored_b = restored.get(202).?;
+    try std.testing.expect(restored.get(key_b) != null);
+    const restored_b = restored.get(key_b).?;
     try std.testing.expectEqual(@as(usize, 1), restored_b.messages.items.len);
     try std.testing.expectEqual(openai_client.Role.user, restored_b.messages.items[0].role);
     try std.testing.expectEqualStrings("hej", restored_b.messages.items[0].content);
