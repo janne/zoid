@@ -334,10 +334,16 @@ pub fn main() !void {
                     };
                     defer result.deinit(allocator);
 
-                    const output = try formatBrowserDoctorOutput(allocator, &result);
+                    var launch_probe: BrowserDoctorLaunchProbe = .{};
+                    if (result.ready()) {
+                        launch_probe = try runBrowserDoctorLaunchProbe(allocator);
+                    }
+                    defer launch_probe.deinit(allocator);
+
+                    const output = try formatBrowserDoctorOutput(allocator, &result, &launch_probe);
                     defer allocator.free(output);
                     try std.fs.File.stdout().writeAll(output);
-                    if (!result.ready()) std.process.exit(1);
+                    if (!result.ready() or !launch_probe.ok) std.process.exit(1);
                 },
                 .uninstall => {
                     var result = zoid.browser_runtime.uninstall(allocator) catch |err| {
@@ -943,9 +949,174 @@ fn formatBrowserStatusOutput(
     return output.toOwnedSlice(allocator);
 }
 
+const BrowserDoctorLaunchProbe = struct {
+    checked: bool = false,
+    ok: bool = false,
+    error_code: ?[]u8 = null,
+    error_detail: ?[]u8 = null,
+
+    fn deinit(self: *BrowserDoctorLaunchProbe, allocator: std.mem.Allocator) void {
+        if (self.error_code) |value| allocator.free(value);
+        if (self.error_detail) |value| allocator.free(value);
+    }
+};
+
+fn runBrowserDoctorLaunchProbe(allocator: std.mem.Allocator) !BrowserDoctorLaunchProbe {
+    var policy = try zoid.tool_runtime.Policy.initForCurrentWorkspace(allocator);
+    defer policy.deinit(allocator);
+
+    const probe_result_json = zoid.tool_runtime.executeToolCall(
+        allocator,
+        &policy,
+        "browser_automate",
+        "{\"timeout_seconds\":5,\"actions\":[{\"action\":\"wait_for_timeout\",\"ms\":1}]}",
+    ) catch |err| {
+        return .{
+            .checked = true,
+            .ok = false,
+            .error_code = try allocator.dupe(u8, @errorName(err)),
+            .error_detail = null,
+        };
+    };
+    defer allocator.free(probe_result_json);
+
+    return parseBrowserDoctorLaunchProbeResult(allocator, probe_result_json);
+}
+
+fn parseBrowserDoctorLaunchProbeResult(
+    allocator: std.mem.Allocator,
+    probe_result_json: []const u8,
+) !BrowserDoctorLaunchProbe {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, probe_result_json, .{}) catch {
+        return .{
+            .checked = true,
+            .ok = false,
+            .error_code = try allocator.dupe(u8, "InvalidToolResult"),
+            .error_detail = try allocator.dupe(u8, "browser_automate returned invalid JSON"),
+        };
+    };
+    defer parsed.deinit();
+
+    const root_object = switch (parsed.value) {
+        .object => |value| value,
+        else => {
+            return .{
+                .checked = true,
+                .ok = false,
+                .error_code = try allocator.dupe(u8, "InvalidToolResult"),
+                .error_detail = try allocator.dupe(u8, "browser_automate returned a non-object result"),
+            };
+        },
+    };
+
+    const ok = switch (root_object.get("ok") orelse {
+        return .{
+            .checked = true,
+            .ok = false,
+            .error_code = try allocator.dupe(u8, "InvalidToolResult"),
+            .error_detail = try allocator.dupe(u8, "browser_automate result is missing boolean field 'ok'"),
+        };
+    }) {
+        .bool => |value| value,
+        else => {
+            return .{
+                .checked = true,
+                .ok = false,
+                .error_code = try allocator.dupe(u8, "InvalidToolResult"),
+                .error_detail = try allocator.dupe(u8, "browser_automate result has non-boolean field 'ok'"),
+            };
+        },
+    };
+
+    if (ok) {
+        return .{
+            .checked = true,
+            .ok = true,
+            .error_code = null,
+            .error_detail = null,
+        };
+    }
+
+    const error_code = if (root_object.get("error")) |error_value|
+        switch (error_value) {
+            .string => |value| if (std.mem.trim(u8, value, " \t\r\n").len > 0) try allocator.dupe(u8, value) else null,
+            else => null,
+        }
+    else
+        null;
+    errdefer if (error_code) |value| allocator.free(value);
+
+    const error_detail = blk: {
+        if (root_object.get("stderr_excerpt")) |stderr_value| {
+            switch (stderr_value) {
+                .string => |value| {
+                    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+                    if (trimmed.len > 0) break :blk try allocator.dupe(u8, trimmed);
+                },
+                else => {},
+            }
+        }
+        if (root_object.get("stdout_excerpt")) |stdout_value| {
+            switch (stdout_value) {
+                .string => |value| {
+                    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+                    if (trimmed.len > 0) break :blk try allocator.dupe(u8, trimmed);
+                },
+                else => {},
+            }
+        }
+        if (error_code) |value| {
+            if (!std.mem.eql(u8, value, "BrowserAutomationFailed")) {
+                break :blk try allocator.dupe(u8, value);
+            }
+        }
+        break :blk null;
+    };
+    errdefer if (error_detail) |value| allocator.free(value);
+
+    return .{
+        .checked = true,
+        .ok = false,
+        .error_code = error_code,
+        .error_detail = error_detail,
+    };
+}
+
+fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (haystack.len < needle.len) return false;
+
+    var index: usize = 0;
+    while (index + needle.len <= haystack.len) : (index += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[index .. index + needle.len], needle)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn launchProbeSuggestsMissingHostDependencies(probe: *const BrowserDoctorLaunchProbe) bool {
+    if (probe.error_code) |value| {
+        if (containsAsciiIgnoreCase(value, "install-deps") or
+            containsAsciiIgnoreCase(value, "missing dependencies"))
+        {
+            return true;
+        }
+    }
+    if (probe.error_detail) |value| {
+        if (containsAsciiIgnoreCase(value, "install-deps") or
+            containsAsciiIgnoreCase(value, "missing dependencies"))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 fn formatBrowserDoctorOutput(
     allocator: std.mem.Allocator,
     status: *const zoid.browser_runtime.Status,
+    launch_probe: *const BrowserDoctorLaunchProbe,
 ) ![]u8 {
     var output = std.ArrayList(u8).empty;
     errdefer output.deinit(allocator);
@@ -973,6 +1144,20 @@ fn formatBrowserDoctorOutput(
         try output.appendSlice(allocator, "[fail] Chromium artifacts missing\n");
     }
 
+    if (!status.ready()) {
+        try output.appendSlice(allocator, "[skip] Chromium launch probe skipped until setup checks pass\n");
+    } else if (launch_probe.checked and launch_probe.ok) {
+        try output.appendSlice(allocator, "[ok] Chromium launch probe passed\n");
+    } else {
+        try output.appendSlice(allocator, "[fail] Chromium launch probe failed\n");
+        if (launch_probe.error_code) |error_code| {
+            try output.writer(allocator).print("       code: {s}\n", .{error_code});
+        }
+        if (launch_probe.error_detail) |error_detail| {
+            try output.writer(allocator).print("       detail: {s}\n", .{error_detail});
+        }
+    }
+
     if (status.state) |state| {
         if (!std.mem.eql(u8, state.playwright_version, zoid.browser_runtime.playwright_version)) {
             try output.writer(allocator).print(
@@ -985,11 +1170,17 @@ fn formatBrowserDoctorOutput(
     }
 
     try output.appendSlice(allocator, "\n");
-    if (status.ready()) {
+    if (status.ready() and launch_probe.ok) {
         try output.appendSlice(allocator, "Result: ready\n");
     } else {
         try output.appendSlice(allocator, "Result: not ready\n");
-        try output.appendSlice(allocator, "Action: run `zoid browser install`\n");
+        if (!status.ready()) {
+            try output.appendSlice(allocator, "Action: run `zoid browser install`\n");
+        } else if (launchProbeSuggestsMissingHostDependencies(launch_probe)) {
+            try output.appendSlice(allocator, "Action: install host dependencies for Playwright Chromium (for example `npx playwright install-deps`) and retry.\n");
+        } else {
+            try output.appendSlice(allocator, "Action: inspect launch probe error details above and retry.\n");
+        }
     }
 
     return output.toOwnedSlice(allocator);
@@ -1315,4 +1506,73 @@ test "loadWorkspaceAgentInstructionAtPath returns null when ZOID.md is missing" 
         zoid.runtime_limits.default_openai_max_workspace_instruction_chars,
     );
     try std.testing.expect(content == null);
+}
+
+test "formatBrowserDoctorOutput reports ready when launch probe passes" {
+    var status = zoid.browser_runtime.Status{
+        .install_root = try std.testing.allocator.dupe(u8, "/tmp/browser"),
+        .browsers_path = try std.testing.allocator.dupe(u8, "/tmp/browser/ms-playwright"),
+        .state_path = try std.testing.allocator.dupe(u8, "/tmp/browser/state.json"),
+        .runner = .npx,
+        .browser_files_present = true,
+        .state_exists = true,
+        .state_valid = true,
+        .state = .{
+            .playwright_version = try std.testing.allocator.dupe(u8, zoid.browser_runtime.playwright_version),
+            .runner = try std.testing.allocator.dupe(u8, "npx"),
+            .browser = try std.testing.allocator.dupe(u8, "chromium"),
+            .installed_at_epoch = 1,
+        },
+    };
+    defer status.deinit(std.testing.allocator);
+
+    var probe = BrowserDoctorLaunchProbe{
+        .checked = true,
+        .ok = true,
+    };
+    defer probe.deinit(std.testing.allocator);
+
+    const output = try formatBrowserDoctorOutput(std.testing.allocator, &status, &probe);
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "[ok] Chromium launch probe passed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Result: ready") != null);
+}
+
+test "formatBrowserDoctorOutput reports missing host dependencies when launch probe fails" {
+    var status = zoid.browser_runtime.Status{
+        .install_root = try std.testing.allocator.dupe(u8, "/tmp/browser"),
+        .browsers_path = try std.testing.allocator.dupe(u8, "/tmp/browser/ms-playwright"),
+        .state_path = try std.testing.allocator.dupe(u8, "/tmp/browser/state.json"),
+        .runner = .npx,
+        .browser_files_present = true,
+        .state_exists = true,
+        .state_valid = true,
+        .state = .{
+            .playwright_version = try std.testing.allocator.dupe(u8, zoid.browser_runtime.playwright_version),
+            .runner = try std.testing.allocator.dupe(u8, "npx"),
+            .browser = try std.testing.allocator.dupe(u8, "chromium"),
+            .installed_at_epoch = 1,
+        },
+    };
+    defer status.deinit(std.testing.allocator);
+
+    var probe = BrowserDoctorLaunchProbe{
+        .checked = true,
+        .ok = false,
+        .error_code = try std.testing.allocator.dupe(u8, "BrowserAutomationFailed"),
+        .error_detail = try std.testing.allocator.dupe(
+            u8,
+            "Host system is missing dependencies to run browsers. Install with: npx playwright install-deps",
+        ),
+    };
+    defer probe.deinit(std.testing.allocator);
+
+    const output = try formatBrowserDoctorOutput(std.testing.allocator, &status, &probe);
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "[fail] Chromium launch probe failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "missing dependencies") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Result: not ready") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "install host dependencies") != null);
 }
