@@ -900,31 +900,65 @@ fn writeSchedulerJobJson(
     try writeJsonString(allocator, writer, workspace_path);
     try writer.writeAll(",\"paused\":");
     try writer.writeAll(if (job.paused) "true" else "false");
-    try writer.writeAll(",\"at\":");
-    if (job.run_at) |run_at| {
-        try writer.print("{d}", .{run_at});
-    } else {
-        try writer.writeAll("null");
-    }
+    try writeNullableEpochTimestampJsonField(allocator, writer, "at", job.run_at);
     try writer.writeAll(",\"cron\":");
     if (job.cron) |cron| {
         try writeJsonString(allocator, writer, cron);
     } else {
         try writer.writeAll("null");
     }
-    try writer.writeAll(",\"next_run_at\":");
-    try writer.print("{d}", .{job.next_run_at});
-    try writer.writeAll(",\"created_at\":");
-    try writer.print("{d}", .{job.created_at});
-    try writer.writeAll(",\"updated_at\":");
-    try writer.print("{d}", .{job.updated_at});
-    try writer.writeAll(",\"last_run_at\":");
-    if (job.last_run_at) |last_run_at| {
-        try writer.print("{d}", .{last_run_at});
+    try writeEpochTimestampJsonField(allocator, writer, "next_run_at", job.next_run_at);
+    try writeEpochTimestampJsonField(allocator, writer, "created_at", job.created_at);
+    try writeEpochTimestampJsonField(allocator, writer, "updated_at", job.updated_at);
+    try writeNullableEpochTimestampJsonField(allocator, writer, "last_run_at", job.last_run_at);
+    try writer.writeAll("}");
+}
+
+fn writeEpochTimestampJsonField(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    field_name: []const u8,
+    epoch_seconds: i64,
+) !void {
+    const formatted = try formatEpochMinuteDisplayAlloc(allocator, epoch_seconds);
+    defer allocator.free(formatted);
+
+    try writer.writeAll(",\"");
+    try writer.writeAll(field_name);
+    try writer.writeAll("\":");
+    try writeJsonString(allocator, writer, formatted);
+
+    try writer.writeAll(",\"");
+    try writer.writeAll(field_name);
+    try writer.writeAll("_epoch\":");
+    try writer.print("{d}", .{epoch_seconds});
+}
+
+fn writeNullableEpochTimestampJsonField(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    field_name: []const u8,
+    epoch_seconds: ?i64,
+) !void {
+    try writer.writeAll(",\"");
+    try writer.writeAll(field_name);
+    try writer.writeAll("\":");
+    if (epoch_seconds) |value| {
+        const formatted = try formatEpochMinuteDisplayAlloc(allocator, value);
+        defer allocator.free(formatted);
+        try writeJsonString(allocator, writer, formatted);
     } else {
         try writer.writeAll("null");
     }
-    try writer.writeAll("}");
+
+    try writer.writeAll(",\"");
+    try writer.writeAll(field_name);
+    try writer.writeAll("_epoch\":");
+    if (epoch_seconds) |value| {
+        try writer.print("{d}", .{value});
+    } else {
+        try writer.writeAll("null");
+    }
 }
 
 fn requireStringProperty(
@@ -1078,6 +1112,13 @@ fn formatTimestampAlloc(
     return allocator.dupe(u8, output_buffer[0..written]);
 }
 
+fn formatEpochMinuteDisplayAlloc(allocator: std.mem.Allocator, epoch_seconds: i64) ![]u8 {
+    const timestamp: c.time_t = std.math.cast(c.time_t, epoch_seconds) orelse return error.TimeOutOfRange;
+    var local_tm: c.struct_tm = std.mem.zeroes(c.struct_tm);
+    if (!tmFromTimestamp(timestamp, false, &local_tm)) return error.TimeConversionFailed;
+    return formatTimestampAlloc(allocator, &local_tm, "%Y-%m-%d %H:%M");
+}
+
 fn writeJsonString(allocator: std.mem.Allocator, writer: *std.Io.Writer, value: []const u8) !void {
     const escaped = try std.json.Stringify.valueAlloc(allocator, value, .{});
     defer allocator.free(escaped);
@@ -1150,6 +1191,23 @@ test "datetime_now returns current timestamp and formatted values" {
     try std.testing.expect(object.get("local").?.string.len > 0);
 }
 
+fn expectTimestampMinuteString(value: std.json.Value) !void {
+    const text = switch (value) {
+        .string => |string| string,
+        else => return error.TestExpectedString,
+    };
+    try std.testing.expectEqual(@as(usize, 16), text.len);
+
+    for (text, 0..) |char, index| {
+        switch (index) {
+            4, 7 => try std.testing.expectEqual(@as(u8, '-'), char),
+            10 => try std.testing.expectEqual(@as(u8, ' '), char),
+            13 => try std.testing.expectEqual(@as(u8, ':'), char),
+            else => try std.testing.expect(std.ascii.isDigit(char)),
+        }
+    }
+}
+
 test "jobs tool can create and list jobs" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1183,8 +1241,16 @@ test "jobs tool can create and list jobs" {
     try std.testing.expectEqualStrings("create", create_object.get("action").?.string);
     const created_job = create_object.get("job").?.object;
     try std.testing.expectEqualStrings("/task.lua", created_job.get("path").?.string);
-    try std.testing.expect(created_job.get("at") != null);
-    try std.testing.expect(created_job.get("run_at") == null);
+    try expectTimestampMinuteString(created_job.get("at").?);
+    try std.testing.expect(created_job.get("at_epoch").?.integer > 0);
+    try expectTimestampMinuteString(created_job.get("next_run_at").?);
+    try std.testing.expect(created_job.get("next_run_at_epoch").?.integer > 0);
+    try expectTimestampMinuteString(created_job.get("created_at").?);
+    try std.testing.expect(created_job.get("created_at_epoch").?.integer > 0);
+    try expectTimestampMinuteString(created_job.get("updated_at").?);
+    try std.testing.expect(created_job.get("updated_at_epoch").?.integer > 0);
+    try std.testing.expect(created_job.get("last_run_at").? == .null);
+    try std.testing.expect(created_job.get("last_run_at_epoch").? == .null);
 
     const list_result = try executeToolCallWithContext(
         std.testing.allocator,
@@ -1200,7 +1266,10 @@ test "jobs tool can create and list jobs" {
     const list_object = parsed_list.value.object;
     const jobs = list_object.get("jobs").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), jobs.len);
-    try std.testing.expectEqualStrings("/task.lua", jobs[0].object.get("path").?.string);
+    const listed_job = jobs[0].object;
+    try std.testing.expectEqualStrings("/task.lua", listed_job.get("path").?.string);
+    try expectTimestampMinuteString(listed_job.get("next_run_at").?);
+    try std.testing.expect(listed_job.get("next_run_at_epoch").?.integer > 0);
 }
 
 test "filesystem write and read stay within workspace root" {

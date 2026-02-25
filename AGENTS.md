@@ -119,6 +119,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - `zoid.dir(path):create()` must fail when the target directory already exists, and `zoid.dir(path):remove()` must fail when the target directory is non-empty.
   - `filesystem_grep` searches file content under a workspace path with optional recursion and match limits; tool result includes match path/line/column/text, files scanned, and truncation status.
   - Filesystem/tool/Lua/jobs path outputs should use workspace-absolute `/...` paths for user-facing JSON/tables/CLI output instead of host filesystem absolute paths.
+  - `jobs` tool JSON returns timestamp fields (`at`, `next_run_at`, `created_at`, `updated_at`, `last_run_at`) formatted as `YYYY-MM-DD HH:MM` local time, with matching numeric `*_epoch` companion fields.
   - `zoid.dir(path):grep(pattern, [options])` uses the same workspace sandbox/path rules as filesystem tools and supports `options.recursive` (default `true`) and `options.max_matches` (default `200`, max `5000`).
   - `zoid.uri(uri)` allows only HTTP/HTTPS requests and returns a Lua table with `status`, `body`, and `ok`; response body capture is capped by tool policy (currently 1 MiB in `lua_execute`).
   - Outbound HTTP tools (`zoid.uri(...)` and direct `http_*`) must reject internal destinations by default (`localhost`, loopback, private/link-local ranges including IPv6 private/link-local blocks), and should not auto-follow redirects.

@@ -555,6 +555,7 @@ fn writeSchedulerToolDefinition(
     const description =
         "Manage scheduled jobs in the current workspace. action=create|list|delete|pause|resume. " ++
         "create requires a Lua path and exactly one of at (natural-language date/time) or cron (5-field). " ++
+        "Job timestamp fields are returned as local strings in YYYY-MM-DD HH:MM plus *_epoch numeric companions. " ++
         "Scheduled output is routed at execution time: Telegram DM if available, otherwise dropped.";
     try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"jobs\",\"description\":");
     try writeJsonString(allocator, writer, description);
