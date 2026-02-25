@@ -696,6 +696,8 @@ fn buildChatCompletionsPayloadWithTools(
     try writer.writeAll("],\"tools\":[");
     try writeFilesystemReadToolDefinition(allocator, writer, policy.workspace_root);
     try writer.writeAll(",");
+    try writeImageAnalyzeToolDefinition(allocator, writer, policy.workspace_root);
+    try writer.writeAll(",");
     try writeFilesystemListToolDefinition(allocator, writer, policy.workspace_root);
     try writer.writeAll(",");
     try writeFilesystemGrepToolDefinition(allocator, writer, policy.workspace_root);
@@ -747,6 +749,27 @@ fn writeFilesystemReadToolDefinition(
     try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"filesystem_read\",\"description\":");
     try writeJsonString(allocator, writer, description);
     try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"max_bytes\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":1048576}},\"required\":[\"path\"],\"additionalProperties\":false}}}");
+}
+
+fn writeImageAnalyzeToolDefinition(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    workspace_root: []const u8,
+) !void {
+    const description = try std.fmt.allocPrint(
+        allocator,
+        "Analyze an image file under workspace root {s} using a vision-capable OpenAI chat completion. " ++
+            "Use this for screenshot debugging and UI error analysis. " ++
+            "Uses OPENAI_API_KEY and OPENAI_MODEL by default unless model is provided.",
+        .{workspace_root},
+    );
+    defer allocator.free(description);
+
+    try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"image_analyze\",\"description\":");
+    try writeJsonString(allocator, writer, description);
+    try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"prompt\":{\"type\":\"string\"},\"model\":{\"type\":\"string\"},\"max_bytes\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":");
+    try writer.print("{d}", .{tool_runtime.max_allowed_image_analyze_bytes});
+    try writer.writeAll("}},\"required\":[\"path\"],\"additionalProperties\":false}}}");
 }
 
 fn writeFilesystemListToolDefinition(
@@ -1252,21 +1275,25 @@ test "buildChatCompletionsPayload creates valid payload" {
     try std.testing.expectEqualStrings("general kenobi", payload_messages[1].object.get("content").?.string);
 
     const tools = root.get("tools").?.array.items;
-    try std.testing.expectEqual(@as(usize, 16), tools.len);
+    try std.testing.expectEqual(@as(usize, 17), tools.len);
     try std.testing.expectEqualStrings("filesystem_read", tools[0].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("filesystem_list", tools[1].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("filesystem_grep", tools[2].object.get("function").?.object.get("name").?.string);
-    const grep_parameters = tools[2].object.get("function").?.object.get("parameters").?.object;
+    try std.testing.expectEqualStrings("image_analyze", tools[1].object.get("function").?.object.get("name").?.string);
+    const image_analyze_parameters = tools[1].object.get("function").?.object.get("parameters").?.object;
+    const image_analyze_properties = image_analyze_parameters.get("properties").?.object;
+    try std.testing.expectEqual(@as(i64, tool_runtime.max_allowed_image_analyze_bytes), image_analyze_properties.get("max_bytes").?.object.get("maximum").?.integer);
+    try std.testing.expectEqualStrings("filesystem_list", tools[2].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("filesystem_grep", tools[3].object.get("function").?.object.get("name").?.string);
+    const grep_parameters = tools[3].object.get("function").?.object.get("parameters").?.object;
     const grep_properties = grep_parameters.get("properties").?.object;
     try std.testing.expect(grep_properties.get("pattern") != null);
     try std.testing.expectEqualStrings("boolean", grep_properties.get("recursive").?.object.get("type").?.string);
     try std.testing.expectEqual(@as(i64, tool_runtime.max_allowed_grep_matches), grep_properties.get("max_matches").?.object.get("maximum").?.integer);
-    try std.testing.expectEqualStrings("filesystem_write", tools[3].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("filesystem_mkdir", tools[4].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("filesystem_rmdir", tools[5].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("filesystem_delete", tools[6].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("lua_execute", tools[7].object.get("function").?.object.get("name").?.string);
-    const lua_parameters = tools[7].object.get("function").?.object.get("parameters").?.object;
+    try std.testing.expectEqualStrings("filesystem_write", tools[4].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("filesystem_mkdir", tools[5].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("filesystem_rmdir", tools[6].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("filesystem_delete", tools[7].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("lua_execute", tools[8].object.get("function").?.object.get("name").?.string);
+    const lua_parameters = tools[8].object.get("function").?.object.get("parameters").?.object;
     const lua_properties = lua_parameters.get("properties").?.object;
     try std.testing.expect(lua_properties.get("path") != null);
     const args_property = lua_properties.get("args").?.object;
@@ -1276,14 +1303,14 @@ test "buildChatCompletionsPayload creates valid payload" {
     try std.testing.expectEqualStrings("integer", timeout_property.get("type").?.string);
     try std.testing.expectEqual(@as(i64, 1), timeout_property.get("minimum").?.integer);
     try std.testing.expectEqual(@as(i64, tool_runtime.max_allowed_lua_timeout_seconds), timeout_property.get("maximum").?.integer);
-    try std.testing.expectEqualStrings("config", tools[8].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("jobs", tools[9].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("http_get", tools[10].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("http_post", tools[11].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("http_put", tools[12].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("http_delete", tools[13].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("datetime_now", tools[14].object.get("function").?.object.get("name").?.string);
-    try std.testing.expectEqualStrings("browser_automate", tools[15].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("config", tools[9].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("jobs", tools[10].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("http_get", tools[11].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("http_post", tools[12].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("http_put", tools[13].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("http_delete", tools[14].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("datetime_now", tools[15].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("browser_automate", tools[16].object.get("function").?.object.get("name").?.string);
 }
 
 test "parseAssistantReply extracts assistant content" {

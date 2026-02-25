@@ -1,8 +1,10 @@
 const std = @import("std");
 const browser_tool = @import("browser_tool.zig");
+const config_keys = @import("config_keys.zig");
 const config_runtime = @import("config_runtime.zig");
 const http_client = @import("http_client.zig");
 const lua_runner = @import("lua_runner.zig");
+const model_catalog = @import("model_catalog.zig");
 const scheduler_runtime = @import("scheduler_runtime.zig");
 const scheduler_store = @import("scheduler_store.zig");
 const workspace_fs = @import("workspace_fs.zig");
@@ -13,6 +15,7 @@ const c = @cImport({
 pub const sandbox_mode: []const u8 = "workspace-write";
 pub const enabled_tools = [_][]const u8{
     "filesystem_read",
+    "image_analyze",
     "filesystem_list",
     "filesystem_grep",
     "filesystem_write",
@@ -35,10 +38,14 @@ pub const max_allowed_read_bytes: usize = 1024 * 1024;
 pub const default_grep_max_matches: usize = workspace_fs.default_max_grep_matches;
 pub const max_allowed_grep_matches: usize = workspace_fs.max_allowed_grep_matches;
 pub const max_allowed_http_response_bytes: usize = 1024 * 1024;
+pub const default_image_analyze_max_bytes: usize = 2 * 1024 * 1024;
+pub const max_allowed_image_analyze_bytes: usize = 8 * 1024 * 1024;
 pub const default_lua_timeout_seconds: u32 = lua_runner.default_tool_execution_timeout_seconds;
 pub const max_allowed_lua_timeout_seconds: u32 = lua_runner.max_tool_execution_timeout_seconds;
 pub const default_browser_timeout_seconds: u32 = browser_tool.default_timeout_seconds;
 pub const max_allowed_browser_timeout_seconds: u32 = browser_tool.max_timeout_seconds;
+const default_image_analyze_prompt: []const u8 =
+    "Analyze this screenshot. Identify visible errors, likely causes, and concrete next debugging steps.";
 
 pub const Policy = struct {
     workspace_root: []u8,
@@ -116,6 +123,9 @@ pub fn executeToolCallWithContext(
 ) ![]u8 {
     if (std.mem.eql(u8, tool_name, "filesystem_read")) {
         return executeFilesystemRead(allocator, policy, arguments_json);
+    }
+    if (std.mem.eql(u8, tool_name, "image_analyze")) {
+        return executeImageAnalyze(allocator, policy, arguments_json);
     }
     if (std.mem.eql(u8, tool_name, "filesystem_list")) {
         return executeFilesystemList(allocator, policy, arguments_json);
@@ -1057,6 +1067,272 @@ fn executeBrowserAutomate(
     }, arguments_json);
 }
 
+fn executeImageAnalyze(
+    allocator: std.mem.Allocator,
+    policy: *const Policy,
+    arguments_json: []const u8,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{});
+    defer parsed.deinit();
+
+    const root_object = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidToolArguments,
+    };
+
+    const requested_path = switch (root_object.get("path") orelse return error.InvalidToolArguments) {
+        .string => |value| value,
+        else => return error.InvalidToolArguments,
+    };
+
+    const prompt: []const u8 = blk: {
+        if (root_object.get("prompt")) |prompt_value| {
+            break :blk switch (prompt_value) {
+                .string => |value| if (std.mem.trim(u8, value, " \t\r\n").len == 0) default_image_analyze_prompt else value,
+                else => return error.InvalidToolArguments,
+            };
+        }
+        break :blk default_image_analyze_prompt;
+    };
+
+    const requested_model: ?[]const u8 = if (root_object.get("model")) |model_value|
+        switch (model_value) {
+            .string => |value| if (std.mem.trim(u8, value, " \t\r\n").len == 0) null else value,
+            else => return error.InvalidToolArguments,
+        }
+    else
+        null;
+
+    var max_bytes: usize = default_image_analyze_max_bytes;
+    if (root_object.get("max_bytes")) |max_bytes_value| {
+        max_bytes = switch (max_bytes_value) {
+            .integer => |value| blk: {
+                if (value <= 0) return error.InvalidToolArguments;
+                const converted = std.math.cast(usize, value) orelse return error.InvalidToolArguments;
+                break :blk converted;
+            },
+            else => return error.InvalidToolArguments,
+        };
+        if (max_bytes > max_allowed_image_analyze_bytes) return error.InvalidToolArguments;
+    }
+
+    const mime_type = guessSupportedImageMimeType(requested_path) orelse return error.InvalidToolArguments;
+
+    const api_key = (try readConfigValue(allocator, policy, config_keys.openai_api_key)) orelse return error.EmptyApiKey;
+    defer allocator.free(api_key);
+
+    const configured_model = try readConfigValue(allocator, policy, config_keys.openai_model);
+    defer if (configured_model) |value| allocator.free(value);
+
+    const model = if (requested_model) |value|
+        value
+    else if (configured_model) |value|
+        if (std.mem.trim(u8, value, " \t\r\n").len > 0) value else model_catalog.default_model
+    else
+        model_catalog.default_model;
+
+    const resolved_path = try workspace_fs.resolveAllowedReadPath(
+        allocator,
+        policy.workspace_root,
+        requested_path,
+    );
+    defer allocator.free(resolved_path);
+
+    const file = try std.fs.cwd().openFile(resolved_path, .{});
+    defer file.close();
+
+    const image_bytes = try file.readToEndAlloc(allocator, max_bytes);
+    defer allocator.free(image_bytes);
+
+    const payload = try buildImageAnalyzePayload(
+        allocator,
+        model,
+        prompt,
+        mime_type,
+        image_bytes,
+    );
+    defer allocator.free(payload);
+
+    const response_body = try sendOpenAiChatCompletionsRequest(allocator, api_key, payload);
+    defer allocator.free(response_body);
+
+    const analysis = try parseImageAnalyzeResponseContent(allocator, response_body);
+    defer allocator.free(analysis);
+
+    var output = std.Io.Writer.Allocating.init(allocator);
+    errdefer output.deinit();
+    const writer = &output.writer;
+
+    try writer.writeAll("{\"ok\":true,\"tool\":\"image_analyze\",\"path\":");
+    try writeWorkspacePathJson(allocator, writer, policy.workspace_root, resolved_path);
+    try writer.writeAll(",\"model\":");
+    try writeJsonString(allocator, writer, model);
+    try writer.writeAll(",\"mime_type\":");
+    try writeJsonString(allocator, writer, mime_type);
+    try writer.writeAll(",\"bytes\":");
+    try writer.print("{d}", .{image_bytes.len});
+    try writer.writeAll(",\"analysis\":");
+    try writeJsonString(allocator, writer, analysis);
+    try writer.writeAll("}");
+
+    return output.toOwnedSlice();
+}
+
+fn buildImageAnalyzePayload(
+    allocator: std.mem.Allocator,
+    model: []const u8,
+    prompt: []const u8,
+    mime_type: []const u8,
+    image_bytes: []const u8,
+) ![]u8 {
+    const encoded_len = std.base64.standard.Encoder.calcSize(image_bytes.len);
+    const image_base64 = try allocator.alloc(u8, encoded_len);
+    defer allocator.free(image_base64);
+    _ = std.base64.standard.Encoder.encode(image_base64, image_bytes);
+
+    var payload = std.Io.Writer.Allocating.init(allocator);
+    errdefer payload.deinit();
+
+    const writer = &payload.writer;
+    try writer.writeAll("{\"model\":");
+    try writeJsonString(allocator, writer, model);
+    try writer.writeAll(",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
+    try writeJsonString(allocator, writer, prompt);
+    try writer.writeAll("},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:");
+    try writer.writeAll(mime_type);
+    try writer.writeAll(";base64,");
+    try writer.writeAll(image_base64);
+    try writer.writeAll("\"}}]}]}");
+
+    return payload.toOwnedSlice();
+}
+
+fn sendOpenAiChatCompletionsRequest(
+    allocator: std.mem.Allocator,
+    api_key: []const u8,
+    payload: []const u8,
+) ![]u8 {
+    const auth_header = try std.mem.concat(allocator, u8, &.{ "Bearer ", api_key });
+    defer allocator.free(auth_header);
+
+    var response_buffer = std.Io.Writer.Allocating.init(allocator);
+    defer response_buffer.deinit();
+
+    var client: std.http.Client = .{ .allocator = allocator };
+    defer client.deinit();
+
+    const response = try client.fetch(.{
+        .location = .{ .url = "https://api.openai.com/v1/chat/completions" },
+        .method = .POST,
+        .payload = payload,
+        .extra_headers = &.{
+            .{ .name = "Authorization", .value = auth_header },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .response_writer = &response_buffer.writer,
+    });
+
+    const status_code = @intFromEnum(response.status);
+    const response_body = response_buffer.written();
+    if (status_code != 200) {
+        if (try parseOpenAiApiErrorMessage(allocator, response_body)) |message| {
+            defer allocator.free(message);
+            std.debug.print("OpenAI image analyze request failed ({d}): {s}\n", .{ status_code, message });
+        } else {
+            std.debug.print("OpenAI image analyze request failed with status {d}.\n", .{status_code});
+        }
+        return error.ApiRequestFailed;
+    }
+
+    return try allocator.dupe(u8, response_body);
+}
+
+fn parseOpenAiApiErrorMessage(allocator: std.mem.Allocator, response_body: []const u8) !?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response_body, .{}) catch {
+        return null;
+    };
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return null,
+    };
+
+    const error_value = switch (root.get("error") orelse return null) {
+        .object => |object| object,
+        else => return null,
+    };
+
+    const message = switch (error_value.get("message") orelse return null) {
+        .string => |value| value,
+        else => return null,
+    };
+
+    return try allocator.dupe(u8, message);
+}
+
+fn parseImageAnalyzeResponseContent(
+    allocator: std.mem.Allocator,
+    response_body: []const u8,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response_body, .{});
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidApiResponse,
+    };
+
+    const choices = switch (root.get("choices") orelse return error.InvalidApiResponse) {
+        .array => |array| array,
+        else => return error.InvalidApiResponse,
+    };
+    if (choices.items.len == 0) return error.InvalidApiResponse;
+
+    const first_choice = switch (choices.items[0]) {
+        .object => |object| object,
+        else => return error.InvalidApiResponse,
+    };
+
+    const message = switch (first_choice.get("message") orelse return error.InvalidApiResponse) {
+        .object => |object| object,
+        else => return error.InvalidApiResponse,
+    };
+
+    const content = switch (message.get("content") orelse return error.InvalidApiResponse) {
+        .string => |value| value,
+        else => return error.InvalidApiResponse,
+    };
+
+    return try allocator.dupe(u8, content);
+}
+
+fn readConfigValue(
+    allocator: std.mem.Allocator,
+    policy: *const Policy,
+    key: []const u8,
+) !?[]u8 {
+    const response = try config_runtime.execute(
+        allocator,
+        .{ .config_path_override = policy.config_path_override },
+        .{ .get = key },
+    );
+    return switch (response) {
+        .get => |maybe_value| maybe_value,
+        else => unreachable,
+    };
+}
+
+fn guessSupportedImageMimeType(path: []const u8) ?[]const u8 {
+    const extension = std.fs.path.extension(path);
+    if (std.ascii.eqlIgnoreCase(extension, ".png")) return "image/png";
+    if (std.ascii.eqlIgnoreCase(extension, ".jpg")) return "image/jpeg";
+    if (std.ascii.eqlIgnoreCase(extension, ".jpeg")) return "image/jpeg";
+    if (std.ascii.eqlIgnoreCase(extension, ".webp")) return "image/webp";
+    if (std.ascii.eqlIgnoreCase(extension, ".gif")) return "image/gif";
+    return null;
+}
+
 fn executeHttpRequestTool(
     allocator: std.mem.Allocator,
     policy: *const Policy,
@@ -1192,7 +1468,7 @@ test "buildPolicyJson emits required fields" {
     const root_object = parsed.value.object;
     try std.testing.expectEqualStrings("workspace-write", root_object.get("sandbox_mode").?.string);
     try std.testing.expectEqualStrings(policy.workspace_root, root_object.get("writable_roots").?.array.items[0].string);
-    try std.testing.expectEqual(@as(usize, 16), root_object.get("tools_enabled").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 17), root_object.get("tools_enabled").?.array.items.len);
 }
 
 test "datetime_now returns current timestamp and formatted values" {
@@ -1346,6 +1622,57 @@ test "filesystem write and read stay within workspace root" {
     const read_object = parsed_read.value.object;
     try std.testing.expect(read_object.get("ok").?.bool);
     try std.testing.expectEqualStrings("hello", read_object.get("content").?.string);
+}
+
+test "image_analyze rejects unsupported file extension" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+
+    try std.testing.expectError(
+        error.InvalidToolArguments,
+        executeToolCall(
+            std.testing.allocator,
+            &policy,
+            "image_analyze",
+            "{\"path\":\"notes.txt\"}",
+        ),
+    );
+}
+
+test "image_analyze requires OPENAI_API_KEY config" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const file = try tmp.dir.createFile("screen.png", .{});
+        defer file.close();
+        try file.writeAll("not-a-real-png");
+    }
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+
+    policy.config_path_override = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "config.json" });
+    defer std.testing.allocator.free(policy.config_path_override.?);
+
+    try std.testing.expectError(
+        error.EmptyApiKey,
+        executeToolCall(
+            std.testing.allocator,
+            &policy,
+            "image_analyze",
+            "{\"path\":\"screen.png\"}",
+        ),
+    );
 }
 
 test "filesystem mkdir creates a directory within workspace root" {
