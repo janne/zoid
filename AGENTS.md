@@ -68,6 +68,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - `/new` or `/reset` clears stored Telegram context for the current conversation key (`chat_id` + optional `message_thread_id`).
   - While generating a reply in Telegram service mode, send the native `sendChatAction` typing indicator periodically so users see Telegram's built-in "typing..." state until `sendMessage` completes.
   - Telegram `sendMessage` requests set `parse_mode` to `MarkdownV2`.
+  - Telegram reply delivery should sanitize outgoing text for `MarkdownV2` (escape reserved punctuation that commonly breaks entity parsing) before send, and fall back to plain text (`parse_mode` omitted) when Telegram still rejects a chunk, so replies are still delivered.
   - Service mode processes due scheduled jobs before polling updates; scheduler output is sent to the assistant and assistant replies are delivered to Telegram DM when a DM chat id is available.
   - Service mode persists the latest private-chat `chat_id` to app-data (`telegram_dm_chat_id.txt`), which is used as runtime DM fallback when scheduled jobs execute.
   - Scheduler metadata files (`scheduler_jobs.json` + lock/tmp) must live under `getAppDataDir("zoid")`, not inside the workspace tree; only user-authored Lua job payload files and documents should live in workspace.

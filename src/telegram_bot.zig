@@ -978,37 +978,88 @@ fn sendMessageInChunks(
     text: []const u8,
 ) !void {
     if (text.len == 0) {
-        try sendMessage(allocator, bot_token, chat_id, thread_id, " ");
+        try sendMessage(allocator, bot_token, chat_id, thread_id, " ", telegram_message_parse_mode);
         return;
     }
 
     var start: usize = 0;
     while (start < text.len) {
-        const end = nextChunkBoundary(text, start, max_telegram_message_bytes);
+        const end = nextMarkdownChunkBoundary(text, start, max_telegram_message_bytes);
         if (end <= start) return error.InvalidUtf8;
-        try sendMessage(allocator, bot_token, chat_id, thread_id, text[start..end]);
+        const chunk = text[start..end];
+        const markdown_chunk = try sanitizeTelegramMarkdownV2Chunk(allocator, chunk);
+        defer allocator.free(markdown_chunk);
+
+        sendMessage(
+            allocator,
+            bot_token,
+            chat_id,
+            thread_id,
+            markdown_chunk,
+            telegram_message_parse_mode,
+        ) catch |err| switch (err) {
+            error.TelegramApiRequestFailed => try sendMessage(allocator, bot_token, chat_id, thread_id, chunk, null),
+            else => return err,
+        };
         start = end;
     }
 }
 
-fn nextChunkBoundary(text: []const u8, start: usize, max_bytes: usize) usize {
+fn nextMarkdownChunkBoundary(text: []const u8, start: usize, max_bytes: usize) usize {
     if (start >= text.len) return text.len;
-    if (text.len - start <= max_bytes) return text.len;
 
     var index = start;
+    var escaped_bytes: usize = 0;
     while (index < text.len) {
         const sequence_len = std.unicode.utf8ByteSequenceLength(text[index]) catch {
-            return @min(start + max_bytes, text.len);
+            if (index == start) return @min(start + max_bytes, text.len);
+            break;
         };
         if (sequence_len == 0 or index + sequence_len > text.len) {
-            return @min(start + max_bytes, text.len);
+            if (index == start) return @min(start + max_bytes, text.len);
+            break;
         }
-        if (index + sequence_len - start > max_bytes) break;
-        index += sequence_len;
+
+        const sequence_end = index + sequence_len;
+        var escaped_sequence_len: usize = sequence_len;
+        var cursor = index;
+        while (cursor < sequence_end) : (cursor += 1) {
+            if (shouldEscapeTelegramMarkdownV2Byte(text[cursor])) {
+                escaped_sequence_len += 1;
+            }
+        }
+        if (escaped_bytes + escaped_sequence_len > max_bytes) break;
+
+        escaped_bytes += escaped_sequence_len;
+        index = sequence_end;
     }
 
     if (index == start) return @min(start + max_bytes, text.len);
     return index;
+}
+
+fn sanitizeTelegramMarkdownV2Chunk(
+    allocator: std.mem.Allocator,
+    chunk: []const u8,
+) ![]u8 {
+    var escaped = std.ArrayList(u8).empty;
+    errdefer escaped.deinit(allocator);
+
+    for (chunk) |byte| {
+        if (shouldEscapeTelegramMarkdownV2Byte(byte)) {
+            try escaped.append(allocator, '\\');
+        }
+        try escaped.append(allocator, byte);
+    }
+
+    return escaped.toOwnedSlice(allocator);
+}
+
+fn shouldEscapeTelegramMarkdownV2Byte(byte: u8) bool {
+    return switch (byte) {
+        '\\', '[', ']', '(', ')', '>', '#', '+', '-', '=', '{', '}', '.', '!' => true,
+        else => false,
+    };
 }
 
 fn sendMessage(
@@ -1017,6 +1068,7 @@ fn sendMessage(
     chat_id: i64,
     thread_id: ?i64,
     text: []const u8,
+    parse_mode: ?[]const u8,
 ) !void {
     const uri = try std.fmt.allocPrint(
         allocator,
@@ -1025,7 +1077,7 @@ fn sendMessage(
     );
     defer allocator.free(uri);
 
-    const payload = try buildSendMessagePayload(allocator, chat_id, thread_id, text);
+    const payload = try buildSendMessagePayload(allocator, chat_id, thread_id, text, parse_mode);
     defer allocator.free(payload);
 
     const headers = [_]http_client.RequestHeader{
@@ -1141,6 +1193,7 @@ fn buildSendMessagePayload(
     chat_id: i64,
     thread_id: ?i64,
     text: []const u8,
+    parse_mode: ?[]const u8,
 ) ![]u8 {
     const escaped_text = try std.json.Stringify.valueAlloc(allocator, text, .{});
     defer allocator.free(escaped_text);
@@ -1153,7 +1206,11 @@ fn buildSendMessagePayload(
     if (thread_id) |value| {
         try writer.print(",\"message_thread_id\":{d}", .{value});
     }
-    try writer.print(",\"text\":{s},\"parse_mode\":\"{s}\"}}", .{ escaped_text, telegram_message_parse_mode });
+    try writer.print(",\"text\":{s}", .{escaped_text});
+    if (parse_mode) |value| {
+        try writer.print(",\"parse_mode\":\"{s}\"", .{value});
+    }
+    try writer.writeAll("}");
     return payload.toOwnedSlice(allocator);
 }
 
@@ -1271,17 +1328,27 @@ test "parsePollBatch extracts text or caption and preserves thread ids" {
     try std.testing.expectEqualStrings("hej", batch.messages[1].text);
 }
 
-test "nextChunkBoundary keeps utf-8 boundaries" {
+test "nextMarkdownChunkBoundary keeps utf-8 boundaries" {
     const text = "abcådef";
 
-    const first = nextChunkBoundary(text, 0, 4);
+    const first = nextMarkdownChunkBoundary(text, 0, 4);
     try std.testing.expectEqual(@as(usize, 3), first);
 
-    const second = nextChunkBoundary(text, first, 4);
+    const second = nextMarkdownChunkBoundary(text, first, 4);
     try std.testing.expectEqual(@as(usize, 7), second);
 
-    const third = nextChunkBoundary(text, second, 4);
+    const third = nextMarkdownChunkBoundary(text, second, 4);
     try std.testing.expectEqual(text.len, third);
+}
+
+test "nextMarkdownChunkBoundary limits escaped markdown size" {
+    const text = "..a";
+    const end = nextMarkdownChunkBoundary(text, 0, 4);
+    try std.testing.expectEqual(@as(usize, 2), end);
+
+    const markdown_chunk = try sanitizeTelegramMarkdownV2Chunk(std.testing.allocator, text[0..end]);
+    defer std.testing.allocator.free(markdown_chunk);
+    try std.testing.expect(markdown_chunk.len <= 4);
 }
 
 test "conversation store keeps separate history per chat and thread key" {
@@ -1340,7 +1407,13 @@ test "buildChatActionPayload encodes chat action request" {
 }
 
 test "buildSendMessagePayload includes markdown parse mode" {
-    const payload = try buildSendMessagePayload(std.testing.allocator, 42, null, "*bold*");
+    const payload = try buildSendMessagePayload(
+        std.testing.allocator,
+        42,
+        null,
+        "*bold*",
+        telegram_message_parse_mode,
+    );
     defer std.testing.allocator.free(payload);
 
     try std.testing.expectEqualStrings(
@@ -1349,12 +1422,41 @@ test "buildSendMessagePayload includes markdown parse mode" {
     );
 }
 
+test "sanitizeTelegramMarkdownV2Chunk escapes reserved punctuation but keeps markdown markers" {
+    const sanitized = try sanitizeTelegramMarkdownV2Chunk(
+        std.testing.allocator,
+        "*bold* `code.with.dots` [label](https://example.com/path)!",
+    );
+    defer std.testing.allocator.free(sanitized);
+
+    try std.testing.expectEqualStrings(
+        "*bold* `code\\.with\\.dots` \\[label\\]\\(https://example\\.com/path\\)\\!",
+        sanitized,
+    );
+}
+
 test "buildSendMessagePayload includes message thread when present" {
-    const payload = try buildSendMessagePayload(std.testing.allocator, -100, 123, "hello");
+    const payload = try buildSendMessagePayload(
+        std.testing.allocator,
+        -100,
+        123,
+        "hello",
+        telegram_message_parse_mode,
+    );
     defer std.testing.allocator.free(payload);
 
     try std.testing.expectEqualStrings(
         "{\"chat_id\":-100,\"message_thread_id\":123,\"text\":\"hello\",\"parse_mode\":\"MarkdownV2\"}",
+        payload,
+    );
+}
+
+test "buildSendMessagePayload omits parse mode when null" {
+    const payload = try buildSendMessagePayload(std.testing.allocator, 42, null, "hello", null);
+    defer std.testing.allocator.free(payload);
+
+    try std.testing.expectEqualStrings(
+        "{\"chat_id\":42,\"text\":\"hello\"}",
         payload,
     );
 }
