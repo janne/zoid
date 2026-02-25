@@ -5,6 +5,7 @@ const openai_client = @import("openai_client.zig");
 const runtime_limits = @import("runtime_limits.zig");
 const scheduler_runtime = @import("scheduler_runtime.zig");
 const tool_runtime = @import("tool_runtime.zig");
+const workspace_fs = @import("workspace_fs.zig");
 
 pub const Settings = struct {
     bot_token: []const u8,
@@ -18,6 +19,7 @@ const max_poll_timeout_seconds: u16 = 50;
 const max_poll_response_bytes: usize = 2 * 1024 * 1024;
 const max_send_response_bytes: usize = 512 * 1024;
 const max_telegram_message_bytes: usize = 4000;
+const max_telegram_upload_file_bytes: usize = 20 * 1024 * 1024;
 const poll_backoff_ns: u64 = 3 * std.time.ns_per_s;
 const max_conversation_state_file_bytes: usize = 8 * 1024 * 1024;
 const conversation_state_file_name = "telegram_context.json";
@@ -216,6 +218,7 @@ pub fn runLongPolling(allocator: std.mem.Allocator, settings: Settings) !void {
                 allocator,
                 &conversations,
                 runtime_paths.state_path,
+                workspace_root,
                 settings.openai_api_key,
                 settings.openai_model,
                 settings.bot_token,
@@ -250,6 +253,7 @@ fn processInboundMessage(
     allocator: std.mem.Allocator,
     conversations: *ConversationStore,
     state_path: []const u8,
+    workspace_root: []const u8,
     api_key: []const u8,
     model: []const u8,
     bot_token: []const u8,
@@ -297,6 +301,7 @@ fn processInboundMessage(
         allocator,
         conversations,
         state_path,
+        workspace_root,
         api_key,
         model,
         bot_token,
@@ -348,6 +353,7 @@ fn processPromptForChat(
     allocator: std.mem.Allocator,
     conversations: *ConversationStore,
     state_path: []const u8,
+    workspace_root: []const u8,
     api_key: []const u8,
     model: []const u8,
     bot_token: []const u8,
@@ -389,7 +395,7 @@ fn processPromptForChat(
     };
     defer typing_notifier.stop();
 
-    const reply = try openai_client.fetchAssistantReplyWithContext(
+    var reply = try openai_client.fetchAssistantReplyWithContextDetailed(
         allocator,
         api_key,
         model,
@@ -400,10 +406,10 @@ fn processPromptForChat(
             .limits = limits.openai,
         },
     );
-    defer allocator.free(reply);
+    defer reply.deinit(allocator);
 
-    const trimmed_reply = std.mem.trim(u8, reply, " \t\r\n");
-    if (trimmed_reply.len == 0) {
+    const trimmed_reply = std.mem.trim(u8, reply.content, " \t\r\n");
+    if (trimmed_reply.len == 0 and reply.attachments.len == 0) {
         conversation.popLastMessage(allocator);
         conversation_turn_committed = true;
         try sendMessageInChunks(
@@ -416,8 +422,18 @@ fn processPromptForChat(
         return;
     }
 
-    try sendMessageInChunks(allocator, bot_token, key.chat_id, key.thread_id, trimmed_reply);
-    try conversation.appendMessage(allocator, .assistant, trimmed_reply);
+    try sendTelegramReplyWithAttachments(
+        allocator,
+        bot_token,
+        key.chat_id,
+        key.thread_id,
+        workspace_root,
+        trimmed_reply,
+        reply.attachments,
+    );
+
+    const conversation_reply = if (trimmed_reply.len > 0) trimmed_reply else "[Attachment delivered]";
+    try conversation.appendMessage(allocator, .assistant, conversation_reply);
     enforceConversationLimit(conversation, allocator, limits.telegram_max_conversation_messages);
     conversation_turn_committed = true;
 
@@ -473,7 +489,7 @@ fn processDueScheduledJobs(
         const messages = [_]openai_client.Message{
             .{ .role = .user, .content = scheduled_prompt },
         };
-        const reply = openai_client.fetchAssistantReplyWithContext(
+        var reply = openai_client.fetchAssistantReplyWithContextDetailed(
             allocator,
             api_key,
             model,
@@ -489,10 +505,10 @@ fn processDueScheduledJobs(
             );
             continue;
         };
-        defer allocator.free(reply);
+        defer reply.deinit(allocator);
 
-        const trimmed_reply = std.mem.trim(u8, reply, " \t\r\n");
-        if (trimmed_reply.len == 0) continue;
+        const trimmed_reply = std.mem.trim(u8, reply.content, " \t\r\n");
+        if (trimmed_reply.len == 0 and reply.attachments.len == 0) continue;
 
         const dm_chat_id = scheduler_runtime.loadDefaultDmChatIdAtPath(
             allocator,
@@ -505,7 +521,15 @@ fn processDueScheduledJobs(
             break :blk null;
         };
         if (dm_chat_id) |chat_id| {
-            sendMessageInChunks(allocator, bot_token, chat_id, null, trimmed_reply) catch |err| {
+            sendTelegramReplyWithAttachments(
+                allocator,
+                bot_token,
+                chat_id,
+                null,
+                workspace_root,
+                trimmed_reply,
+                reply.attachments,
+            ) catch |err| {
                 std.debug.print(
                     "Failed to send scheduled reply to Telegram DM {d}: {s}\n",
                     .{ chat_id, @errorName(err) },
@@ -994,6 +1018,358 @@ fn parsePollBatch(
     };
 }
 
+fn sendTelegramReplyWithAttachments(
+    allocator: std.mem.Allocator,
+    bot_token: []const u8,
+    chat_id: i64,
+    thread_id: ?i64,
+    workspace_root: []const u8,
+    text: []const u8,
+    attachments: []const openai_client.OutboundAttachment,
+) !void {
+    var delivered_attachment = false;
+    for (attachments) |attachment| {
+        sendWorkspaceAttachment(
+            allocator,
+            bot_token,
+            chat_id,
+            thread_id,
+            workspace_root,
+            attachment,
+        ) catch |err| {
+            std.debug.print(
+                "Failed to send Telegram attachment {s} to chat {d}: {s}\n",
+                .{ attachment.path, chat_id, @errorName(err) },
+            );
+            continue;
+        };
+        delivered_attachment = true;
+    }
+
+    if (text.len > 0) {
+        try sendMessageInChunks(allocator, bot_token, chat_id, thread_id, text);
+    } else if (attachments.len > 0 and !delivered_attachment) {
+        try sendMessageInChunks(
+            allocator,
+            bot_token,
+            chat_id,
+            thread_id,
+            "Generated attachment could not be delivered.",
+        );
+    }
+}
+
+fn sendWorkspaceAttachment(
+    allocator: std.mem.Allocator,
+    bot_token: []const u8,
+    chat_id: i64,
+    thread_id: ?i64,
+    workspace_root: []const u8,
+    attachment: openai_client.OutboundAttachment,
+) !void {
+    const resolved = try workspace_fs.resolveAllowedReadPath(
+        allocator,
+        workspace_root,
+        attachment.path,
+    );
+    defer allocator.free(resolved);
+
+    const file = try std.fs.cwd().openFile(resolved, .{});
+    defer file.close();
+
+    const contents = try file.readToEndAlloc(allocator, max_telegram_upload_file_bytes);
+    defer allocator.free(contents);
+
+    const basename = std.fs.path.basename(attachment.path);
+    const fallback_name = switch (attachment.kind) {
+        .photo => "attachment.png",
+        .document => "attachment.bin",
+    };
+    const filename = if (basename.len > 0) basename else fallback_name;
+
+    const content_type = switch (attachment.kind) {
+        .photo => guessPhotoContentType(filename),
+        .document => guessDocumentContentType(filename),
+    };
+
+    switch (attachment.kind) {
+        .photo => sendPhoto(
+            allocator,
+            bot_token,
+            chat_id,
+            thread_id,
+            filename,
+            content_type,
+            contents,
+        ) catch |err| switch (err) {
+            error.TelegramApiRequestFailed => try sendDocument(
+                allocator,
+                bot_token,
+                chat_id,
+                thread_id,
+                filename,
+                content_type,
+                contents,
+            ),
+            else => return err,
+        },
+        .document => try sendDocument(
+            allocator,
+            bot_token,
+            chat_id,
+            thread_id,
+            filename,
+            content_type,
+            contents,
+        ),
+    }
+}
+
+fn guessPhotoContentType(path: []const u8) []const u8 {
+    const extension = std.fs.path.extension(path);
+    if (std.ascii.eqlIgnoreCase(extension, ".jpg") or std.ascii.eqlIgnoreCase(extension, ".jpeg")) {
+        return "image/jpeg";
+    }
+    if (std.ascii.eqlIgnoreCase(extension, ".webp")) return "image/webp";
+    return "image/png";
+}
+
+fn guessDocumentContentType(path: []const u8) []const u8 {
+    const extension = std.fs.path.extension(path);
+    if (std.ascii.eqlIgnoreCase(extension, ".pdf")) return "application/pdf";
+    if (std.ascii.eqlIgnoreCase(extension, ".txt")) return "text/plain";
+    if (std.ascii.eqlIgnoreCase(extension, ".json")) return "application/json";
+    return "application/octet-stream";
+}
+
+fn sendPhoto(
+    allocator: std.mem.Allocator,
+    bot_token: []const u8,
+    chat_id: i64,
+    thread_id: ?i64,
+    filename: []const u8,
+    file_content_type: []const u8,
+    file_contents: []const u8,
+) !void {
+    try sendMultipartFileRequest(
+        allocator,
+        bot_token,
+        "sendPhoto",
+        "photo",
+        chat_id,
+        thread_id,
+        filename,
+        file_content_type,
+        file_contents,
+    );
+}
+
+fn sendDocument(
+    allocator: std.mem.Allocator,
+    bot_token: []const u8,
+    chat_id: i64,
+    thread_id: ?i64,
+    filename: []const u8,
+    file_content_type: []const u8,
+    file_contents: []const u8,
+) !void {
+    try sendMultipartFileRequest(
+        allocator,
+        bot_token,
+        "sendDocument",
+        "document",
+        chat_id,
+        thread_id,
+        filename,
+        file_content_type,
+        file_contents,
+    );
+}
+
+const MultipartPayload = struct {
+    body: []u8,
+    content_type_header: []u8,
+
+    fn deinit(self: *MultipartPayload, allocator: std.mem.Allocator) void {
+        allocator.free(self.body);
+        allocator.free(self.content_type_header);
+        self.* = undefined;
+    }
+};
+
+fn sendMultipartFileRequest(
+    allocator: std.mem.Allocator,
+    bot_token: []const u8,
+    method_name: []const u8,
+    file_field_name: []const u8,
+    chat_id: i64,
+    thread_id: ?i64,
+    filename: []const u8,
+    file_content_type: []const u8,
+    file_contents: []const u8,
+) !void {
+    const uri = try std.fmt.allocPrint(
+        allocator,
+        "https://api.telegram.org/bot{s}/{s}",
+        .{ bot_token, method_name },
+    );
+    defer allocator.free(uri);
+
+    var payload = try buildMultipartFilePayload(
+        allocator,
+        file_field_name,
+        chat_id,
+        thread_id,
+        filename,
+        file_content_type,
+        file_contents,
+    );
+    defer payload.deinit(allocator);
+
+    const headers = [_]http_client.RequestHeader{
+        .{ .name = "Content-Type", .value = payload.content_type_header },
+    };
+
+    var response = try http_client.executeRequest(
+        allocator,
+        .POST,
+        uri,
+        payload.body,
+        &headers,
+        max_send_response_bytes,
+        false,
+    );
+    defer response.deinit(allocator);
+
+    if (response.status_code != 200) {
+        if (try parseTelegramErrorDescription(allocator, response.body)) |description| {
+            defer allocator.free(description);
+            std.debug.print(
+                "Telegram {s} returned status {d}: {s}\n",
+                .{ method_name, response.status_code, description },
+            );
+        } else {
+            std.debug.print(
+                "Telegram {s} returned status {d}.\n",
+                .{ method_name, response.status_code },
+            );
+        }
+        return error.TelegramApiRequestFailed;
+    }
+
+    const ok = parseTelegramOk(allocator, response.body) catch |err| {
+        std.debug.print("Telegram {s} invalid response: {s}\n", .{ method_name, @errorName(err) });
+        return err;
+    };
+    if (!ok) {
+        if (try parseTelegramErrorDescription(allocator, response.body)) |description| {
+            defer allocator.free(description);
+            std.debug.print("Telegram {s} failed: {s}\n", .{ method_name, description });
+        } else {
+            std.debug.print("Telegram {s} failed.\n", .{method_name});
+        }
+        return error.TelegramApiRequestFailed;
+    }
+}
+
+fn buildMultipartFilePayload(
+    allocator: std.mem.Allocator,
+    file_field_name: []const u8,
+    chat_id: i64,
+    thread_id: ?i64,
+    filename: []const u8,
+    file_content_type: []const u8,
+    file_contents: []const u8,
+) !MultipartPayload {
+    var boundary_random: [12]u8 = undefined;
+    std.crypto.random.bytes(&boundary_random);
+    const boundary_suffix = std.fmt.bytesToHex(boundary_random, .lower);
+    const boundary = try std.mem.concat(allocator, u8, &.{ "zoid-", boundary_suffix[0..] });
+    defer allocator.free(boundary);
+
+    const content_type_header = try std.fmt.allocPrint(
+        allocator,
+        "multipart/form-data; boundary={s}",
+        .{boundary},
+    );
+
+    const chat_id_text = try std.fmt.allocPrint(allocator, "{d}", .{chat_id});
+    defer allocator.free(chat_id_text);
+
+    var payload = std.ArrayList(u8).empty;
+    errdefer payload.deinit(allocator);
+
+    try appendMultipartTextField(
+        allocator,
+        &payload,
+        boundary,
+        "chat_id",
+        chat_id_text,
+    );
+    if (thread_id) |value| {
+        const thread_id_text = try std.fmt.allocPrint(allocator, "{d}", .{value});
+        defer allocator.free(thread_id_text);
+        try appendMultipartTextField(
+            allocator,
+            &payload,
+            boundary,
+            "message_thread_id",
+            thread_id_text,
+        );
+    }
+
+    const escaped_filename = try sanitizeMultipartFilename(allocator, filename);
+    defer allocator.free(escaped_filename);
+
+    const writer = payload.writer(allocator);
+    try writer.print("--{s}\r\n", .{boundary});
+    try writer.print(
+        "Content-Disposition: form-data; name=\"{s}\"; filename=\"{s}\"\r\n",
+        .{ file_field_name, escaped_filename },
+    );
+    try writer.print("Content-Type: {s}\r\n\r\n", .{file_content_type});
+    try payload.appendSlice(allocator, file_contents);
+    try payload.appendSlice(allocator, "\r\n");
+    try writer.print("--{s}--\r\n", .{boundary});
+
+    return .{
+        .body = try payload.toOwnedSlice(allocator),
+        .content_type_header = content_type_header,
+    };
+}
+
+fn appendMultipartTextField(
+    allocator: std.mem.Allocator,
+    payload: *std.ArrayList(u8),
+    boundary: []const u8,
+    field_name: []const u8,
+    value: []const u8,
+) !void {
+    const writer = payload.writer(allocator);
+    try writer.print("--{s}\r\n", .{boundary});
+    try writer.print("Content-Disposition: form-data; name=\"{s}\"\r\n\r\n", .{field_name});
+    try payload.appendSlice(allocator, value);
+    try payload.appendSlice(allocator, "\r\n");
+}
+
+fn sanitizeMultipartFilename(allocator: std.mem.Allocator, filename: []const u8) ![]u8 {
+    var sanitized = std.ArrayList(u8).empty;
+    errdefer sanitized.deinit(allocator);
+
+    for (filename) |byte| {
+        switch (byte) {
+            '"', '\r', '\n' => try sanitized.append(allocator, '_'),
+            else => try sanitized.append(allocator, byte),
+        }
+    }
+
+    if (sanitized.items.len == 0) {
+        try sanitized.appendSlice(allocator, "attachment.bin");
+    }
+
+    return sanitized.toOwnedSlice(allocator);
+}
+
 fn sendMessageInChunks(
     allocator: std.mem.Allocator,
     bot_token: []const u8,
@@ -1081,7 +1457,7 @@ fn sanitizeTelegramMarkdownV2Chunk(
 
 fn shouldEscapeTelegramMarkdownV2Byte(byte: u8) bool {
     return switch (byte) {
-        '\\', '[', ']', '(', ')', '>', '#', '+', '-', '=', '{', '}', '.', '!' => true,
+        '_', '[', ']', '(', ')', '~', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!', '\\' => true,
         else => false,
     };
 }
@@ -1446,15 +1822,15 @@ test "buildSendMessagePayload includes markdown parse mode" {
     );
 }
 
-test "sanitizeTelegramMarkdownV2Chunk escapes reserved punctuation but keeps markdown markers" {
+test "sanitizeTelegramMarkdownV2Chunk escapes markdown-v2 reserved characters" {
     const sanitized = try sanitizeTelegramMarkdownV2Chunk(
         std.testing.allocator,
-        "*bold* `code.with.dots` [label](https://example.com/path)!",
+        "*bold* `code.with.dots` [label](https://example.com/path)! browser_automate",
     );
     defer std.testing.allocator.free(sanitized);
 
     try std.testing.expectEqualStrings(
-        "*bold* `code\\.with\\.dots` \\[label\\]\\(https://example\\.com/path\\)\\!",
+        "*bold* `code\\.with\\.dots` \\[label\\]\\(https://example\\.com/path\\)\\! browser\\_automate",
         sanitized,
     );
 }
@@ -1483,6 +1859,41 @@ test "buildSendMessagePayload omits parse mode when null" {
         "{\"chat_id\":42,\"text\":\"hello\"}",
         payload,
     );
+}
+
+test "buildMultipartFilePayload encodes chat and thread fields with binary file part" {
+    var payload = try buildMultipartFilePayload(
+        std.testing.allocator,
+        "photo",
+        -100,
+        7,
+        "screen\"shot.png",
+        "image/png",
+        &.{ 0x89, 'P', 'N', 'G' },
+    );
+    defer payload.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload.content_type_header, "multipart/form-data; boundary=zoid-") == 0);
+    try std.testing.expect(std.mem.indexOf(u8, payload.body, "name=\"chat_id\"\r\n\r\n-100\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload.body, "name=\"message_thread_id\"\r\n\r\n7\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload.body, "name=\"photo\"; filename=\"screen_shot.png\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload.body, "Content-Type: image/png\r\n\r\n") != null);
+    try std.testing.expect(std.mem.indexOfPos(u8, payload.body, 0, &.{ 0x89, 'P', 'N', 'G', '\r', '\n' }) != null);
+}
+
+test "guessPhotoContentType recognizes common image extensions" {
+    try std.testing.expectEqualStrings("image/jpeg", guessPhotoContentType("shot.jpg"));
+    try std.testing.expectEqualStrings("image/jpeg", guessPhotoContentType("shot.jpeg"));
+    try std.testing.expectEqualStrings("image/webp", guessPhotoContentType("shot.webp"));
+    try std.testing.expectEqualStrings("image/png", guessPhotoContentType("shot.png"));
+    try std.testing.expectEqualStrings("image/png", guessPhotoContentType("shot.unknown"));
+}
+
+test "guessDocumentContentType recognizes common document extensions" {
+    try std.testing.expectEqualStrings("application/pdf", guessDocumentContentType("report.pdf"));
+    try std.testing.expectEqualStrings("text/plain", guessDocumentContentType("note.txt"));
+    try std.testing.expectEqualStrings("application/json", guessDocumentContentType("data.json"));
+    try std.testing.expectEqualStrings("application/octet-stream", guessDocumentContentType("archive.bin"));
 }
 
 test "conversation state round-trips through disk persistence" {

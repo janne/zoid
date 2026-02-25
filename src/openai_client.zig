@@ -18,6 +18,33 @@ pub const RequestContext = struct {
     limits: Limits = .{},
 };
 
+pub const OutboundAttachmentKind = enum {
+    photo,
+    document,
+};
+
+pub const OutboundAttachment = struct {
+    kind: OutboundAttachmentKind,
+    path: []u8,
+
+    pub fn deinit(self: *OutboundAttachment, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        self.* = undefined;
+    }
+};
+
+pub const AssistantReplyResult = struct {
+    content: []u8,
+    attachments: []OutboundAttachment = &.{},
+
+    pub fn deinit(self: *AssistantReplyResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.content);
+        for (self.attachments) |*attachment| attachment.deinit(allocator);
+        if (self.attachments.len > 0) allocator.free(self.attachments);
+        self.* = undefined;
+    }
+};
+
 const ParsedToolCall = struct {
     id: []u8,
     name: []u8,
@@ -123,6 +150,27 @@ pub fn fetchAssistantReplyWithContext(
     messages: []const Message,
     request_context: RequestContext,
 ) ![]u8 {
+    const detailed = try fetchAssistantReplyWithContextDetailed(
+        allocator,
+        api_key,
+        model,
+        messages,
+        request_context,
+    );
+    defer {
+        for (detailed.attachments) |*attachment| attachment.deinit(allocator);
+        if (detailed.attachments.len > 0) allocator.free(detailed.attachments);
+    }
+    return detailed.content;
+}
+
+pub fn fetchAssistantReplyWithContextDetailed(
+    allocator: std.mem.Allocator,
+    api_key: []const u8,
+    model: []const u8,
+    messages: []const Message,
+    request_context: RequestContext,
+) !AssistantReplyResult {
     if (api_key.len == 0) return error.EmptyApiKey;
     if (messages.len == 0) return error.EmptyConversation;
     const limits = sanitizeLimits(request_context.limits);
@@ -135,6 +183,7 @@ pub fn fetchAssistantReplyWithContext(
     const system_instruction = try buildSystemInstruction(
         allocator,
         policy_json,
+        request_context.request_chat_id,
         request_context.workspace_instruction,
     );
     defer allocator.free(system_instruction);
@@ -143,6 +192,12 @@ pub fn fetchAssistantReplyWithContext(
     defer {
         for (wire_messages.items) |wire_message| allocator.free(wire_message);
         wire_messages.deinit(allocator);
+    }
+
+    var attachments = std.ArrayList(OutboundAttachment).empty;
+    errdefer {
+        for (attachments.items) |*attachment| attachment.deinit(allocator);
+        attachments.deinit(allocator);
     }
 
     const system_message_json = try buildRoleContentMessageJson(
@@ -182,7 +237,10 @@ pub fn fetchAssistantReplyWithContext(
         if (turn.tool_calls.len == 0) {
             const content = turn.content orelse return error.InvalidApiResponse;
             turn.content = null;
-            return content;
+            return .{
+                .content = content,
+                .attachments = try attachments.toOwnedSlice(allocator),
+            };
         }
 
         const assistant_message_json = try buildAssistantToolCallMessageJson(
@@ -202,6 +260,13 @@ pub fn fetchAssistantReplyWithContext(
                 tool_call.arguments_json,
             ) catch |err| try tool_runtime.buildErrorResult(allocator, @errorName(err));
             defer allocator.free(tool_result);
+
+            try collectOutboundAttachmentsFromToolResult(
+                allocator,
+                &attachments,
+                tool_call.name,
+                tool_result,
+            );
 
             const capped_tool_result = try capTextToLimit(
                 allocator,
@@ -237,7 +302,91 @@ pub fn fetchAssistantReplyWithContext(
     if (final_turn.tool_calls.len != 0) return error.ToolCallLimitExceeded;
     const final_content = final_turn.content orelse return error.ToolCallLimitExceeded;
     final_turn.content = null;
-    return final_content;
+    return .{
+        .content = final_content,
+        .attachments = try attachments.toOwnedSlice(allocator),
+    };
+}
+
+fn collectOutboundAttachmentsFromToolResult(
+    allocator: std.mem.Allocator,
+    attachments: *std.ArrayList(OutboundAttachment),
+    tool_name: []const u8,
+    tool_result_json: []const u8,
+) !void {
+    if (!std.mem.eql(u8, tool_name, "browser_automate")) return;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, tool_result_json, .{}) catch {
+        return;
+    };
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return,
+    };
+
+    const actions_value = root.get("actions") orelse return;
+    const actions = switch (actions_value) {
+        .array => |array| array,
+        else => return,
+    };
+
+    for (actions.items) |action_value| {
+        const action = switch (action_value) {
+            .object => |object| object,
+            else => continue,
+        };
+
+        var action_ok = true;
+        if (action.get("ok")) |ok_value| {
+            action_ok = switch (ok_value) {
+                .bool => |value| value,
+                else => false,
+            };
+        }
+        if (!action_ok) continue;
+
+        const action_name = switch (action.get("action") orelse continue) {
+            .string => |value| value,
+            else => continue,
+        };
+
+        if (std.mem.eql(u8, action_name, "screenshot")) {
+            const path = switch (action.get("path") orelse continue) {
+                .string => |value| value,
+                else => continue,
+            };
+            try appendUniqueOutboundAttachment(allocator, attachments, .photo, path);
+            continue;
+        }
+
+        if (std.mem.eql(u8, action_name, "download")) {
+            const path = switch (action.get("save_as") orelse continue) {
+                .string => |value| value,
+                else => continue,
+            };
+            try appendUniqueOutboundAttachment(allocator, attachments, .document, path);
+        }
+    }
+}
+
+fn appendUniqueOutboundAttachment(
+    allocator: std.mem.Allocator,
+    attachments: *std.ArrayList(OutboundAttachment),
+    kind: OutboundAttachmentKind,
+    path: []const u8,
+) !void {
+    if (path.len == 0) return;
+
+    for (attachments.items) |existing| {
+        if (existing.kind == kind and std.mem.eql(u8, existing.path, path)) return;
+    }
+
+    try attachments.append(allocator, .{
+        .kind = kind,
+        .path = try allocator.dupe(u8, path),
+    });
 }
 
 fn sanitizeLimits(raw: Limits) Limits {
@@ -445,23 +594,30 @@ fn buildChatCompletionsPayload(
 fn buildSystemInstruction(
     allocator: std.mem.Allocator,
     policy_json: []const u8,
+    request_chat_id: ?i64,
     workspace_instruction: ?[]const u8,
 ) ![]u8 {
+    const telegram_media_instruction =
+        if (request_chat_id != null)
+            "\n\nTelegram media delivery note:\nWhen browser_automate produces screenshot/download files, the host service delivers them to Telegram automatically. Do not read those files for base64 transport and do not claim missing delivery unless the tool call itself failed."
+        else
+            "";
+
     if (workspace_instruction) |raw_workspace_instruction| {
         const trimmed_workspace_instruction = std.mem.trim(u8, raw_workspace_instruction, " \t\r\n");
         if (trimmed_workspace_instruction.len > 0) {
             return std.fmt.allocPrint(
                 allocator,
-                "Use tools only under this enforced local policy: {s}\n\nWorkspace instructions from ZOID.md:\n{s}\n\nFollow workspace instructions as agent guidance unless they conflict with higher-priority constraints.",
-                .{ policy_json, trimmed_workspace_instruction },
+                "Use tools only under this enforced local policy: {s}{s}\n\nWorkspace instructions from ZOID.md:\n{s}\n\nFollow workspace instructions as agent guidance unless they conflict with higher-priority constraints.",
+                .{ policy_json, telegram_media_instruction, trimmed_workspace_instruction },
             );
         }
     }
 
     return std.fmt.allocPrint(
         allocator,
-        "Use tools only under this enforced local policy: {s}",
-        .{policy_json},
+        "Use tools only under this enforced local policy: {s}{s}",
+        .{ policy_json, telegram_media_instruction },
     );
 }
 
@@ -1102,6 +1258,44 @@ test "parseAssistantReply rejects unexpected payload shape" {
     try std.testing.expectError(error.InvalidApiResponse, parseAssistantReply(std.testing.allocator, response_body));
 }
 
+test "collectOutboundAttachmentsFromToolResult captures browser outputs" {
+    var attachments = std.ArrayList(OutboundAttachment).empty;
+    defer {
+        for (attachments.items) |*attachment| attachment.deinit(std.testing.allocator);
+        attachments.deinit(std.testing.allocator);
+    }
+
+    try collectOutboundAttachmentsFromToolResult(
+        std.testing.allocator,
+        &attachments,
+        "browser_automate",
+        "{\"ok\":true,\"tool\":\"browser_automate\",\"actions\":[{\"action\":\"screenshot\",\"ok\":true,\"path\":\"/shots/home.png\"},{\"action\":\"download\",\"ok\":true,\"save_as\":\"/downloads/report.pdf\"},{\"action\":\"screenshot\",\"ok\":true,\"path\":\"/shots/home.png\"}]}",
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), attachments.items.len);
+    try std.testing.expectEqual(OutboundAttachmentKind.photo, attachments.items[0].kind);
+    try std.testing.expectEqualStrings("/shots/home.png", attachments.items[0].path);
+    try std.testing.expectEqual(OutboundAttachmentKind.document, attachments.items[1].kind);
+    try std.testing.expectEqualStrings("/downloads/report.pdf", attachments.items[1].path);
+}
+
+test "collectOutboundAttachmentsFromToolResult ignores failed actions" {
+    var attachments = std.ArrayList(OutboundAttachment).empty;
+    defer {
+        for (attachments.items) |*attachment| attachment.deinit(std.testing.allocator);
+        attachments.deinit(std.testing.allocator);
+    }
+
+    try collectOutboundAttachmentsFromToolResult(
+        std.testing.allocator,
+        &attachments,
+        "browser_automate",
+        "{\"ok\":true,\"tool\":\"browser_automate\",\"actions\":[{\"action\":\"screenshot\",\"ok\":false,\"path\":\"/shots/fail.png\"},{\"action\":\"download\",\"ok\":false,\"save_as\":\"/downloads/fail.pdf\"}]}",
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), attachments.items.len);
+}
+
 test "parseAssistantTurn extracts tool calls" {
     const response_body =
         \\{
@@ -1163,6 +1357,7 @@ test "buildSystemInstruction includes workspace instructions when provided" {
     const instruction = try buildSystemInstruction(
         std.testing.allocator,
         "{\"workspace_root\":\"/tmp/workspace\"}",
+        null,
         "Always read README.md first.",
     );
     defer std.testing.allocator.free(instruction);
@@ -1175,11 +1370,25 @@ test "buildSystemInstruction omits workspace section for empty instructions" {
     const instruction = try buildSystemInstruction(
         std.testing.allocator,
         "{\"workspace_root\":\"/tmp/workspace\"}",
+        null,
         "   \n\t",
     );
     defer std.testing.allocator.free(instruction);
 
     try std.testing.expect(std.mem.indexOf(u8, instruction, "Workspace instructions from ZOID.md:") == null);
+}
+
+test "buildSystemInstruction includes telegram media delivery note for chat requests" {
+    const instruction = try buildSystemInstruction(
+        std.testing.allocator,
+        "{\"workspace_root\":\"/tmp/workspace\"}",
+        12345,
+        null,
+    );
+    defer std.testing.allocator.free(instruction);
+
+    try std.testing.expect(std.mem.indexOf(u8, instruction, "Telegram media delivery note:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, instruction, "Do not read those files for base64 transport") != null);
 }
 
 test "sanitizeLimits clamps to supported bounds" {

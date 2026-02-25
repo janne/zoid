@@ -424,10 +424,9 @@ const js_driver_source =
     \\    throw new Error("Path must be a non-empty string.");
     \\  }
     \\  let resolved;
-    \\  if (inputPath.startsWith("/")) {
-    \\    resolved = path.resolve(rootPath, inputPath.slice(1));
-    \\  } else if (path.isAbsolute(inputPath)) {
-    \\    resolved = path.resolve(inputPath);
+    \\  if (path.isAbsolute(inputPath)) {
+    \\    const trimmed = inputPath.replace(/^[/\\\\]+/, "");
+    \\    resolved = trimmed.length === 0 ? rootPath : path.resolve(rootPath, trimmed);
     \\  } else {
     \\    resolved = path.resolve(rootPath, inputPath);
     \\  }
@@ -927,4 +926,9 @@ test "isValidSessionId allows only safe characters" {
     try std.testing.expect(!isValidSessionId(""));
     try std.testing.expect(!isValidSessionId("space id"));
     try std.testing.expect(!isValidSessionId("../../etc"));
+}
+
+test "js driver resolveWorkspacePath treats absolute input as workspace-relative" {
+    try std.testing.expect(std.mem.indexOf(u8, js_driver_source, "const trimmed = inputPath.replace(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, js_driver_source, "const absoluteCandidate = path.resolve(inputPath);") == null);
 }

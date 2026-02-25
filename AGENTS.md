@@ -9,7 +9,7 @@ The project provides:
 - Workspace bootstrap via `zoid init [<path>] [--force]` in `src/workspace_init.zig`, copying embedded template files sourced from `workspace/`.
 - Lua script execution via `zoid execute <file.lua>` in `src/lua_runner.zig`.
 - JSON config key/value storage via `zoid config set|get|unset|list` in `src/config_store.zig`.
-- Service mode via `zoid serve` in `src/telegram_bot.zig` (Telegram long-polling), maintaining conversation context per Telegram conversation key (`chat_id` + optional `message_thread_id`), persisting it under the app-data directory, forwarding messages to OpenAI, replying with `sendMessage`, and running scheduled jobs from app-data scheduler storage (workspace-scoped namespace).
+- Service mode via `zoid serve` in `src/telegram_bot.zig` (Telegram long-polling), maintaining conversation context per Telegram conversation key (`chat_id` + optional `message_thread_id`), persisting it under the app-data directory, forwarding messages to OpenAI, replying with `sendMessage` plus `sendPhoto`/`sendDocument` for generated file attachments, and running scheduled jobs from app-data scheduler storage (workspace-scoped namespace).
 - OpenAI chat + one-shot run flows in `src/openai_client.zig` and `src/chat_session.zig`, including local tools (`filesystem_read`, `filesystem_list`, `filesystem_grep`, `filesystem_write`, `filesystem_mkdir`, `filesystem_rmdir`, `filesystem_delete`, `lua_execute`, `config`, `jobs`, `http_get`, `http_post`, `http_put`, `http_delete`, `datetime_now`) with workspace-root policy handling via `src/tool_runtime.zig`.
 - Shared scheduler persistence/runtime in `src/scheduler_store.zig` + `src/scheduler_runtime.zig` with cron helper logic in `src/cron_adapter.zig`.
 - Shared OpenAI model policy in `src/model_catalog.zig` (default model, picker fallback models, and chat-model ID filtering rules).
@@ -73,6 +73,8 @@ If you change command behavior, error handling, config format, or Lua execution 
   - While generating a reply in Telegram service mode, send the native `sendChatAction` typing indicator periodically so users see Telegram's built-in "typing..." state until `sendMessage` completes.
   - Telegram `sendMessage` requests set `parse_mode` to `MarkdownV2`.
   - Telegram reply delivery should sanitize outgoing text for `MarkdownV2` (escape reserved punctuation that commonly breaks entity parsing) before send, and fall back to plain text (`parse_mode` omitted) when Telegram still rejects a chunk, so replies are still delivered.
+  - Telegram delivery should upload generated attachments from browser tool outputs before text: screenshots via `sendPhoto` (with fallback to `sendDocument` when photo upload fails), and downloaded files via `sendDocument`.
+  - For Telegram chat requests, system instructions should tell the agent that browser screenshot/download artifacts are host-delivered automatically, so the agent should not read files for base64 media transport.
   - Service mode processes due scheduled jobs before polling updates; scheduler output is sent to the assistant and assistant replies are delivered to Telegram DM when a DM chat id is available.
   - Service mode persists the latest private-chat `chat_id` to app-data (`telegram_dm_chat_id.txt`), which is used as runtime DM fallback when scheduled jobs execute.
   - Scheduler metadata files (`scheduler_jobs.json` + lock/tmp) must live under `getAppDataDir("zoid")`, not inside the workspace tree; only user-authored Lua job payload files and documents should live in workspace.
@@ -106,7 +108,7 @@ If you change command behavior, error handling, config format, or Lua execution 
 ### Tool runtime changes:
   - `src/tool_runtime.zig` enforces `workspace-write` policy rooted at current working directory and exposes `filesystem_read`, `filesystem_list`, `filesystem_grep`, `filesystem_write`, `filesystem_mkdir`, `filesystem_rmdir`, `filesystem_delete`, `lua_execute`, `config`, `jobs`, `http_get`, `http_post`, `http_put`, `http_delete`, `datetime_now`, and `browser_automate`.
   - Shared filesystem sandbox/path enforcement and metadata/listing logic lives in `src/workspace_fs.zig`; both `lua_execute` (`zoid.file(...)` / `zoid.dir(...)`) and direct filesystem tools must use this module.
-  - In workspace path APIs, a leading `/` means workspace root (not filesystem root); canonical filesystem absolute paths are only accepted when already inside workspace root.
+  - In workspace path APIs, absolute inputs are treated as workspace-relative paths: a leading `/` means workspace root (not filesystem root), and host filesystem absolute semantics are not used.
   - Shared outbound HTTP request behavior lives in `src/http_client.zig`; both `lua_execute` (`zoid.uri(...)`) and direct HTTP tools must use this module to avoid divergence.
   - Shared config mutation/read behavior lives in `src/config_runtime.zig`; both `lua_execute` (`zoid.config():list/get/set/unset`) and direct `config` tool calls must use this module to avoid divergence.
   - `filesystem_mkdir` creates one directory whose canonical path resolves inside workspace root and fails if it already exists.

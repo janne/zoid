@@ -399,6 +399,7 @@ Supported browser `actions` (complete list):
 - exactly one schedule input is required: `at` (natural-language date/time) or `cron` (5-field cron)
 - no Telegram destination is resolved at create time
 - destination is resolved when the job runs: Telegram DM (if available), otherwise the reply is dropped
+- when the agent uses browser automation during a scheduled run, screenshot artifacts are sent via Telegram photo upload (fallback document upload) and download artifacts are sent as Telegram documents
 - returned `job.path` values use workspace-absolute format (`/...`)
 
 `zoid.jobs` supports `create`, `list`, `delete`, `pause`, and `resume`.

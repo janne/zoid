@@ -485,10 +485,6 @@ fn toCandidatePath(
 ) ![]u8 {
     if (requested_path.len == 0) return error.InvalidToolArguments;
     if (std.fs.path.isAbsolute(requested_path)) {
-        if (isPathInsideWorkspace(workspace_root, requested_path)) {
-            return allocator.dupe(u8, requested_path);
-        }
-
         const trimmed_path = std.mem.trimLeft(u8, requested_path, "/\\");
         if (trimmed_path.len == 0) return allocator.dupe(u8, workspace_root);
         return std.fs.path.join(allocator, &.{ workspace_root, trimmed_path });
@@ -874,4 +870,29 @@ test "workspace absolute path resolves from workspace root" {
     const workspace_absolute = try toWorkspaceAbsolutePath(std.testing.allocator, workspace_root, resolved);
     defer std.testing.allocator.free(workspace_absolute);
     try std.testing.expectEqualStrings("/ZOID.md", workspace_absolute);
+}
+
+test "filesystem absolute path input is treated as workspace-relative" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    try tmp.dir.makePath("Users/example");
+    {
+        const file = try tmp.dir.createFile("Users/example/note.txt", .{});
+        defer file.close();
+        try file.writeAll("ok");
+    }
+
+    const resolved = try resolveAllowedReadPath(
+        std.testing.allocator,
+        workspace_root,
+        "/Users/example/note.txt",
+    );
+    defer std.testing.allocator.free(resolved);
+
+    try std.testing.expect(std.mem.startsWith(u8, resolved, workspace_root));
+    try std.testing.expect(std.mem.endsWith(u8, resolved, "Users/example/note.txt"));
 }

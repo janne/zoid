@@ -61,6 +61,7 @@ Telegram routing for scheduled output:
 - When a due job runs, Zoid passes the output to the agent and asks for a reply, then tries to DM on Telegram using the stored private-chat id.
 - The DM id is updated automatically when `zoid serve` receives a private Telegram message.
 - If no DM id is available at run time, the scheduled reply is ignored.
+- Browser automation artifacts are delivered as Telegram media when possible: screenshots via `sendPhoto` (fallback `sendDocument`) and downloaded files via `sendDocument`.
 
 ## Optional browser support
 
