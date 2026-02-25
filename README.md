@@ -111,6 +111,15 @@ sudo install -m 0755 /path/to/zoid /usr/local/bin/zoid
 sudo zoid config set OPENAI_API_KEY "<...>"
 sudo zoid config set TELEGRAM_BOT_TOKEN "<...>"
 sudo zoid config set OPENAI_MODEL "gpt-5-mini"
+
+# Optional runtime limits
+sudo zoid config set OPENAI_MAX_INPUT_TOKENS "180000"
+sudo zoid config set OPENAI_MAX_MESSAGE_CHARS "12000"
+sudo zoid config set OPENAI_MAX_TOOL_ROUNDS "16"
+sudo zoid config set OPENAI_MAX_TOOL_RESULT_CHARS "12000"
+sudo zoid config set OPENAI_MAX_WORKSPACE_INSTRUCTION_CHARS "262144"
+sudo zoid config set TELEGRAM_MAX_CONVERSATION_MESSAGES "20"
+sudo zoid config set TELEGRAM_USER_INACTIVITY_RESET_SECONDS "28800"
 ```
 
 ## Create `/etc/systemd/system/zoid.service`

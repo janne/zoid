@@ -1,3 +1,10 @@
 pub const openai_api_key: []const u8 = "OPENAI_API_KEY";
 pub const openai_model: []const u8 = "OPENAI_MODEL";
 pub const telegram_bot_token: []const u8 = "TELEGRAM_BOT_TOKEN";
+pub const openai_max_input_tokens: []const u8 = "OPENAI_MAX_INPUT_TOKENS";
+pub const openai_max_message_chars: []const u8 = "OPENAI_MAX_MESSAGE_CHARS";
+pub const telegram_max_conversation_messages: []const u8 = "TELEGRAM_MAX_CONVERSATION_MESSAGES";
+pub const telegram_user_inactivity_reset_seconds: []const u8 = "TELEGRAM_USER_INACTIVITY_RESET_SECONDS";
+pub const openai_max_tool_rounds: []const u8 = "OPENAI_MAX_TOOL_ROUNDS";
+pub const openai_max_tool_result_chars: []const u8 = "OPENAI_MAX_TOOL_RESULT_CHARS";
+pub const openai_max_workspace_instruction_chars: []const u8 = "OPENAI_MAX_WORKSPACE_INSTRUCTION_CHARS";

@@ -2,6 +2,7 @@ const std = @import("std");
 const http_client = @import("http_client.zig");
 const lua_runner = @import("lua_runner.zig");
 const openai_client = @import("openai_client.zig");
+const runtime_limits = @import("runtime_limits.zig");
 const scheduler_runtime = @import("scheduler_runtime.zig");
 const tool_runtime = @import("tool_runtime.zig");
 
@@ -10,6 +11,7 @@ pub const Settings = struct {
     openai_api_key: []const u8,
     openai_model: []const u8,
     workspace_instruction: ?[]const u8 = null,
+    limits: runtime_limits.Limits = .{},
 };
 
 const max_poll_timeout_seconds: u16 = 50;
@@ -17,8 +19,6 @@ const max_poll_response_bytes: usize = 2 * 1024 * 1024;
 const max_send_response_bytes: usize = 512 * 1024;
 const max_telegram_message_bytes: usize = 4000;
 const poll_backoff_ns: u64 = 3 * std.time.ns_per_s;
-const max_conversation_messages_per_chat: usize = 80;
-const user_inactivity_reset_seconds: i64 = 8 * std.time.s_per_hour;
 const max_conversation_state_file_bytes: usize = 8 * 1024 * 1024;
 const conversation_state_file_name = "telegram_context.json";
 const serve_lock_file_name = "telegram_serve.lock";
@@ -149,7 +149,12 @@ pub fn runLongPolling(allocator: std.mem.Allocator, settings: Settings) !void {
     var conversations = ConversationStore.init(allocator);
     defer deinitConversationStore(allocator, &conversations);
 
-    loadConversationStoreAtPath(allocator, runtime_paths.state_path, &conversations) catch |err| {
+    loadConversationStoreAtPath(
+        allocator,
+        runtime_paths.state_path,
+        &conversations,
+        settings.limits.telegram_max_conversation_messages,
+    ) catch |err| {
         std.debug.print(
             "Failed to load Telegram conversation state ({s}); continuing with empty state.\n",
             .{@errorName(err)},
@@ -166,6 +171,7 @@ pub fn runLongPolling(allocator: std.mem.Allocator, settings: Settings) !void {
             workspace_root,
             runtime_paths.default_dm_chat_id_path,
             settings.workspace_instruction,
+            settings.limits.openai,
         ) catch |err| {
             std.debug.print("Failed to process scheduled jobs: {s}\n", .{@errorName(err)});
         };
@@ -213,6 +219,7 @@ pub fn runLongPolling(allocator: std.mem.Allocator, settings: Settings) !void {
                 settings.openai_api_key,
                 settings.openai_model,
                 settings.bot_token,
+                settings.limits,
                 message.chat_id,
                 message.thread_id,
                 message.text,
@@ -246,6 +253,7 @@ fn processInboundMessage(
     api_key: []const u8,
     model: []const u8,
     bot_token: []const u8,
+    limits: runtime_limits.Limits,
     chat_id: i64,
     thread_id: ?i64,
     raw_text: []const u8,
@@ -292,6 +300,7 @@ fn processInboundMessage(
         api_key,
         model,
         bot_token,
+        limits,
         conversation_key,
         prompt,
         workspace_instruction,
@@ -342,13 +351,14 @@ fn processPromptForChat(
     api_key: []const u8,
     model: []const u8,
     bot_token: []const u8,
+    limits: runtime_limits.Limits,
     key: ConversationKey,
     prompt: []const u8,
     workspace_instruction: ?[]const u8,
 ) !void {
     const now = std.time.timestamp();
     if (conversations.getPtr(key)) |existing| {
-        if (shouldResetConversationForInactivity(existing, now)) {
+        if (shouldResetConversationForInactivity(existing, now, limits.telegram_user_inactivity_reset_seconds)) {
             _ = clearConversationForKey(allocator, conversations, key);
             persistConversationStoreAtPath(allocator, state_path, conversations) catch |err| {
                 std.debug.print(
@@ -387,6 +397,7 @@ fn processPromptForChat(
         .{
             .request_chat_id = key.chat_id,
             .workspace_instruction = workspace_instruction,
+            .limits = limits.openai,
         },
     );
     defer allocator.free(reply);
@@ -407,7 +418,7 @@ fn processPromptForChat(
 
     try sendMessageInChunks(allocator, bot_token, key.chat_id, key.thread_id, trimmed_reply);
     try conversation.appendMessage(allocator, .assistant, trimmed_reply);
-    enforceConversationLimit(conversation, allocator);
+    enforceConversationLimit(conversation, allocator, limits.telegram_max_conversation_messages);
     conversation_turn_committed = true;
 
     persistConversationStoreAtPath(allocator, state_path, conversations) catch |err| {
@@ -415,10 +426,14 @@ fn processPromptForChat(
     };
 }
 
-fn shouldResetConversationForInactivity(conversation: *const Conversation, now: i64) bool {
+fn shouldResetConversationForInactivity(
+    conversation: *const Conversation,
+    now: i64,
+    reset_after_seconds: i64,
+) bool {
     const last_user_message_at = conversation.last_user_message_at orelse return false;
     if (now <= last_user_message_at) return false;
-    return now - last_user_message_at >= user_inactivity_reset_seconds;
+    return now - last_user_message_at >= reset_after_seconds;
 }
 
 fn processDueScheduledJobs(
@@ -429,6 +444,7 @@ fn processDueScheduledJobs(
     workspace_root: []const u8,
     default_dm_chat_id_path: []const u8,
     workspace_instruction: ?[]const u8,
+    openai_limits: openai_client.Limits,
 ) !void {
     const now = std.time.timestamp();
     const due_jobs = try scheduler_runtime.takeDueJobs(
@@ -462,7 +478,10 @@ fn processDueScheduledJobs(
             api_key,
             model,
             &messages,
-            .{ .workspace_instruction = workspace_instruction },
+            .{
+                .workspace_instruction = workspace_instruction,
+                .limits = openai_limits,
+            },
         ) catch |err| {
             std.debug.print(
                 "Failed to process scheduled job {s}: {s}\n",
@@ -502,8 +521,12 @@ fn processDueScheduledJobs(
     }
 }
 
-fn enforceConversationLimit(conversation: *Conversation, allocator: std.mem.Allocator) void {
-    while (conversation.messages.items.len > max_conversation_messages_per_chat) {
+fn enforceConversationLimit(
+    conversation: *Conversation,
+    allocator: std.mem.Allocator,
+    max_messages: usize,
+) void {
+    while (conversation.messages.items.len > max_messages) {
         const removed = conversation.messages.orderedRemove(0);
         allocator.free(removed.content);
     }
@@ -658,6 +681,7 @@ fn loadConversationStoreAtPath(
     allocator: std.mem.Allocator,
     state_path: []const u8,
     conversations: *ConversationStore,
+    max_messages_per_chat: usize,
 ) !void {
     const state_file = std.fs.cwd().openFile(state_path, .{}) catch |err| switch (err) {
         error.FileNotFound => return,
@@ -731,7 +755,7 @@ fn loadConversationStoreAtPath(
         }
 
         loaded.last_user_message_at = last_user_message_at;
-        enforceConversationLimit(&loaded, allocator);
+        enforceConversationLimit(&loaded, allocator, max_messages_per_chat);
 
         const entry = try conversations.getOrPut(.{
             .chat_id = chat_id,
@@ -1490,7 +1514,12 @@ test "conversation state round-trips through disk persistence" {
 
     var restored = ConversationStore.init(std.testing.allocator);
     defer deinitConversationStore(std.testing.allocator, &restored);
-    try loadConversationStoreAtPath(std.testing.allocator, state_path, &restored);
+    try loadConversationStoreAtPath(
+        std.testing.allocator,
+        state_path,
+        &restored,
+        runtime_limits.default_telegram_max_conversation_messages,
+    );
 
     try std.testing.expect(restored.get(key_a) != null);
     const restored_a = restored.get(key_a).?;
@@ -1555,19 +1584,22 @@ test "enforceConversationLimit removes oldest messages" {
     var conversation = Conversation{};
     defer conversation.deinit(std.testing.allocator);
 
-    const overflow = max_conversation_messages_per_chat + 3;
+    const max_messages = runtime_limits.default_telegram_max_conversation_messages;
+    const overflow = max_messages + 3;
     for (0..overflow) |index| {
         const text = try std.fmt.allocPrint(std.testing.allocator, "m{d}", .{index});
         defer std.testing.allocator.free(text);
         try conversation.appendMessage(std.testing.allocator, .user, text);
     }
 
-    enforceConversationLimit(&conversation, std.testing.allocator);
+    enforceConversationLimit(&conversation, std.testing.allocator, max_messages);
 
-    try std.testing.expectEqual(@as(usize, max_conversation_messages_per_chat), conversation.messages.items.len);
+    try std.testing.expectEqual(max_messages, conversation.messages.items.len);
     try std.testing.expectEqualStrings("m3", conversation.messages.items[0].content);
+    const expected_last = try std.fmt.allocPrint(std.testing.allocator, "m{d}", .{max_messages + 2});
+    defer std.testing.allocator.free(expected_last);
     try std.testing.expectEqualStrings(
-        "m82",
+        expected_last,
         conversation.messages.items[conversation.messages.items.len - 1].content,
     );
 }
@@ -1575,10 +1607,11 @@ test "enforceConversationLimit removes oldest messages" {
 test "shouldResetConversationForInactivity honors 8-hour threshold" {
     var conversation = Conversation{};
     defer conversation.deinit(std.testing.allocator);
+    const reset_seconds = runtime_limits.default_telegram_user_inactivity_reset_seconds;
 
-    try std.testing.expect(!shouldResetConversationForInactivity(&conversation, 1_000));
+    try std.testing.expect(!shouldResetConversationForInactivity(&conversation, 1_000, reset_seconds));
 
     conversation.last_user_message_at = 1_000;
-    try std.testing.expect(!shouldResetConversationForInactivity(&conversation, 1_000 + user_inactivity_reset_seconds - 1));
-    try std.testing.expect(shouldResetConversationForInactivity(&conversation, 1_000 + user_inactivity_reset_seconds));
+    try std.testing.expect(!shouldResetConversationForInactivity(&conversation, 1_000 + reset_seconds - 1, reset_seconds));
+    try std.testing.expect(shouldResetConversationForInactivity(&conversation, 1_000 + reset_seconds, reset_seconds));
 }

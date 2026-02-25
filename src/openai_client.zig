@@ -15,6 +15,7 @@ pub const Message = struct {
 pub const RequestContext = struct {
     request_chat_id: ?i64 = null,
     workspace_instruction: ?[]const u8 = null,
+    limits: Limits = .{},
 };
 
 const ParsedToolCall = struct {
@@ -38,7 +39,31 @@ const ParsedAssistantTurn = struct {
     }
 };
 
-const max_tool_rounds: usize = 16;
+pub const default_max_input_tokens: usize = 180_000;
+pub const min_max_input_tokens: usize = 1_000;
+pub const max_max_input_tokens: usize = 500_000;
+
+pub const default_max_message_chars: usize = 12_000;
+pub const min_max_message_chars: usize = 256;
+pub const max_max_message_chars: usize = 200_000;
+
+pub const default_max_tool_rounds: usize = 16;
+pub const min_max_tool_rounds: usize = 1;
+pub const max_max_tool_rounds: usize = 64;
+
+pub const default_max_tool_result_chars: usize = 12_000;
+pub const min_max_tool_result_chars: usize = 256;
+pub const max_max_tool_result_chars: usize = 200_000;
+
+pub const Limits = struct {
+    max_input_tokens: usize = default_max_input_tokens,
+    max_message_chars: usize = default_max_message_chars,
+    max_tool_rounds: usize = default_max_tool_rounds,
+    max_tool_result_chars: usize = default_max_tool_result_chars,
+};
+
+const estimated_tokens_per_byte_divisor: usize = 3;
+const estimated_token_overhead: usize = 2_048;
 
 pub fn fetchAvailableModels(allocator: std.mem.Allocator, api_key: []const u8) ![][]u8 {
     if (api_key.len == 0) return error.EmptyApiKey;
@@ -100,6 +125,7 @@ pub fn fetchAssistantReplyWithContext(
 ) ![]u8 {
     if (api_key.len == 0) return error.EmptyApiKey;
     if (messages.len == 0) return error.EmptyConversation;
+    const limits = sanitizeLimits(request_context.limits);
 
     var policy = try tool_runtime.Policy.initForCurrentWorkspace(allocator);
     defer policy.deinit(allocator);
@@ -127,22 +153,24 @@ pub fn fetchAssistantReplyWithContext(
     try wire_messages.append(allocator, system_message_json);
 
     for (messages) |message| {
-        const message_json = try buildRoleContentMessageJson(
+        const message_json = try buildRoleContentMessageJsonCapped(
             allocator,
             roleToString(message.role),
             message.content,
+            limits.max_message_chars,
         );
         try wire_messages.append(allocator, message_json);
     }
 
     var rounds: usize = 0;
-    while (rounds < max_tool_rounds) : (rounds += 1) {
-        const payload = try buildChatCompletionsPayloadWithTools(
+    while (rounds < limits.max_tool_rounds) : (rounds += 1) {
+        const payload = try buildPayloadWithinTokenBudget(
             allocator,
             model,
-            wire_messages.items,
+            &wire_messages,
             &policy,
             "auto",
+            limits.max_input_tokens,
         );
         defer allocator.free(payload);
         const response_body = try sendChatCompletionsRequest(allocator, api_key, payload);
@@ -161,6 +189,7 @@ pub fn fetchAssistantReplyWithContext(
             allocator,
             turn.content,
             turn.tool_calls,
+            limits.max_message_chars,
         );
         try wire_messages.append(allocator, assistant_message_json);
 
@@ -174,21 +203,29 @@ pub fn fetchAssistantReplyWithContext(
             ) catch |err| try tool_runtime.buildErrorResult(allocator, @errorName(err));
             defer allocator.free(tool_result);
 
+            const capped_tool_result = try capTextToLimit(
+                allocator,
+                tool_result,
+                limits.max_tool_result_chars,
+            );
+            defer capped_tool_result.deinit(allocator);
+
             const tool_result_message = try buildToolResultMessageJson(
                 allocator,
                 tool_call.id,
-                tool_result,
+                capped_tool_result.value,
             );
             try wire_messages.append(allocator, tool_result_message);
         }
     }
 
-    const final_payload = try buildChatCompletionsPayloadWithTools(
+    const final_payload = try buildPayloadWithinTokenBudget(
         allocator,
         model,
-        wire_messages.items,
+        &wire_messages,
         &policy,
         "none",
+        limits.max_input_tokens,
     );
     defer allocator.free(final_payload);
 
@@ -201,6 +238,109 @@ pub fn fetchAssistantReplyWithContext(
     const final_content = final_turn.content orelse return error.ToolCallLimitExceeded;
     final_turn.content = null;
     return final_content;
+}
+
+fn sanitizeLimits(raw: Limits) Limits {
+    var limits = raw;
+    limits.max_input_tokens = std.math.clamp(
+        limits.max_input_tokens,
+        min_max_input_tokens,
+        max_max_input_tokens,
+    );
+    limits.max_message_chars = std.math.clamp(
+        limits.max_message_chars,
+        min_max_message_chars,
+        max_max_message_chars,
+    );
+    limits.max_tool_rounds = std.math.clamp(
+        limits.max_tool_rounds,
+        min_max_tool_rounds,
+        max_max_tool_rounds,
+    );
+    limits.max_tool_result_chars = std.math.clamp(
+        limits.max_tool_result_chars,
+        min_max_tool_result_chars,
+        max_max_tool_result_chars,
+    );
+    return limits;
+}
+
+const CappedText = struct {
+    value: []const u8,
+    owned: bool = false,
+
+    fn deinit(self: CappedText, allocator: std.mem.Allocator) void {
+        if (self.owned) allocator.free(self.value);
+    }
+};
+
+fn capTextToLimit(
+    allocator: std.mem.Allocator,
+    value: []const u8,
+    max_chars: usize,
+) !CappedText {
+    if (value.len <= max_chars) {
+        return .{ .value = value };
+    }
+
+    return .{
+        .value = try allocator.dupe(u8, value[0..max_chars]),
+        .owned = true,
+    };
+}
+
+fn buildRoleContentMessageJsonCapped(
+    allocator: std.mem.Allocator,
+    role: []const u8,
+    content: []const u8,
+    max_chars: usize,
+) ![]u8 {
+    const capped = try capTextToLimit(allocator, content, max_chars);
+    defer capped.deinit(allocator);
+    return buildRoleContentMessageJson(allocator, role, capped.value);
+}
+
+fn buildPayloadWithinTokenBudget(
+    allocator: std.mem.Allocator,
+    model: []const u8,
+    wire_messages: *std.ArrayList([]u8),
+    policy: *const tool_runtime.Policy,
+    tool_choice: []const u8,
+    max_input_tokens: usize,
+) ![]u8 {
+    while (true) {
+        const payload = try buildChatCompletionsPayloadWithTools(
+            allocator,
+            model,
+            wire_messages.items,
+            policy,
+            tool_choice,
+        );
+
+        if (estimateInputTokens(payload.len) <= max_input_tokens) {
+            return payload;
+        }
+
+        allocator.free(payload);
+        if (!dropOldestWireMessage(allocator, wire_messages)) {
+            return error.InputTokenBudgetExceeded;
+        }
+    }
+}
+
+fn estimateInputTokens(payload_bytes: usize) usize {
+    return payload_bytes / estimated_tokens_per_byte_divisor + estimated_token_overhead;
+}
+
+fn dropOldestWireMessage(
+    allocator: std.mem.Allocator,
+    wire_messages: *std.ArrayList([]u8),
+) bool {
+    // Keep the system message (index 0) and always preserve at least one latest non-system message.
+    if (wire_messages.items.len <= 2) return false;
+    const removed = wire_messages.orderedRemove(1);
+    allocator.free(removed);
+    return true;
 }
 
 fn sendChatCompletionsRequest(
@@ -644,6 +784,7 @@ fn buildAssistantToolCallMessageJson(
     allocator: std.mem.Allocator,
     content: ?[]const u8,
     tool_calls: []const ParsedToolCall,
+    max_message_chars: usize,
 ) ![]u8 {
     var output = std.Io.Writer.Allocating.init(allocator);
     errdefer output.deinit();
@@ -651,7 +792,9 @@ fn buildAssistantToolCallMessageJson(
     const writer = &output.writer;
     try writer.writeAll("{\"role\":\"assistant\",\"content\":");
     if (content) |value| {
-        try writeJsonString(allocator, writer, value);
+        const capped = try capTextToLimit(allocator, value, max_message_chars);
+        defer capped.deinit(allocator);
+        try writeJsonString(allocator, writer, capped.value);
     } else {
         try writer.writeAll("null");
     }
@@ -994,4 +1137,96 @@ test "buildSystemInstruction omits workspace section for empty instructions" {
     defer std.testing.allocator.free(instruction);
 
     try std.testing.expect(std.mem.indexOf(u8, instruction, "Workspace instructions from ZOID.md:") == null);
+}
+
+test "sanitizeLimits clamps to supported bounds" {
+    const sanitized = sanitizeLimits(.{
+        .max_input_tokens = 10,
+        .max_message_chars = 1_000_000,
+        .max_tool_rounds = 0,
+        .max_tool_result_chars = 10,
+    });
+
+    try std.testing.expectEqual(min_max_input_tokens, sanitized.max_input_tokens);
+    try std.testing.expectEqual(max_max_message_chars, sanitized.max_message_chars);
+    try std.testing.expectEqual(min_max_tool_rounds, sanitized.max_tool_rounds);
+    try std.testing.expectEqual(min_max_tool_result_chars, sanitized.max_tool_result_chars);
+}
+
+test "buildRoleContentMessageJsonCapped truncates long content" {
+    const payload = try buildRoleContentMessageJsonCapped(
+        std.testing.allocator,
+        "user",
+        "abcdefghij",
+        4,
+    );
+    defer std.testing.allocator.free(payload);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("user", root.get("role").?.string);
+    try std.testing.expectEqualStrings("abcd", root.get("content").?.string);
+}
+
+test "buildPayloadWithinTokenBudget drops oldest non-system messages first" {
+    var wire_messages = std.ArrayList([]u8).empty;
+    defer {
+        for (wire_messages.items) |item| std.testing.allocator.free(item);
+        wire_messages.deinit(std.testing.allocator);
+    }
+
+    try wire_messages.append(
+        std.testing.allocator,
+        try buildRoleContentMessageJson(std.testing.allocator, "system", "policy"),
+    );
+    try wire_messages.append(
+        std.testing.allocator,
+        try buildRoleContentMessageJson(std.testing.allocator, "user", "11111111111111111111"),
+    );
+    try wire_messages.append(
+        std.testing.allocator,
+        try buildRoleContentMessageJson(std.testing.allocator, "assistant", "22222222222222222222"),
+    );
+
+    const no_tools_policy = tool_runtime.Policy{ .workspace_root = "" };
+    const payload_with_three = try buildChatCompletionsPayloadWithTools(
+        std.testing.allocator,
+        "gpt-4o-mini",
+        wire_messages.items,
+        &no_tools_policy,
+        "auto",
+    );
+    defer std.testing.allocator.free(payload_with_three);
+
+    const two_messages = [_][]const u8{
+        wire_messages.items[0],
+        wire_messages.items[2],
+    };
+    const payload_with_two = try buildChatCompletionsPayloadWithTools(
+        std.testing.allocator,
+        "gpt-4o-mini",
+        &two_messages,
+        &no_tools_policy,
+        "auto",
+    );
+    defer std.testing.allocator.free(payload_with_two);
+
+    const estimate_three = estimateInputTokens(payload_with_three.len);
+    const estimate_two = estimateInputTokens(payload_with_two.len);
+    try std.testing.expect(estimate_three > estimate_two);
+
+    const payload = try buildPayloadWithinTokenBudget(
+        std.testing.allocator,
+        "gpt-4o-mini",
+        &wire_messages,
+        &no_tools_policy,
+        "auto",
+        estimate_three - 1,
+    );
+    defer std.testing.allocator.free(payload);
+
+    try std.testing.expectEqual(@as(usize, 2), wire_messages.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "22222222222222222222") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "11111111111111111111") == null);
 }

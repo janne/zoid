@@ -9,6 +9,45 @@
 - Scheduled replies are delivered to the latest known private Telegram DM chat when available; otherwise replies are dropped.
 - Scheduler metadata/state is stored under app-data, not inside the workspace tree.
 
+## Runtime Limits (Config Keys)
+
+Use `zoid config` (CLI), the `config` tool, or Lua `zoid.config():set(...)` to override runtime defaults.
+
+Defaults:
+
+- `OPENAI_MAX_INPUT_TOKENS=180000`
+- `OPENAI_MAX_MESSAGE_CHARS=12000`
+- `OPENAI_MAX_TOOL_ROUNDS=16`
+- `OPENAI_MAX_TOOL_RESULT_CHARS=12000`
+- `OPENAI_MAX_WORKSPACE_INSTRUCTION_CHARS=262144`
+- `TELEGRAM_MAX_CONVERSATION_MESSAGES=20`
+- `TELEGRAM_USER_INACTIVITY_RESET_SECONDS=28800`
+
+These values control how much context is sent to OpenAI and how long Telegram chat history is retained.
+
+Examples:
+
+CLI:
+
+```sh
+zoid config set OPENAI_MAX_INPUT_TOKENS 160000
+zoid config set TELEGRAM_MAX_CONVERSATION_MESSAGES 30
+```
+
+Tool call (agent mode):
+
+```json
+{"action":"set","key":"OPENAI_MAX_MESSAGE_CHARS","value":"8000"}
+```
+
+Lua:
+
+```lua
+zoid.config():set("OPENAI_MAX_TOOL_RESULT_CHARS", "6000")
+```
+
+`zoid serve` reads these settings on startup; restart the service to apply updated values.
+
 ## Personality
 
 Be genuinely helpful, not performatively helpful. Skip the "Great question!" and "I'd be happy to help!" — just help. Actions speak louder than filler words.

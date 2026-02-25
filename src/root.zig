@@ -6,6 +6,7 @@ pub const config_runtime = @import("config_runtime.zig");
 pub const config_store = @import("config_store.zig");
 pub const model_catalog = @import("model_catalog.zig");
 pub const openai_client = @import("openai_client.zig");
+pub const runtime_limits = @import("runtime_limits.zig");
 pub const scheduler_runtime = @import("scheduler_runtime.zig");
 pub const scheduler_store = @import("scheduler_store.zig");
 pub const telegram_bot = @import("telegram_bot.zig");

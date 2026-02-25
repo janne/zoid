@@ -51,6 +51,7 @@ const RequestWorkerArgs = struct {
     api_key: []const u8,
     model: []const u8,
     workspace_instruction: ?[]const u8,
+    limits: openai_client.Limits,
     messages: []openai_client.Message,
 };
 
@@ -161,8 +162,9 @@ pub fn run(
     api_key: []const u8,
     model: []const u8,
     workspace_instruction: ?[]const u8,
+    limits: openai_client.Limits,
 ) !void {
-    return runFullscreen(allocator, api_key, model, workspace_instruction);
+    return runFullscreen(allocator, api_key, model, workspace_instruction, limits);
 }
 
 fn runFullscreen(
@@ -170,6 +172,7 @@ fn runFullscreen(
     api_key: []const u8,
     model: []const u8,
     workspace_instruction: ?[]const u8,
+    limits: openai_client.Limits,
 ) !void {
     var current_model = try allocator.dupe(u8, model);
     defer allocator.free(current_model);
@@ -331,6 +334,7 @@ fn runFullscreen(
                                             .api_key = api_key,
                                             .model = current_model,
                                             .workspace_instruction = workspace_instruction,
+                                            .limits = limits,
                                             .messages = snapshot,
                                         };
 
@@ -582,7 +586,10 @@ fn requestWorkerMain(args: *RequestWorkerArgs) void {
         args.api_key,
         args.model,
         args.messages,
-        .{ .workspace_instruction = args.workspace_instruction },
+        .{
+            .workspace_instruction = args.workspace_instruction,
+            .limits = args.limits,
+        },
     ) catch |err| {
         const err_text = switch (err) {
             error.ToolCallLimitExceeded => std.fmt.allocPrint(

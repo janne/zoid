@@ -308,11 +308,12 @@ pub fn main() !void {
                 .{ .role = .user, .content = trimmed_prompt },
             };
 
-            const reply = zoid.openai_client.fetchAssistantReply(
+            const reply = zoid.openai_client.fetchAssistantReplyWithContext(
                 allocator,
                 settings.api_key,
                 settings.model,
                 &messages,
+                .{ .limits = settings.limits.openai },
             ) catch |err| {
                 std.debug.print("OpenAI request failed: {s}\n", .{@errorName(err)});
                 std.process.exit(1);
@@ -329,7 +330,10 @@ pub fn main() !void {
             const bot_token = loadTelegramBotTokenOrExit(allocator);
             defer allocator.free(bot_token);
 
-            const workspace_instruction = loadWorkspaceAgentInstruction(allocator) catch |err| blk: {
+            const workspace_instruction = loadWorkspaceAgentInstruction(
+                allocator,
+                openai_settings.limits.openai_max_workspace_instruction_chars,
+            ) catch |err| blk: {
                 std.debug.print(
                     "Warning: failed to load workspace instructions from ZOID.md: {s}\n",
                     .{@errorName(err)},
@@ -343,6 +347,7 @@ pub fn main() !void {
                 .openai_api_key = openai_settings.api_key,
                 .openai_model = openai_settings.model,
                 .workspace_instruction = workspace_instruction,
+                .limits = openai_settings.limits,
             }) catch |err| {
                 switch (err) {
                     error.ServiceAlreadyRunning => {
@@ -365,7 +370,10 @@ pub fn main() !void {
             const settings = loadOpenAISettingsOrExit(allocator);
             defer settings.deinit(allocator);
 
-            const workspace_instruction = loadWorkspaceAgentInstruction(allocator) catch |err| blk: {
+            const workspace_instruction = loadWorkspaceAgentInstruction(
+                allocator,
+                settings.limits.openai_max_workspace_instruction_chars,
+            ) catch |err| blk: {
                 std.debug.print(
                     "Warning: failed to load workspace instructions from ZOID.md: {s}\n",
                     .{@errorName(err)},
@@ -374,7 +382,13 @@ pub fn main() !void {
             };
             defer if (workspace_instruction) |value| allocator.free(value);
 
-            zoid.chat_session.run(allocator, settings.api_key, settings.model, workspace_instruction) catch |err| {
+            zoid.chat_session.run(
+                allocator,
+                settings.api_key,
+                settings.model,
+                workspace_instruction,
+                settings.limits.openai,
+            ) catch |err| {
                 std.debug.print("Chat session failed: {s}\n", .{@errorName(err)});
                 std.process.exit(1);
             };
@@ -495,6 +509,7 @@ fn executeLuaAsTool(
 const OpenAISettings = struct {
     api_key: []u8,
     model: []u8,
+    limits: zoid.runtime_limits.Limits,
 
     fn deinit(self: OpenAISettings, allocator: std.mem.Allocator) void {
         allocator.free(self.api_key);
@@ -503,7 +518,6 @@ const OpenAISettings = struct {
 };
 
 const workspace_agent_instruction_file_name = "ZOID.md";
-const max_workspace_agent_instruction_bytes: usize = 256 * 1024;
 
 fn loadOpenAISettingsOrExit(allocator: std.mem.Allocator) OpenAISettings {
     return loadOpenAISettings(allocator) catch |err| {
@@ -528,10 +542,14 @@ fn loadOpenAISettings(allocator: std.mem.Allocator) !OpenAISettings {
         value
     else
         try allocator.dupe(u8, zoid.model_catalog.default_model);
+    errdefer allocator.free(model);
+
+    const limits = try zoid.runtime_limits.load(allocator);
 
     return .{
         .api_key = api_key,
         .model = model,
+        .limits = limits,
     };
 }
 
@@ -554,15 +572,19 @@ fn loadTelegramBotToken(allocator: std.mem.Allocator) ![]u8 {
     return token_value orelse error.MissingTelegramBotToken;
 }
 
-fn loadWorkspaceAgentInstruction(allocator: std.mem.Allocator) !?[]u8 {
+fn loadWorkspaceAgentInstruction(
+    allocator: std.mem.Allocator,
+    max_instruction_bytes: usize,
+) !?[]u8 {
     const workspace_root = try getWorkspaceRoot(allocator);
     defer allocator.free(workspace_root);
-    return loadWorkspaceAgentInstructionAtPath(allocator, workspace_root);
+    return loadWorkspaceAgentInstructionAtPath(allocator, workspace_root, max_instruction_bytes);
 }
 
 fn loadWorkspaceAgentInstructionAtPath(
     allocator: std.mem.Allocator,
     workspace_root: []const u8,
+    max_instruction_bytes: usize,
 ) !?[]u8 {
     const path = try std.fs.path.join(
         allocator,
@@ -573,7 +595,7 @@ fn loadWorkspaceAgentInstructionAtPath(
     const content = std.fs.cwd().readFileAlloc(
         allocator,
         path,
-        max_workspace_agent_instruction_bytes,
+        max_instruction_bytes,
     ) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
@@ -1058,7 +1080,11 @@ test "loadWorkspaceAgentInstructionAtPath reads trimmed ZOID.md content" {
     defer file.close();
     try file.writeAll("  agent instructions  \n");
 
-    const content = try loadWorkspaceAgentInstructionAtPath(std.testing.allocator, workspace_root);
+    const content = try loadWorkspaceAgentInstructionAtPath(
+        std.testing.allocator,
+        workspace_root,
+        zoid.runtime_limits.default_openai_max_workspace_instruction_chars,
+    );
     defer if (content) |value| std.testing.allocator.free(value);
 
     try std.testing.expect(content != null);
@@ -1072,6 +1098,10 @@ test "loadWorkspaceAgentInstructionAtPath returns null when ZOID.md is missing" 
     const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace_root);
 
-    const content = try loadWorkspaceAgentInstructionAtPath(std.testing.allocator, workspace_root);
+    const content = try loadWorkspaceAgentInstructionAtPath(
+        std.testing.allocator,
+        workspace_root,
+        zoid.runtime_limits.default_openai_max_workspace_instruction_chars,
+    );
     try std.testing.expect(content == null);
 }

@@ -61,9 +61,9 @@ If you change command behavior, error handling, config format, or Lua execution 
   - Default command is `chat` when running `zoid` with no arguments.
   - `zoid serve` is the long-running service entrypoint; currently it requires both `OPENAI_API_KEY` and `TELEGRAM_BOT_TOKEN` in config and runs a Telegram long-polling loop until interrupted.
   - `zoid chat` and `zoid serve` load `ZOID.md` from the workspace root on startup when present, and pass its content as additional agent instructions in OpenAI system context.
-  - Telegram service mode keeps conversation history per conversation key (`chat_id` + optional `message_thread_id`), persists it to app-data (`telegram_context.json` next to `config.json`), and enforces a per-conversation history cap (`max_conversation_messages_per_chat` in `src/telegram_bot.zig`).
+  - Telegram service mode keeps conversation history per conversation key (`chat_id` + optional `message_thread_id`), persists it to app-data (`telegram_context.json` next to `config.json`), and enforces a per-conversation history cap from config key `TELEGRAM_MAX_CONVERSATION_MESSAGES` (default `20`).
   - Telegram service mode treats forum topics as separate sessions by keying context with `message_thread_id`, and sends replies/typing actions back to the same topic thread when present.
-  - Telegram service mode clears a conversation key's stored context before handling a new prompt when the last inbound user message for that key is older than 8 hours.
+  - Telegram service mode clears a conversation key's stored context before handling a new prompt when the last inbound user message for that key is older than config key `TELEGRAM_USER_INACTIVITY_RESET_SECONDS` (default `28800` / 8h).
   - Telegram service mode acquires an app-data lock file (`telegram_serve.lock`) so only one `zoid serve` instance runs per user profile; a second instance fails with `error.ServiceAlreadyRunning`.
   - `/new` or `/reset` clears stored Telegram context for the current conversation key (`chat_id` + optional `message_thread_id`).
   - While generating a reply in Telegram service mode, send the native `sendChatAction` typing indicator periodically so users see Telegram's built-in "typing..." state until `sendMessage` completes.
@@ -93,7 +93,8 @@ If you change command behavior, error handling, config format, or Lua execution 
   - Keep `src/model_catalog.zig` as the single source of truth for `default_model`, `fallback_models`, and `isChatModelId`.
   - `src/openai_client.zig` should use `model_catalog.isChatModelId` when filtering `/v1/models` results.
   - When writing OpenAI tool-definition JSON in `src/openai_client.zig`, prefer `writeAll` segments plus targeted `writer.print` for numeric inserts instead of one large escaped-brace format string; malformed formatting can trigger OpenAI `400` with `We could not parse the JSON body`.
-  - `src/openai_client.zig` currently allows up to 16 tool-call rounds per request; if that budget is exhausted it performs one final chat-completions call with `tool_choice=\"none\"` to let the model synthesize a final answer before returning `ToolCallLimitExceeded`.
+  - `src/openai_client.zig` uses config-driven runtime limits for prompt/tool execution budgets (`OPENAI_MAX_INPUT_TOKENS`, `OPENAI_MAX_MESSAGE_CHARS`, `OPENAI_MAX_TOOL_ROUNDS`, `OPENAI_MAX_TOOL_RESULT_CHARS`) and trims oldest non-system messages when estimated request tokens exceed budget.
+  - If the tool-round budget is exhausted it performs one final chat-completions call with `tool_choice=\"none\"` to let the model synthesize a final answer before returning `ToolCallLimitExceeded`.
   - `src/main.zig` should use `model_catalog.default_model` when `OPENAI_MODEL` is unset.
   - `src/chat_session.zig` should use `model_catalog.fallback_models` for picker fallback choices.
   - Keep model catalog invariants covered by tests (`default_model` included in `fallback_models`, fallback IDs unique, fallback IDs chat-capable).
@@ -137,6 +138,8 @@ If you change command behavior, error handling, config format, or Lua execution 
   - Preserve valid JSON object format (string keys and string values).
   - Keep deterministic key listing behavior (`list` is currently sorted).
   - Keep OpenAI and Telegram config key names centralized in `src/config_keys.zig` and reuse those constants in command/chat code paths.
+  - Runtime limit keys are loaded via `src/runtime_limits.zig`; invalid/missing values must fall back to defaults.
+  - `ZOID.md` load size limit is config-driven via `OPENAI_MAX_WORKSPACE_INSTRUCTION_CHARS` (default `262144`).
 
 ### Lua runner changes:
   - Keep clear load/runtime error reporting.
