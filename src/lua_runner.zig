@@ -28,6 +28,21 @@ pub const CapturedExecutionStatus = enum {
     runtime_failed,
 };
 
+pub const BrowserAttachmentKind = enum {
+    photo,
+    document,
+};
+
+pub const BrowserAttachment = struct {
+    kind: BrowserAttachmentKind,
+    path: []u8,
+
+    pub fn deinit(self: *BrowserAttachment, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        self.* = undefined;
+    }
+};
+
 pub const CapturedExecution = struct {
     status: CapturedExecutionStatus,
     exit_code: ?i64,
@@ -35,10 +50,13 @@ pub const CapturedExecution = struct {
     stderr: []u8,
     stdout_truncated: bool,
     stderr_truncated: bool,
+    browser_attachments: []BrowserAttachment = &.{},
 
     pub fn deinit(self: *CapturedExecution, allocator: std.mem.Allocator) void {
         allocator.free(self.stdout);
         allocator.free(self.stderr);
+        for (self.browser_attachments) |*attachment| attachment.deinit(allocator);
+        if (self.browser_attachments.len > 0) allocator.free(self.browser_attachments);
     }
 };
 
@@ -100,6 +118,7 @@ const ToolLuaEnvironment = struct {
     allow_private_http_destinations: bool,
     module_cache: std.StringHashMapUnmanaged(c_int) = .{},
     module_stack: std.ArrayList([]u8) = .empty,
+    browser_attachments: std.ArrayList(BrowserAttachment) = .empty,
 
     fn pushModuleStackPath(self: *ToolLuaEnvironment, path: []const u8) !void {
         const owned_path = try self.allocator.dupe(u8, path);
@@ -123,6 +142,8 @@ const ToolLuaEnvironment = struct {
         }
         self.module_cache.deinit(self.allocator);
         self.module_stack.deinit(self.allocator);
+        for (self.browser_attachments.items) |*attachment| attachment.deinit(self.allocator);
+        self.browser_attachments.deinit(self.allocator);
     }
 };
 
@@ -1645,6 +1666,79 @@ fn serializeLuaValueToJsonAlloc(
     return output.toOwnedSlice();
 }
 
+fn appendUniqueBrowserAttachment(
+    allocator: std.mem.Allocator,
+    attachments: *std.ArrayList(BrowserAttachment),
+    kind: BrowserAttachmentKind,
+    path: []const u8,
+) !void {
+    if (path.len == 0) return;
+
+    for (attachments.items) |existing| {
+        if (existing.kind == kind and std.mem.eql(u8, existing.path, path)) return;
+    }
+
+    try attachments.append(allocator, .{
+        .kind = kind,
+        .path = try allocator.dupe(u8, path),
+    });
+}
+
+fn collectBrowserAttachmentsFromBrowserResult(
+    allocator: std.mem.Allocator,
+    attachments: *std.ArrayList(BrowserAttachment),
+    result_value: std.json.Value,
+) !void {
+    const root = switch (result_value) {
+        .object => |object| object,
+        else => return,
+    };
+
+    const actions_value = root.get("actions") orelse return;
+    const actions = switch (actions_value) {
+        .array => |array| array,
+        else => return,
+    };
+
+    for (actions.items) |action_value| {
+        const action = switch (action_value) {
+            .object => |object| object,
+            else => continue,
+        };
+
+        var action_ok = true;
+        if (action.get("ok")) |ok_value| {
+            action_ok = switch (ok_value) {
+                .bool => |value| value,
+                else => false,
+            };
+        }
+        if (!action_ok) continue;
+
+        const action_name = switch (action.get("action") orelse continue) {
+            .string => |value| value,
+            else => continue,
+        };
+
+        if (std.mem.eql(u8, action_name, "screenshot")) {
+            const path = switch (action.get("path") orelse continue) {
+                .string => |value| value,
+                else => continue,
+            };
+            try appendUniqueBrowserAttachment(allocator, attachments, .photo, path);
+            continue;
+        }
+
+        if (std.mem.eql(u8, action_name, "download")) {
+            const path = switch (action.get("save_as") orelse continue) {
+                .string => |value| value,
+                else => continue,
+            };
+            try appendUniqueBrowserAttachment(allocator, attachments, .document, path);
+        }
+    }
+}
+
 fn luaZoidBrowserAutomate(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
     const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace context unavailable", .{});
@@ -1684,6 +1778,10 @@ fn luaZoidBrowserAutomate(lua_state: ?*c.lua_State) callconv(.c) c_int {
         return pushLuaErrorMessage(state, "zoid.browser.automate failed: {s}", .{@errorName(err)});
     };
     defer parsed.deinit();
+
+    collectBrowserAttachmentsFromBrowserResult(env.allocator, &env.browser_attachments, parsed.value) catch |err| {
+        return pushLuaErrorMessage(state, "zoid.browser.automate failed: {s}", .{@errorName(err)});
+    };
 
     pushLuaJsonValue(state, parsed.value, 0) catch |err| {
         return pushLuaErrorMessage(state, "zoid.browser.automate failed: {s}", .{@errorName(err)});
@@ -2044,6 +2142,7 @@ fn executeLuaFileCaptureOutputInternal(
         .stderr = try allocator.dupe(u8, "Unable to initialize Lua runtime."),
         .stdout_truncated = false,
         .stderr_truncated = false,
+        .browser_attachments = &.{},
     };
     defer c.lua_close(lua_state);
 
@@ -2088,30 +2187,31 @@ fn executeLuaFileCaptureOutputInternal(
 
     if (c.luaL_loadfilex(lua_state, c_file_path.ptr, "t") != c.LUA_OK) {
         capture.appendStderrSlice(luaErrorMessage(lua_state));
-        return finalizeCapture(allocator, &capture, .load_failed, null);
+        return finalizeCapture(allocator, allocated_tool_env, &capture, .load_failed, null);
     }
 
     if (c.lua_pcallk(lua_state, 0, c.LUA_MULTRET, 0, 0, null) != c.LUA_OK) {
         if (parseLuaExitCode(lua_state)) |exit_code| {
-            return finalizeCapture(allocator, &capture, .exited, exit_code);
+            return finalizeCapture(allocator, allocated_tool_env, &capture, .exited, exit_code);
         }
 
         const lua_error = luaErrorMessage(lua_state);
         if (parseTimeoutToken(lua_error)) |timeout_seconds| {
             var timeout_message_buffer: [96]u8 = undefined;
             capture.appendStderrSlice(formatTimeoutMessage(&timeout_message_buffer, timeout_seconds));
-            return finalizeCapture(allocator, &capture, .timed_out, null);
+            return finalizeCapture(allocator, allocated_tool_env, &capture, .timed_out, null);
         }
 
         capture.appendStderrSlice(lua_error);
-        return finalizeCapture(allocator, &capture, .runtime_failed, null);
+        return finalizeCapture(allocator, allocated_tool_env, &capture, .runtime_failed, null);
     }
 
-    return finalizeCapture(allocator, &capture, .ok, null);
+    return finalizeCapture(allocator, allocated_tool_env, &capture, .ok, null);
 }
 
 fn finalizeCapture(
     allocator: std.mem.Allocator,
+    tool_env: *ToolLuaEnvironment,
     capture: *LuaOutputCapture,
     status: CapturedExecutionStatus,
     exit_code: ?i64,
@@ -2119,6 +2219,12 @@ fn finalizeCapture(
     const stdout = try capture.stdout.toOwnedSlice(allocator);
     errdefer allocator.free(stdout);
     const stderr = try capture.stderr.toOwnedSlice(allocator);
+    errdefer allocator.free(stderr);
+    const browser_attachments = try tool_env.browser_attachments.toOwnedSlice(allocator);
+    errdefer {
+        for (browser_attachments) |*attachment| attachment.deinit(allocator);
+        if (browser_attachments.len > 0) allocator.free(browser_attachments);
+    }
 
     return .{
         .status = status,
@@ -2127,6 +2233,7 @@ fn finalizeCapture(
         .stderr = stderr,
         .stdout_truncated = capture.stdout_truncated,
         .stderr_truncated = capture.stderr_truncated,
+        .browser_attachments = browser_attachments,
     };
 }
 
@@ -2145,6 +2252,47 @@ pub fn executeLuaFileCaptureOutputToolWithArgs(
     script_args: []const []const u8,
 ) CaptureError!CapturedExecution {
     return executeLuaFileCaptureOutputInternal(allocator, file_path, sandbox, script_args);
+}
+
+test "collectBrowserAttachmentsFromBrowserResult captures screenshot and download paths" {
+    const json =
+        \\{"ok":true,"actions":[{"action":"screenshot","ok":true,"path":"/shots/one.png"},{"action":"download","ok":true,"save_as":"/downloads/report.pdf"},{"action":"screenshot","ok":true,"path":"/shots/one.png"}]}
+    ;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+
+    var attachments = std.ArrayList(BrowserAttachment).empty;
+    defer {
+        for (attachments.items) |*attachment| attachment.deinit(std.testing.allocator);
+        attachments.deinit(std.testing.allocator);
+    }
+
+    try collectBrowserAttachmentsFromBrowserResult(std.testing.allocator, &attachments, parsed.value);
+
+    try std.testing.expectEqual(@as(usize, 2), attachments.items.len);
+    try std.testing.expectEqual(BrowserAttachmentKind.photo, attachments.items[0].kind);
+    try std.testing.expectEqualStrings("/shots/one.png", attachments.items[0].path);
+    try std.testing.expectEqual(BrowserAttachmentKind.document, attachments.items[1].kind);
+    try std.testing.expectEqualStrings("/downloads/report.pdf", attachments.items[1].path);
+}
+
+test "collectBrowserAttachmentsFromBrowserResult ignores failed actions" {
+    const json =
+        \\{"ok":true,"actions":[{"action":"screenshot","ok":false,"path":"/shots/fail.png"},{"action":"download","ok":false,"save_as":"/downloads/fail.pdf"}]}
+    ;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+
+    var attachments = std.ArrayList(BrowserAttachment).empty;
+    defer {
+        for (attachments.items) |*attachment| attachment.deinit(std.testing.allocator);
+        attachments.deinit(std.testing.allocator);
+    }
+
+    try collectBrowserAttachmentsFromBrowserResult(std.testing.allocator, &attachments, parsed.value);
+    try std.testing.expectEqual(@as(usize, 0), attachments.items.len);
 }
 
 test "executeLuaFileCaptureOutputTool runs a valid script" {

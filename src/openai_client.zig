@@ -314,7 +314,9 @@ fn collectOutboundAttachmentsFromToolResult(
     tool_name: []const u8,
     tool_result_json: []const u8,
 ) !void {
-    if (!std.mem.eql(u8, tool_name, "browser_automate")) return;
+    const is_browser_tool = std.mem.eql(u8, tool_name, "browser_automate");
+    const is_lua_tool = std.mem.eql(u8, tool_name, "lua_execute");
+    if (!is_browser_tool and !is_lua_tool) return;
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, tool_result_json, .{}) catch {
         return;
@@ -326,7 +328,23 @@ fn collectOutboundAttachmentsFromToolResult(
         else => return,
     };
 
-    const actions_value = root.get("actions") orelse return;
+    if (is_browser_tool) {
+        const actions_value = root.get("actions") orelse return;
+        try collectOutboundAttachmentsFromBrowserActions(allocator, attachments, actions_value);
+        return;
+    }
+
+    if (is_lua_tool) {
+        const lua_attachments_value = root.get("attachments") orelse return;
+        try collectOutboundAttachmentsFromLuaExecution(allocator, attachments, lua_attachments_value);
+    }
+}
+
+fn collectOutboundAttachmentsFromBrowserActions(
+    allocator: std.mem.Allocator,
+    attachments: *std.ArrayList(OutboundAttachment),
+    actions_value: std.json.Value,
+) !void {
     const actions = switch (actions_value) {
         .array => |array| array,
         else => return,
@@ -368,6 +386,40 @@ fn collectOutboundAttachmentsFromToolResult(
             };
             try appendUniqueOutboundAttachment(allocator, attachments, .document, path);
         }
+    }
+}
+
+fn collectOutboundAttachmentsFromLuaExecution(
+    allocator: std.mem.Allocator,
+    attachments: *std.ArrayList(OutboundAttachment),
+    lua_attachments_value: std.json.Value,
+) !void {
+    const lua_attachments = switch (lua_attachments_value) {
+        .array => |array| array,
+        else => return,
+    };
+
+    for (lua_attachments.items) |attachment_value| {
+        const attachment = switch (attachment_value) {
+            .object => |object| object,
+            else => continue,
+        };
+
+        const kind = switch (attachment.get("kind") orelse continue) {
+            .string => |value| blk: {
+                if (std.mem.eql(u8, value, "photo")) break :blk OutboundAttachmentKind.photo;
+                if (std.mem.eql(u8, value, "document")) break :blk OutboundAttachmentKind.document;
+                continue;
+            },
+            else => continue,
+        };
+
+        const path = switch (attachment.get("path") orelse continue) {
+            .string => |value| value,
+            else => continue,
+        };
+
+        try appendUniqueOutboundAttachment(allocator, attachments, kind, path);
     }
 }
 
@@ -599,7 +651,7 @@ fn buildSystemInstruction(
 ) ![]u8 {
     const telegram_media_instruction =
         if (request_chat_id != null)
-            "\n\nTelegram media delivery note:\nWhen browser_automate produces screenshot/download files, the host service delivers them to Telegram automatically. Do not read those files for base64 transport and do not claim missing delivery unless the tool call itself failed."
+            "\n\nTelegram media delivery note:\nWhen browser_automate (including via lua_execute through zoid.browser.automate) produces screenshot/download files, the host service delivers them to Telegram automatically. Do not read those files for base64 transport and do not claim missing delivery unless the tool call itself failed."
         else
             "";
 
@@ -1294,6 +1346,27 @@ test "collectOutboundAttachmentsFromToolResult ignores failed actions" {
     );
 
     try std.testing.expectEqual(@as(usize, 0), attachments.items.len);
+}
+
+test "collectOutboundAttachmentsFromToolResult captures lua execute browser attachments" {
+    var attachments = std.ArrayList(OutboundAttachment).empty;
+    defer {
+        for (attachments.items) |*attachment| attachment.deinit(std.testing.allocator);
+        attachments.deinit(std.testing.allocator);
+    }
+
+    try collectOutboundAttachmentsFromToolResult(
+        std.testing.allocator,
+        &attachments,
+        "lua_execute",
+        "{\"ok\":true,\"tool\":\"lua_execute\",\"attachments\":[{\"kind\":\"photo\",\"path\":\"/shots/lua.png\"},{\"kind\":\"document\",\"path\":\"/downloads/lua.pdf\"},{\"kind\":\"photo\",\"path\":\"/shots/lua.png\"}]}",
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), attachments.items.len);
+    try std.testing.expectEqual(OutboundAttachmentKind.photo, attachments.items[0].kind);
+    try std.testing.expectEqualStrings("/shots/lua.png", attachments.items[0].path);
+    try std.testing.expectEqual(OutboundAttachmentKind.document, attachments.items[1].kind);
+    try std.testing.expectEqualStrings("/downloads/lua.pdf", attachments.items[1].path);
 }
 
 test "parseAssistantTurn extracts tool calls" {

@@ -236,6 +236,8 @@ The output APIs are replaced to capture script output safely:
 
 Captured streams are returned in tool JSON fields (`stdout`, `stderr`) instead of writing directly to terminal stdout/stderr. Tool-mode results also include `exit_code` (`null` unless the script called `zoid.exit`).
 
+When `zoid.browser.automate(...)` produces screenshot/download files in tool mode, `lua_execute` tool JSON also includes `attachments` metadata (`[{ kind, path }, ...]`) so host integrations (for example Telegram service mode) can deliver generated media automatically.
+
 ### Execution Timeout
 
 Sandboxed Lua execution has a runtime timeout:
@@ -319,6 +321,7 @@ Method-specific behavior:
 - Screenshot/download/upload paths are restricted to workspace paths
 - `session_id` format validation matches tool behavior
 - On driver-level execution failures, returns structured payload with `ok = false` (same as tool behavior)
+- In tool mode, screenshot/download action outputs are surfaced in `lua_execute` attachment metadata for host-side auto-delivery
 
 Browser extraction result contract:
 

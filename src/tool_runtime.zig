@@ -651,6 +651,16 @@ fn executeLuaExecute(
     try writer.writeAll(if (execution.stdout_truncated) "true" else "false");
     try writer.writeAll(",\"stderr_truncated\":");
     try writer.writeAll(if (execution.stderr_truncated) "true" else "false");
+    try writer.writeAll(",\"attachments\":[");
+    for (execution.browser_attachments, 0..) |attachment, index| {
+        if (index != 0) try writer.writeAll(",");
+        try writer.writeAll("{\"kind\":");
+        try writeJsonString(allocator, writer, luaBrowserAttachmentKindToString(attachment.kind));
+        try writer.writeAll(",\"path\":");
+        try writeJsonString(allocator, writer, attachment.path);
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("]");
     try writer.writeAll(",\"exit_code\":");
     if (execution.exit_code) |exit_code| {
         try writer.print("{d}", .{exit_code});
@@ -1143,6 +1153,13 @@ fn writeJsonString(allocator: std.mem.Allocator, writer: *std.Io.Writer, value: 
     const escaped = try std.json.Stringify.valueAlloc(allocator, value, .{});
     defer allocator.free(escaped);
     try writer.writeAll(escaped);
+}
+
+fn luaBrowserAttachmentKindToString(kind: lua_runner.BrowserAttachmentKind) []const u8 {
+    return switch (kind) {
+        .photo => "photo",
+        .document => "document",
+    };
 }
 
 fn writeWorkspacePathJson(
@@ -1749,6 +1766,7 @@ test "lua execute runs script inside workspace root" {
     try std.testing.expectEqualStrings("", root_object.get("stderr").?.string);
     try std.testing.expect(!root_object.get("stdout_truncated").?.bool);
     try std.testing.expect(!root_object.get("stderr_truncated").?.bool);
+    try std.testing.expectEqual(@as(usize, 0), root_object.get("attachments").?.array.items.len);
     try std.testing.expect(root_object.get("error") == null);
 }
 
