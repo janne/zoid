@@ -77,6 +77,8 @@ Notes:
 - Browser support is installed under app-data (`.../zoid/browser`).
 - Installation is distro-agnostic and does not use `apt`/`pacman`, but requires a JS runner (`npx`, `bunx`, `pnpm`, or `yarn`).
 - `zoid browser doctor` exits non-zero when the setup is incomplete.
+- Once installed, the agent tool `browser_automate` can drive dynamic sites with multi-step actions (navigate, click, fill/type, submit, wait, and extract content).
+- `browser_automate` also supports persistent sessions (`session_id`) plus `screenshot`, `download`, and `upload` actions with workspace path restrictions.
 
 # Setup on Linux host
 

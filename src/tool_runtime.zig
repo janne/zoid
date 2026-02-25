@@ -1,4 +1,6 @@
 const std = @import("std");
+const browser_automation = @import("browser_automation.zig");
+const browser_runtime = @import("browser_runtime.zig");
 const config_runtime = @import("config_runtime.zig");
 const http_client = @import("http_client.zig");
 const lua_runner = @import("lua_runner.zig");
@@ -26,6 +28,7 @@ pub const enabled_tools = [_][]const u8{
     "http_put",
     "http_delete",
     "datetime_now",
+    "browser_automate",
 };
 pub const disabled_tools = [_][]const u8{};
 pub const default_max_read_bytes: usize = 128 * 1024;
@@ -35,11 +38,14 @@ pub const max_allowed_grep_matches: usize = workspace_fs.max_allowed_grep_matche
 pub const max_allowed_http_response_bytes: usize = 1024 * 1024;
 pub const default_lua_timeout_seconds: u32 = lua_runner.default_tool_execution_timeout_seconds;
 pub const max_allowed_lua_timeout_seconds: u32 = lua_runner.max_tool_execution_timeout_seconds;
+pub const default_browser_timeout_seconds: u32 = browser_automation.default_timeout_seconds;
+pub const max_allowed_browser_timeout_seconds: u32 = browser_automation.max_timeout_seconds;
 
 pub const Policy = struct {
     workspace_root: []u8,
     config_path_override: ?[]const u8 = null,
     allow_private_http_destinations: bool = false,
+    browser_app_data_dir_override: ?[]const u8 = null,
 
     pub fn initForCurrentWorkspace(allocator: std.mem.Allocator) !Policy {
         const cwd = try std.process.getCwdAlloc(allocator);
@@ -153,6 +159,9 @@ pub fn executeToolCallWithContext(
     }
     if (std.mem.eql(u8, tool_name, "datetime_now")) {
         return executeDateTimeNow(allocator, arguments_json);
+    }
+    if (std.mem.eql(u8, tool_name, "browser_automate")) {
+        return executeBrowserAutomate(allocator, policy, arguments_json);
     }
     return error.ToolDisabled;
 }
@@ -971,6 +980,55 @@ fn requireStringProperty(
     };
 }
 
+fn validateBrowserUploadPathValue(
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    path_value: std.json.Value,
+) !void {
+    switch (path_value) {
+        .string => |path_text| {
+            const resolved = try workspace_fs.resolveAllowedReadPath(
+                allocator,
+                workspace_root,
+                path_text,
+            );
+            allocator.free(resolved);
+        },
+        .array => |paths_array| {
+            if (paths_array.items.len == 0) return error.InvalidToolArguments;
+            for (paths_array.items) |entry| {
+                const path_text = switch (entry) {
+                    .string => |value| value,
+                    else => return error.InvalidToolArguments,
+                };
+                const resolved = try workspace_fs.resolveAllowedReadPath(
+                    allocator,
+                    workspace_root,
+                    path_text,
+                );
+                allocator.free(resolved);
+            }
+        },
+        else => return error.InvalidToolArguments,
+    }
+}
+
+fn isValidBrowserSessionId(value: []const u8) bool {
+    if (value.len == 0 or value.len > 64) return false;
+    for (value) |char| {
+        if ((char >= 'a' and char <= 'z') or
+            (char >= 'A' and char <= 'Z') or
+            (char >= '0' and char <= '9') or
+            char == '_' or
+            char == '-')
+        {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
 fn executeHttpGet(allocator: std.mem.Allocator, policy: *const Policy, arguments_json: []const u8) ![]u8 {
     return executeHttpRequestTool(allocator, policy, "http_get", .GET, false, arguments_json);
 }
@@ -1025,6 +1083,151 @@ fn executeDateTimeNow(allocator: std.mem.Allocator, arguments_json: []const u8) 
     try writer.writeAll("}");
 
     return output.toOwnedSlice();
+}
+
+fn executeBrowserAutomate(
+    allocator: std.mem.Allocator,
+    policy: *const Policy,
+    arguments_json: []const u8,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{});
+    defer parsed.deinit();
+
+    const root_object = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidToolArguments,
+    };
+
+    if (root_object.get("timeout_seconds")) |timeout_value| {
+        const timeout_seconds = switch (timeout_value) {
+            .integer => |value| blk: {
+                if (value <= 0) return error.InvalidToolArguments;
+                const converted = std.math.cast(u32, value) orelse return error.InvalidToolArguments;
+                break :blk converted;
+            },
+            else => return error.InvalidToolArguments,
+        };
+        if (timeout_seconds > max_allowed_browser_timeout_seconds) return error.InvalidToolArguments;
+    }
+
+    if (root_object.get("session_id")) |session_id_value| {
+        const session_id = switch (session_id_value) {
+            .string => |value| value,
+            else => return error.InvalidToolArguments,
+        };
+        if (!isValidBrowserSessionId(session_id)) return error.InvalidToolArguments;
+    }
+    if (root_object.get("session_dispose")) |dispose_value| {
+        _ = switch (dispose_value) {
+            .bool => {},
+            else => return error.InvalidToolArguments,
+        };
+    }
+
+    if (root_object.get("start_url")) |start_url_value| {
+        const start_url = switch (start_url_value) {
+            .string => |value| value,
+            else => return error.InvalidToolArguments,
+        };
+        try http_client.validateUriPolicy(allocator, start_url, policy.allow_private_http_destinations);
+    }
+
+    if (root_object.get("actions")) |actions_value| {
+        const actions_array = switch (actions_value) {
+            .array => |value| value,
+            else => return error.InvalidToolArguments,
+        };
+        for (actions_array.items) |action_value| {
+            const action_object = switch (action_value) {
+                .object => |object| object,
+                else => return error.InvalidToolArguments,
+            };
+            const action_name = switch (action_object.get("action") orelse return error.InvalidToolArguments) {
+                .string => |value| value,
+                else => return error.InvalidToolArguments,
+            };
+
+            if (std.mem.eql(u8, action_name, "goto") or
+                std.mem.eql(u8, action_name, "open") or
+                std.mem.eql(u8, action_name, "download"))
+            {
+                const uri = switch (action_object.get("url") orelse return error.InvalidToolArguments) {
+                    .string => |value| value,
+                    else => return error.InvalidToolArguments,
+                };
+                try http_client.validateUriPolicy(allocator, uri, policy.allow_private_http_destinations);
+            }
+
+            if (std.mem.eql(u8, action_name, "screenshot")) {
+                if (action_object.get("path")) |path_value| {
+                    const path_text = switch (path_value) {
+                        .string => |value| value,
+                        else => return error.InvalidToolArguments,
+                    };
+                    const resolved = try workspace_fs.resolveAllowedWritePath(
+                        allocator,
+                        policy.workspace_root,
+                        path_text,
+                    );
+                    allocator.free(resolved);
+                }
+            }
+
+            if (std.mem.eql(u8, action_name, "download")) {
+                const save_as = switch (action_object.get("save_as") orelse return error.InvalidToolArguments) {
+                    .string => |value| value,
+                    else => return error.InvalidToolArguments,
+                };
+                const resolved = try workspace_fs.resolveAllowedWritePath(
+                    allocator,
+                    policy.workspace_root,
+                    save_as,
+                );
+                allocator.free(resolved);
+            }
+
+            if (std.mem.eql(u8, action_name, "upload")) {
+                var validated_any = false;
+                if (action_object.get("path")) |path_value| {
+                    validated_any = true;
+                    try validateBrowserUploadPathValue(allocator, policy.workspace_root, path_value);
+                }
+                if (action_object.get("paths")) |paths_value| {
+                    validated_any = true;
+                    try validateBrowserUploadPathValue(allocator, policy.workspace_root, paths_value);
+                }
+                if (!validated_any) return error.InvalidToolArguments;
+            }
+        }
+    }
+
+    var status = try browser_runtime.statusWithContext(allocator, .{
+        .app_data_dir_override = policy.browser_app_data_dir_override,
+    });
+    defer status.deinit(allocator);
+
+    if (!status.state_valid or !status.browser_files_present) {
+        return error.BrowserSupportNotReady;
+    }
+
+    const session_dir = try std.fs.path.join(
+        allocator,
+        &.{ status.install_root, "sessions" },
+    );
+    defer allocator.free(session_dir);
+    try std.fs.cwd().makePath(session_dir);
+
+    const output = try browser_automation.execute(
+        allocator,
+        arguments_json,
+        .{
+            .browsers_path = status.browsers_path,
+            .workspace_root = policy.workspace_root,
+            .session_dir = session_dir,
+            .allow_private_destinations = policy.allow_private_http_destinations,
+        },
+    );
+    return output;
 }
 
 fn executeHttpRequestTool(
@@ -1155,7 +1358,7 @@ test "buildPolicyJson emits required fields" {
     const root_object = parsed.value.object;
     try std.testing.expectEqualStrings("workspace-write", root_object.get("sandbox_mode").?.string);
     try std.testing.expectEqualStrings(policy.workspace_root, root_object.get("writable_roots").?.array.items[0].string);
-    try std.testing.expectEqual(@as(usize, 15), root_object.get("tools_enabled").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 16), root_object.get("tools_enabled").?.array.items.len);
 }
 
 test "datetime_now returns current timestamp and formatted values" {
@@ -2520,6 +2723,136 @@ test "http get and delete reject body argument" {
             &policy,
             "http_delete",
             "{\"uri\":\"https://example.com\",\"body\":\"unexpected\"}",
+        ),
+    );
+}
+
+test "browser_automate validates URI policy for start_url and actions" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+    policy.browser_app_data_dir_override = tmp_path;
+
+    try std.testing.expectError(
+        error.UnsupportedUriScheme,
+        executeToolCall(
+            std.testing.allocator,
+            &policy,
+            "browser_automate",
+            "{\"start_url\":\"ftp://example.com\"}",
+        ),
+    );
+
+    try std.testing.expectError(
+        error.DestinationNotAllowed,
+        executeToolCall(
+            std.testing.allocator,
+            &policy,
+            "browser_automate",
+            "{\"actions\":[{\"action\":\"goto\",\"url\":\"http://127.0.0.1:8080\"}]}",
+        ),
+    );
+}
+
+test "browser_automate reports missing browser setup" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+    policy.browser_app_data_dir_override = tmp_path;
+
+    try std.testing.expectError(
+        error.BrowserSupportNotReady,
+        executeToolCall(
+            std.testing.allocator,
+            &policy,
+            "browser_automate",
+            "{\"actions\":[{\"action\":\"wait_for_timeout\",\"ms\":1}]}",
+        ),
+    );
+}
+
+test "browser_automate validates session id format" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+    policy.browser_app_data_dir_override = tmp_path;
+
+    try std.testing.expectError(
+        error.InvalidToolArguments,
+        executeToolCall(
+            std.testing.allocator,
+            &policy,
+            "browser_automate",
+            "{\"session_id\":\"../bad\"}",
+        ),
+    );
+}
+
+test "browser_automate enforces workspace policy for screenshot and download paths" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+    policy.browser_app_data_dir_override = tmp_path;
+
+    try std.testing.expectError(
+        error.PathNotAllowed,
+        executeToolCall(
+            std.testing.allocator,
+            &policy,
+            "browser_automate",
+            "{\"actions\":[{\"action\":\"screenshot\",\"path\":\"../outside.png\"}]}",
+        ),
+    );
+
+    try std.testing.expectError(
+        error.PathNotAllowed,
+        executeToolCall(
+            std.testing.allocator,
+            &policy,
+            "browser_automate",
+            "{\"actions\":[{\"action\":\"download\",\"url\":\"https://example.com\",\"save_as\":\"../outside.bin\"}]}",
+        ),
+    );
+}
+
+test "browser_automate enforces workspace policy for upload paths" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+    policy.browser_app_data_dir_override = tmp_path;
+
+    try std.testing.expectError(
+        error.PathNotAllowed,
+        executeToolCall(
+            std.testing.allocator,
+            &policy,
+            "browser_automate",
+            "{\"actions\":[{\"action\":\"upload\",\"selector\":\"input[type=file]\",\"path\":\"../secret.txt\"}]}",
         ),
     );
 }

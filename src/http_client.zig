@@ -31,13 +31,9 @@ pub fn executeRequest(
     if (max_response_bytes == 0) return error.InvalidToolArguments;
     try validateRequestHeaders(headers);
 
+    try validateUriPolicy(allocator, uri, allow_private_destinations);
+
     const parsed_uri = try std.Uri.parse(uri);
-    if (!std.ascii.eqlIgnoreCase(parsed_uri.scheme, "http") and
-        !std.ascii.eqlIgnoreCase(parsed_uri.scheme, "https"))
-    {
-        return error.UnsupportedUriScheme;
-    }
-    try validateUriDestination(allocator, parsed_uri, allow_private_destinations);
 
     var extra_headers = std.ArrayList(std.http.Header).empty;
     defer extra_headers.deinit(allocator);
@@ -73,6 +69,22 @@ pub fn executeRequest(
         .status_code = @intFromEnum(response.status),
         .body = try allocator.dupe(u8, response_writer.buffered()),
     };
+}
+
+pub fn validateUriPolicy(
+    allocator: std.mem.Allocator,
+    uri: []const u8,
+    allow_private_destinations: bool,
+) !void {
+    if (uri.len == 0) return error.InvalidToolArguments;
+
+    const parsed_uri = try std.Uri.parse(uri);
+    if (!std.ascii.eqlIgnoreCase(parsed_uri.scheme, "http") and
+        !std.ascii.eqlIgnoreCase(parsed_uri.scheme, "https"))
+    {
+        return error.UnsupportedUriScheme;
+    }
+    try validateUriDestination(allocator, parsed_uri, allow_private_destinations);
 }
 
 fn validateUriDestination(

@@ -104,7 +104,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - Keep model catalog invariants covered by tests (`default_model` included in `fallback_models`, fallback IDs unique, fallback IDs chat-capable).
 
 ### Tool runtime changes:
-  - `src/tool_runtime.zig` enforces `workspace-write` policy rooted at current working directory and exposes `filesystem_read`, `filesystem_list`, `filesystem_grep`, `filesystem_write`, `filesystem_mkdir`, `filesystem_rmdir`, `filesystem_delete`, `lua_execute`, `config`, `jobs`, `http_get`, `http_post`, `http_put`, `http_delete`, and `datetime_now`.
+  - `src/tool_runtime.zig` enforces `workspace-write` policy rooted at current working directory and exposes `filesystem_read`, `filesystem_list`, `filesystem_grep`, `filesystem_write`, `filesystem_mkdir`, `filesystem_rmdir`, `filesystem_delete`, `lua_execute`, `config`, `jobs`, `http_get`, `http_post`, `http_put`, `http_delete`, `datetime_now`, and `browser_automate`.
   - Shared filesystem sandbox/path enforcement and metadata/listing logic lives in `src/workspace_fs.zig`; both `lua_execute` (`zoid.file(...)` / `zoid.dir(...)`) and direct filesystem tools must use this module.
   - In workspace path APIs, a leading `/` means workspace root (not filesystem root); canonical filesystem absolute paths are only accepted when already inside workspace root.
   - Shared outbound HTTP request behavior lives in `src/http_client.zig`; both `lua_execute` (`zoid.uri(...)`) and direct HTTP tools must use this module to avoid divergence.
@@ -128,6 +128,14 @@ If you change command behavior, error handling, config format, or Lua execution 
   - `zoid.dir(path):grep(pattern, [options])` uses the same workspace sandbox/path rules as filesystem tools and supports `options.recursive` (default `true`) and `options.max_matches` (default `200`, max `5000`).
   - `zoid.uri(uri)` allows only HTTP/HTTPS requests and returns a Lua table with `status`, `body`, and `ok`; response body capture is capped by tool policy (currently 1 MiB in `lua_execute`).
   - Outbound HTTP tools (`zoid.uri(...)` and direct `http_*`) must reject internal destinations by default (`localhost`, loopback, private/link-local ranges including IPv6 private/link-local blocks), and should not auto-follow redirects.
+  - `browser_automate` runs a headless Chromium automation session (Playwright) per tool call and supports multi-step page actions (navigation, click/type/fill/submit/wait/select/check, content extraction, and JS evaluation in page context).
+  - `browser_automate` currently executes Playwright via `npx` at runtime while reusing browser binaries from app-data (`PLAYWRIGHT_BROWSERS_PATH`); missing `npx` should return a browser-runtime error.
+  - In `browser_automate`, `npx -p playwright ... node -e ...` does not reliably make `require("playwright")` resolve from workspace context; JS driver bootstrap should include PATH `.bin`-based fallback module resolution for Playwright package discovery.
+  - `browser_automate` requires browser setup from `zoid browser install`; if setup artifacts are missing it should fail with a clear browser-support error.
+  - When the Playwright driver process fails before returning tool JSON, `browser_automate` should still return a structured `ok:false` tool payload with `exit_code` plus `stdout_excerpt`/`stderr_excerpt` for debugging instead of only surfacing a generic runtime error name.
+  - `browser_automate` must enforce the same outbound destination policy as HTTP tools by default (block localhost/private/link-local destinations unless policy override explicitly allows private destinations).
+  - `browser_automate` supports persistent session state via `session_id`; session files are stored under app-data browser storage and allow continuation across tool calls.
+  - `browser_automate` supports `screenshot`, `download`, and `upload` actions; local file paths must always resolve inside workspace root (same path policy as filesystem tools).
   - `zoid.uri(...):get/delete/post/put` accept optional request options with `headers` table (string->string); header names/values are validated and dangerous overrides such as `Host`/`Content-Length` are rejected.
   - `zoid.json.decode` maps JSON values to Lua tables/scalars and maps JSON `null` to the sentinel `zoid.json.null`.
   - `zoid.time([table])` and `zoid.date([format[, epoch]])` provide safe time/date helpers while global `os` remains disabled; behavior is aligned with Lua `os.time`/`os.date`, including date-table normalization in `zoid.time`.

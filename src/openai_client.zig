@@ -515,6 +515,8 @@ fn buildChatCompletionsPayloadWithTools(
     try writeHttpDeleteToolDefinition(allocator, writer);
     try writer.writeAll(",");
     try writeDateTimeNowToolDefinition(allocator, writer);
+    try writer.writeAll(",");
+    try writeBrowserAutomateToolDefinition(allocator, writer);
     try writer.writeAll("],\"tool_choice\":");
     try writeJsonString(allocator, writer, tool_choice);
     try writer.writeAll("}");
@@ -762,6 +764,45 @@ fn writeDateTimeNowToolDefinition(
     try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}}");
 }
 
+fn writeBrowserAutomateToolDefinition(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+) !void {
+    const description =
+        "Automate a real headless Chromium browser session for dynamic pages and form workflows. " ++
+        "Supports multi-step actions such as goto/open, click, type/fill, press, select_option, check/uncheck, submit, wait_for_selector, wait_for_url, wait_for_timeout, " ++
+        "extract_text, extract_html, extract_links, extract_page_text, evaluate JavaScript, screenshot, download, and upload. " ++
+        "Use session_id to persist browser state between tool calls. " ++
+        "Use this when normal HTTP fetching is insufficient due to client-side rendering.";
+
+    try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"browser_automate\",\"description\":");
+    try writeJsonString(allocator, writer, description);
+    try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{");
+    try writer.writeAll("\"session_id\":{\"type\":\"string\"},");
+    try writer.writeAll("\"session_dispose\":{\"type\":\"boolean\"},");
+    try writer.writeAll("\"start_url\":{\"type\":\"string\"},");
+    try writer.writeAll("\"timeout_seconds\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":");
+    try writer.print("{d}", .{tool_runtime.max_allowed_browser_timeout_seconds});
+    try writer.writeAll("},");
+    try writer.writeAll("\"action_timeout_ms\":{\"type\":\"integer\",\"minimum\":100,\"maximum\":600000},");
+    try writer.writeAll("\"continue_on_error\":{\"type\":\"boolean\"},");
+    try writer.writeAll("\"user_agent\":{\"type\":\"string\"},");
+    try writer.writeAll("\"max_extract_items\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":500},");
+    try writer.writeAll("\"max_text_chars\":{\"type\":\"integer\",\"minimum\":256,\"maximum\":200000},");
+    try writer.writeAll("\"max_html_chars\":{\"type\":\"integer\",\"minimum\":256,\"maximum\":400000},");
+    try writer.writeAll("\"viewport\":{\"type\":\"object\",\"properties\":{\"width\":{\"type\":\"integer\"},\"height\":{\"type\":\"integer\"}},\"additionalProperties\":false},");
+    try writer.writeAll("\"actions\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{");
+    try writer.writeAll("\"action\":{\"type\":\"string\"},\"url\":{\"type\":\"string\"},\"selector\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"},");
+    try writer.writeAll("\"key\":{\"type\":\"string\"},\"value\":{},\"arg\":{},\"script\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"},");
+    try writer.writeAll("\"type\":{\"type\":\"string\"},\"quality\":{\"type\":\"integer\"},\"full_page\":{\"type\":\"boolean\"},\"max_base64_chars\":{\"type\":\"integer\"},");
+    try writer.writeAll("\"path\":{},\"paths\":{},\"save_as\":{\"type\":\"string\"},\"method\":{\"type\":\"string\"},\"body\":{\"type\":\"string\"},\"headers\":{},");
+    try writer.writeAll("\"timeout_ms\":{\"type\":\"integer\"},\"delay_ms\":{\"type\":\"integer\"},\"wait_until\":{\"type\":\"string\"},");
+    try writer.writeAll("\"wait_for_navigation\":{\"type\":\"boolean\"},\"state\":{\"type\":\"string\"},\"match\":{\"type\":\"string\"},\"ms\":{\"type\":\"integer\"},");
+    try writer.writeAll("\"max_links\":{\"type\":\"integer\"},\"clear\":{\"type\":\"boolean\"}");
+    try writer.writeAll("},\"required\":[\"action\"],\"additionalProperties\":true}}");
+    try writer.writeAll("},\"additionalProperties\":false}}}");
+}
+
 fn buildRoleContentMessageJson(
     allocator: std.mem.Allocator,
     role: []const u8,
@@ -1002,7 +1043,7 @@ test "buildChatCompletionsPayload creates valid payload" {
     try std.testing.expectEqualStrings("general kenobi", payload_messages[1].object.get("content").?.string);
 
     const tools = root.get("tools").?.array.items;
-    try std.testing.expectEqual(@as(usize, 15), tools.len);
+    try std.testing.expectEqual(@as(usize, 16), tools.len);
     try std.testing.expectEqualStrings("filesystem_read", tools[0].object.get("function").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("filesystem_list", tools[1].object.get("function").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("filesystem_grep", tools[2].object.get("function").?.object.get("name").?.string);
@@ -1033,6 +1074,7 @@ test "buildChatCompletionsPayload creates valid payload" {
     try std.testing.expectEqualStrings("http_put", tools[12].object.get("function").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("http_delete", tools[13].object.get("function").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("datetime_now", tools[14].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("browser_automate", tools[15].object.get("function").?.object.get("name").?.string);
 }
 
 test "parseAssistantReply extracts assistant content" {
