@@ -56,8 +56,18 @@ pub fn main() !void {
                 zoid.cli.printHelp();
                 return;
             },
+            error.MissingBrowserSubcommand => {
+                std.debug.print("Missing subcommand for 'browser'.\n\n", .{});
+                zoid.cli.printHelp();
+                return;
+            },
             error.InvalidJobsArguments => {
                 std.debug.print("Invalid arguments for jobs command.\n\n", .{});
+                zoid.cli.printHelp();
+                return;
+            },
+            error.InvalidBrowserArguments => {
+                std.debug.print("Invalid arguments for browser command.\n\n", .{});
                 zoid.cli.printHelp();
                 return;
             },
@@ -68,6 +78,11 @@ pub fn main() !void {
             },
             error.UnknownJobsSubcommand => {
                 std.debug.print("Unknown jobs command: {s}\n\n", .{args[2]});
+                zoid.cli.printHelp();
+                return;
+            },
+            error.UnknownBrowserSubcommand => {
+                std.debug.print("Unknown browser command: {s}\n\n", .{args[2]});
                 zoid.cli.printHelp();
                 return;
             },
@@ -285,6 +300,55 @@ pub fn main() !void {
                         std.debug.print("Scheduled job not found: {s}\n", .{job_id});
                         std.process.exit(1);
                     }
+                },
+            }
+        },
+        .browser => |browser_cmd| {
+            switch (browser_cmd) {
+                .install => {
+                    var result = zoid.browser_runtime.install(allocator) catch |err| {
+                        reportBrowserInstallError(err);
+                        std.process.exit(1);
+                    };
+                    defer result.deinit(allocator);
+
+                    const output = try formatBrowserInstallOutput(allocator, &result);
+                    defer allocator.free(output);
+                    try std.fs.File.stdout().writeAll(output);
+                },
+                .status => {
+                    var result = zoid.browser_runtime.status(allocator) catch |err| {
+                        std.debug.print("Failed to read browser status: {s}\n", .{@errorName(err)});
+                        std.process.exit(1);
+                    };
+                    defer result.deinit(allocator);
+
+                    const output = try formatBrowserStatusOutput(allocator, &result);
+                    defer allocator.free(output);
+                    try std.fs.File.stdout().writeAll(output);
+                },
+                .doctor => {
+                    var result = zoid.browser_runtime.status(allocator) catch |err| {
+                        std.debug.print("Browser doctor failed: {s}\n", .{@errorName(err)});
+                        std.process.exit(1);
+                    };
+                    defer result.deinit(allocator);
+
+                    const output = try formatBrowserDoctorOutput(allocator, &result);
+                    defer allocator.free(output);
+                    try std.fs.File.stdout().writeAll(output);
+                    if (!result.ready()) std.process.exit(1);
+                },
+                .uninstall => {
+                    var result = zoid.browser_runtime.uninstall(allocator) catch |err| {
+                        std.debug.print("Failed to uninstall browser support: {s}\n", .{@errorName(err)});
+                        std.process.exit(1);
+                    };
+                    defer result.deinit(allocator);
+
+                    const output = try formatBrowserUninstallOutput(allocator, &result);
+                    defer allocator.free(output);
+                    try std.fs.File.stdout().writeAll(output);
                 },
             }
         },
@@ -815,6 +879,153 @@ fn sortJobsForList(_: void, a: zoid.scheduler_store.Job, b: zoid.scheduler_store
 
 fn formatCreatedJobOutput(allocator: std.mem.Allocator, job_id: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}\n", .{job_id});
+}
+
+fn formatBrowserInstallOutput(
+    allocator: std.mem.Allocator,
+    result: *const zoid.browser_runtime.InstallResult,
+) ![]u8 {
+    var output = std.ArrayList(u8).empty;
+    errdefer output.deinit(allocator);
+
+    try output.writer(allocator).print(
+        "Browser support installed using {s}.\n\n",
+        .{result.runner.name()},
+    );
+
+    const status = try formatBrowserStatusOutput(allocator, &result.status);
+    defer allocator.free(status);
+    try output.appendSlice(allocator, status);
+
+    return output.toOwnedSlice(allocator);
+}
+
+fn formatBrowserStatusOutput(
+    allocator: std.mem.Allocator,
+    status: *const zoid.browser_runtime.Status,
+) ![]u8 {
+    var output = std.ArrayList(u8).empty;
+    errdefer output.deinit(allocator);
+
+    try output.writer(allocator).print(
+        "Browser support: {s}\n",
+        .{if (status.ready()) "ready" else "not ready"},
+    );
+    try output.writer(allocator).print("Install root: {s}\n", .{status.install_root});
+    try output.writer(allocator).print("Browsers path: {s}\n", .{status.browsers_path});
+    try output.writer(allocator).print("State file: {s}\n", .{status.state_path});
+
+    if (status.runner) |runner| {
+        try output.writer(allocator).print("Detected runtime: {s}\n", .{runner.name()});
+    } else {
+        try output.appendSlice(allocator, "Detected runtime: none\n");
+    }
+
+    if (status.state_exists and status.state_valid and status.state != null) {
+        const state = status.state.?;
+        const installed_at = try formatEpochDisplay(allocator, state.installed_at_epoch);
+        defer allocator.free(installed_at);
+        try output.writer(allocator).print("Playwright version: {s}\n", .{state.playwright_version});
+        try output.writer(allocator).print("Installed browser: {s}\n", .{state.browser});
+        try output.writer(allocator).print("Installed with: {s}\n", .{state.runner});
+        try output.writer(allocator).print("Installed at: {s}\n", .{installed_at});
+    } else if (status.state_exists and !status.state_valid) {
+        try output.appendSlice(allocator, "State file: invalid\n");
+    } else {
+        try output.appendSlice(allocator, "State file: missing\n");
+    }
+
+    try output.writer(allocator).print(
+        "Browser binaries present: {s}\n",
+        .{if (status.browser_files_present) "yes" else "no"},
+    );
+
+    return output.toOwnedSlice(allocator);
+}
+
+fn formatBrowserDoctorOutput(
+    allocator: std.mem.Allocator,
+    status: *const zoid.browser_runtime.Status,
+) ![]u8 {
+    var output = std.ArrayList(u8).empty;
+    errdefer output.deinit(allocator);
+
+    try output.appendSlice(allocator, "Browser doctor\n");
+    try output.appendSlice(allocator, "=============\n");
+
+    if (status.runner != null) {
+        try output.appendSlice(allocator, "[ok] JS runtime found\n");
+    } else {
+        try output.appendSlice(allocator, "[fail] No JS runtime found (npx/bunx/pnpm/yarn)\n");
+    }
+
+    if (!status.state_exists) {
+        try output.appendSlice(allocator, "[fail] Browser state file missing\n");
+    } else if (!status.state_valid) {
+        try output.appendSlice(allocator, "[fail] Browser state file is invalid\n");
+    } else {
+        try output.appendSlice(allocator, "[ok] Browser state file is valid\n");
+    }
+
+    if (status.browser_files_present) {
+        try output.appendSlice(allocator, "[ok] Chromium artifacts found\n");
+    } else {
+        try output.appendSlice(allocator, "[fail] Chromium artifacts missing\n");
+    }
+
+    if (status.state) |state| {
+        if (!std.mem.eql(u8, state.playwright_version, zoid.browser_runtime.playwright_version)) {
+            try output.writer(allocator).print(
+                "[warn] Installed Playwright version is {s}; expected {s}\n",
+                .{ state.playwright_version, zoid.browser_runtime.playwright_version },
+            );
+        } else {
+            try output.appendSlice(allocator, "[ok] Playwright version matches expected pin\n");
+        }
+    }
+
+    try output.appendSlice(allocator, "\n");
+    if (status.ready()) {
+        try output.appendSlice(allocator, "Result: ready\n");
+    } else {
+        try output.appendSlice(allocator, "Result: not ready\n");
+        try output.appendSlice(allocator, "Action: run `zoid browser install`\n");
+    }
+
+    return output.toOwnedSlice(allocator);
+}
+
+fn formatBrowserUninstallOutput(
+    allocator: std.mem.Allocator,
+    result: *const zoid.browser_runtime.UninstallResult,
+) ![]u8 {
+    if (!result.removed) {
+        return std.fmt.allocPrint(
+            allocator,
+            "Browser support was not installed. Install root: {s}\n",
+            .{result.install_root},
+        );
+    }
+
+    return std.fmt.allocPrint(
+        allocator,
+        "Browser support removed from {s}\n",
+        .{result.install_root},
+    );
+}
+
+fn reportBrowserInstallError(err: anyerror) void {
+    switch (err) {
+        error.BrowserRuntimeNotFound => std.debug.print(
+            "No supported JavaScript runtime found. Install one of: npx (Node.js), bunx, pnpm, or yarn.\n",
+            .{},
+        ),
+        error.BrowserInstallFailed => std.debug.print(
+            "Playwright Chromium installation failed. Check network access and runtime setup, then retry `zoid browser install`.\n",
+            .{},
+        ),
+        else => std.debug.print("Browser install failed: {s}\n", .{@errorName(err)}),
+    }
 }
 
 fn reportScheduleError(err: anyerror) void {

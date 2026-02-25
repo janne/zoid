@@ -62,6 +62,22 @@ Telegram routing for scheduled output:
 - The DM id is updated automatically when `zoid serve` receives a private Telegram message.
 - If no DM id is available at run time, the scheduled reply is ignored.
 
+## Optional browser support
+
+When you need client-rendered pages (for example travel sites), install optional headless browser support:
+
+```sh
+zoid browser install
+zoid browser status
+zoid browser doctor
+zoid browser uninstall
+```
+
+Notes:
+- Browser support is installed under app-data (`.../zoid/browser`).
+- Installation is distro-agnostic and does not use `apt`/`pacman`, but requires a JS runner (`npx`, `bunx`, `pnpm`, or `yarn`).
+- `zoid browser doctor` exits non-zero when the setup is incomplete.
+
 # Setup on Linux host
 
 ## Install zig

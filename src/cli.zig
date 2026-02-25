@@ -29,6 +29,13 @@ pub const InitCommand = struct {
     force: bool,
 };
 
+pub const BrowserCommand = union(enum) {
+    install,
+    status,
+    uninstall,
+    doctor,
+};
+
 pub const Command = union(enum) {
     help,
     init: InitCommand,
@@ -42,6 +49,7 @@ pub const Command = union(enum) {
     serve,
     config: ConfigCommand,
     jobs: JobsCommand,
+    browser: BrowserCommand,
 };
 
 pub const ParseCommandError = error{
@@ -54,9 +62,12 @@ pub const ParseCommandError = error{
     MissingConfigValue,
     MissingJobsSubcommand,
     MissingJobsArgument,
+    MissingBrowserSubcommand,
     InvalidJobsArguments,
+    InvalidBrowserArguments,
     UnknownConfigSubcommand,
     UnknownJobsSubcommand,
+    UnknownBrowserSubcommand,
     UnknownCommand,
 };
 
@@ -139,6 +150,11 @@ pub fn parseCommand(args: []const []const u8) ParseCommandError!Command {
     if (std.mem.eql(u8, cmd, "jobs")) {
         if (args.len < 3) return error.MissingJobsSubcommand;
         return .{ .jobs = try parseJobsCommand(args[2..]) };
+    }
+
+    if (std.mem.eql(u8, cmd, "browser")) {
+        if (args.len < 3) return error.MissingBrowserSubcommand;
+        return .{ .browser = try parseBrowserCommand(args[2..]) };
     }
 
     return error.UnknownCommand;
@@ -242,6 +258,32 @@ fn parseJobsCreate(args: []const []const u8) ParseCommandError!JobsCreateCommand
     };
 }
 
+fn parseBrowserCommand(args: []const []const u8) ParseCommandError!BrowserCommand {
+    const subcmd = args[0];
+
+    if (std.mem.eql(u8, subcmd, "install")) {
+        if (args.len != 1) return error.InvalidBrowserArguments;
+        return .install;
+    }
+
+    if (std.mem.eql(u8, subcmd, "status")) {
+        if (args.len != 1) return error.InvalidBrowserArguments;
+        return .status;
+    }
+
+    if (std.mem.eql(u8, subcmd, "uninstall")) {
+        if (args.len != 1) return error.InvalidBrowserArguments;
+        return .uninstall;
+    }
+
+    if (std.mem.eql(u8, subcmd, "doctor")) {
+        if (args.len != 1) return error.InvalidBrowserArguments;
+        return .doctor;
+    }
+
+    return error.UnknownBrowserSubcommand;
+}
+
 pub fn printHelp() void {
     std.debug.print(
         \\zoid help
@@ -288,6 +330,18 @@ pub fn printHelp() void {
         \\
         \\zoid config list
         \\  Lists all config keys.
+        \\
+        \\zoid browser install
+        \\  Installs optional Playwright Chromium support into app-data.
+        \\
+        \\zoid browser status
+        \\  Shows browser support status and detected JS runtime.
+        \\
+        \\zoid browser doctor
+        \\  Runs browser support diagnostics and reports missing pieces.
+        \\
+        \\zoid browser uninstall
+        \\  Removes browser support files from app-data.
     , .{});
 }
 
@@ -439,4 +493,39 @@ test "jobs rejects deprecated run-at flag" {
 test "jobs rejects multiple paths" {
     const args = [_][]const u8{ "zoid", "jobs", "create", "task.lua", "note.lua", "--cron", "0 * * * *" };
     try std.testing.expectError(error.InvalidJobsArguments, parseCommand(&args));
+}
+
+test "browser install parses" {
+    const args = [_][]const u8{ "zoid", "browser", "install" };
+    const command = try parseCommand(&args);
+
+    switch (command) {
+        .browser => |browser_cmd| try std.testing.expect(browser_cmd == .install),
+        else => return error.UnexpectedCommand,
+    }
+}
+
+test "browser status parses" {
+    const args = [_][]const u8{ "zoid", "browser", "status" };
+    const command = try parseCommand(&args);
+
+    switch (command) {
+        .browser => |browser_cmd| try std.testing.expect(browser_cmd == .status),
+        else => return error.UnexpectedCommand,
+    }
+}
+
+test "browser requires subcommand" {
+    const args = [_][]const u8{ "zoid", "browser" };
+    try std.testing.expectError(error.MissingBrowserSubcommand, parseCommand(&args));
+}
+
+test "browser rejects unknown subcommand" {
+    const args = [_][]const u8{ "zoid", "browser", "nope" };
+    try std.testing.expectError(error.UnknownBrowserSubcommand, parseCommand(&args));
+}
+
+test "browser rejects extra arguments" {
+    const args = [_][]const u8{ "zoid", "browser", "install", "extra" };
+    try std.testing.expectError(error.InvalidBrowserArguments, parseCommand(&args));
 }

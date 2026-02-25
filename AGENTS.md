@@ -49,6 +49,10 @@ If you change command behavior, error handling, config format, or Lua execution 
   - `zoid init [<path>] [--force]` copies embedded template files from `workspace/` into `<path>` (default current directory), fails on any existing target file unless `--force` is provided.
   - `zoid init` template payload is generated recursively from all files under `workspace/` at build time; adding/removing files under `workspace/` requires rebuild but no code changes.
   - Jobs CLI commands live under `zoid jobs ...` with create/list/delete/pause/resume.
+  - Browser setup CLI commands live under `zoid browser ...` with install/status/doctor/uninstall.
+  - `zoid browser install` is distro-agnostic: it does not call OS package managers (`apt`, `pacman`, etc.); it requires an available JS runner (`npx`, `bunx`, `pnpm dlx`, or `yarn dlx`) and installs pinned Playwright Chromium artifacts in app-data.
+  - Browser setup artifacts live under app-data (`getAppDataDir("zoid")/browser`) with Playwright browser binaries in `ms-playwright` and setup state metadata in `state.json`.
+  - `zoid browser doctor` exits non-zero when browser support is not ready and should report missing runtime/state/artifact checks.
   - `zoid jobs create` takes a single path argument and requires a `.lua` extension.
   - `zoid jobs create` accepts exactly one schedule input: `--at <datetime-expression>` or `--cron "<min hour dom mon dow>"`.
   - `--at` is parsed via timelib and accepts natural-language date/time text.

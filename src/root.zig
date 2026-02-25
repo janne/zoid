@@ -1,4 +1,5 @@
 pub const cli = @import("cli.zig");
+pub const browser_runtime = @import("browser_runtime.zig");
 pub const chat_session = @import("chat_session.zig");
 pub const cron_adapter = @import("cron_adapter.zig");
 pub const config_keys = @import("config_keys.zig");
