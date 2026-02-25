@@ -772,6 +772,7 @@ fn writeBrowserAutomateToolDefinition(
         "Automate a real headless Chromium browser session for dynamic pages and form workflows. " ++
         "Supports multi-step actions such as goto/open, click, type/fill, press, select_option, check/uncheck, submit, wait_for_selector, wait_for_url, wait_for_timeout, " ++
         "extract_text, extract_html, extract_links, extract_page_text, evaluate JavaScript, screenshot, download, and upload. " ++
+        "Screenshot actions require a workspace file path and save the image to that path. " ++
         "Use session_id to persist browser state between tool calls. " ++
         "Use this when normal HTTP fetching is insufficient due to client-side rendering.";
 
@@ -794,8 +795,8 @@ fn writeBrowserAutomateToolDefinition(
     try writer.writeAll("\"actions\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{");
     try writer.writeAll("\"action\":{\"type\":\"string\"},\"url\":{\"type\":\"string\"},\"selector\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"},");
     try writer.writeAll("\"key\":{\"type\":\"string\"},\"value\":{},\"arg\":{},\"script\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"},");
-    try writer.writeAll("\"type\":{\"type\":\"string\"},\"quality\":{\"type\":\"integer\"},\"full_page\":{\"type\":\"boolean\"},\"max_base64_chars\":{\"type\":\"integer\"},");
-    try writer.writeAll("\"path\":{},\"paths\":{},\"save_as\":{\"type\":\"string\"},\"method\":{\"type\":\"string\"},\"body\":{\"type\":\"string\"},\"headers\":{},");
+    try writer.writeAll("\"type\":{\"type\":\"string\"},\"quality\":{\"type\":\"integer\"},\"full_page\":{\"type\":\"boolean\"},");
+    try writer.writeAll("\"path\":{\"type\":\"string\"},\"paths\":{},\"save_as\":{\"type\":\"string\"},\"method\":{\"type\":\"string\"},\"body\":{\"type\":\"string\"},\"headers\":{},");
     try writer.writeAll("\"timeout_ms\":{\"type\":\"integer\"},\"delay_ms\":{\"type\":\"integer\"},\"wait_until\":{\"type\":\"string\"},");
     try writer.writeAll("\"wait_for_navigation\":{\"type\":\"boolean\"},\"state\":{\"type\":\"string\"},\"match\":{\"type\":\"string\"},\"ms\":{\"type\":\"integer\"},");
     try writer.writeAll("\"max_links\":{\"type\":\"integer\"},\"clear\":{\"type\":\"boolean\"}");

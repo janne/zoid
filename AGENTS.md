@@ -137,6 +137,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - `browser_automate` must enforce the same outbound destination policy as HTTP tools by default (block localhost/private/link-local destinations unless policy override explicitly allows private destinations).
   - `browser_automate` supports persistent session state via `session_id`; session files are stored under app-data browser storage and allow continuation across tool calls.
   - `browser_automate` supports `screenshot`, `download`, and `upload` actions; local file paths must always resolve inside workspace root (same path policy as filesystem tools).
+  - `browser_automate` `screenshot` actions require `path` and save images to workspace files.
   - Browser automation results use `extracts` as an array of objects (not a map): `extract_page_text` yields `{ kind: "page_text", value }`, `extract_links` yields `{ kind: "links", items = [{ href, text }, ...] }`, and there is no `results` field.
   - `zoid.uri(...):get/delete/post/put` accept optional request options with `headers` table (string->string); header names/values are validated and dangerous overrides such as `Host`/`Content-Length` are rejected.
   - `zoid.json.decode` maps JSON values to Lua tables/scalars and maps JSON `null` to the sentinel `zoid.json.null`.

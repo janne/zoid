@@ -2632,6 +2632,16 @@ test "browser_automate enforces workspace policy for screenshot and download pat
     policy.browser_app_data_dir_override = tmp_path;
 
     try std.testing.expectError(
+        error.InvalidToolArguments,
+        executeToolCall(
+            std.testing.allocator,
+            &policy,
+            "browser_automate",
+            "{\"actions\":[{\"action\":\"screenshot\"}]}",
+        ),
+    );
+
+    try std.testing.expectError(
         error.PathNotAllowed,
         executeToolCall(
             std.testing.allocator,

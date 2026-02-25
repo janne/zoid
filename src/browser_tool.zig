@@ -87,18 +87,17 @@ pub fn execute(
             }
 
             if (std.mem.eql(u8, action_name, "screenshot")) {
-                if (action_object.get("path")) |path_value| {
-                    const path_text = switch (path_value) {
-                        .string => |value| value,
-                        else => return error.InvalidToolArguments,
-                    };
-                    const resolved = try workspace_fs.resolveAllowedWritePath(
-                        allocator,
-                        policy.workspace_root,
-                        path_text,
-                    );
-                    allocator.free(resolved);
-                }
+                const path_text = switch (action_object.get("path") orelse return error.InvalidToolArguments) {
+                    .string => |value| value,
+                    else => return error.InvalidToolArguments,
+                };
+                if (path_text.len == 0) return error.InvalidToolArguments;
+                const resolved = try workspace_fs.resolveAllowedWritePath(
+                    allocator,
+                    policy.workspace_root,
+                    path_text,
+                );
+                allocator.free(resolved);
             }
 
             if (std.mem.eql(u8, action_name, "download")) {

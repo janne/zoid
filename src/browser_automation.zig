@@ -751,32 +751,12 @@ const js_driver_source =
     \\          screenshotOptions.fullPage = undefined;
     \\        }
     \\
-    \\        const destinationPath = typeof action.path === "string" && action.path.length > 0
-    \\          ? resolveWorkspacePath(action.path, rootPath)
-    \\          : null;
-    \\
-    \\        if (destinationPath) {
-    \\          await fs.mkdir(path.dirname(destinationPath), { recursive: true });
-    \\          await target.screenshot({ ...screenshotOptions, path: destinationPath });
-    \\          const stat = await fs.stat(destinationPath);
-    \\          actionRecord.path = toWorkspacePath(destinationPath, rootPath);
-    \\          actionRecord.bytes = stat.size;
-    \\        } else {
-    \\          const buffer = await target.screenshot(screenshotOptions);
-    \\          const base64 = Buffer.from(buffer).toString("base64");
-    \\          const maxBase64Chars = asInt(action.max_base64_chars, 200000, 1024, 500000);
-    \\          const truncated = base64.length > maxBase64Chars;
-    \\          const value = truncated ? base64.slice(0, maxBase64Chars) : base64;
-    \\          result.extracts.push({
-    \\            kind: "screenshot_base64",
-    \\            name: typeof action.name === "string" ? action.name : "screenshot",
-    \\            mime: imageType === "jpeg" ? "image/jpeg" : "image/png",
-    \\            value,
-    \\            truncated,
-    \\          });
-    \\          actionRecord.chars = value.length;
-    \\          actionRecord.truncated = truncated;
-    \\        }
+    \\        const destinationPath = resolveWorkspacePath(requireString(action, "path"), rootPath);
+    \\        await fs.mkdir(path.dirname(destinationPath), { recursive: true });
+    \\        await target.screenshot({ ...screenshotOptions, path: destinationPath });
+    \\        const stat = await fs.stat(destinationPath);
+    \\        actionRecord.path = toWorkspacePath(destinationPath, rootPath);
+    \\        actionRecord.bytes = stat.size;
     \\        if (selector && target && typeof target.dispose === "function") {
     \\          await target.dispose();
     \\        }

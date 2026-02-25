@@ -328,7 +328,7 @@ Browser extraction result contract:
 - `extract_links` emits `{ kind = "links", name, selector, items = { { href, text }, ... } }`
 - `extract_page_text` emits `{ kind = "page_text", name, value }`
 - `evaluate` emits `{ kind = "evaluate", name, value }`
-- `screenshot` without `path` emits `{ kind = "screenshot_base64", name, mime, value, truncated }`
+- `screenshot` writes an image file to the required workspace `path`; action metadata includes the saved `path` and `bytes`
 
 Supported browser `actions` (complete list):
 
@@ -380,8 +380,9 @@ Supported browser `actions` (complete list):
   - Required: `script`
   - Optional: `arg`, `name`, `timeout_ms`
 - `screenshot`
-  - Optional: `selector`, `type` (`png` default or `jpeg`), `quality` (jpeg), `full_page`, `path`, `name`, `max_base64_chars`, `timeout_ms`
-  - Behavior: with `path`, writes file in workspace; without `path`, adds base64 image data to extracts
+  - Required: `path`
+  - Optional: `selector`, `type` (`png` default or `jpeg`), `quality` (jpeg), `full_page`, `timeout_ms`
+  - Behavior: writes file in workspace
 - `download`
   - Required: `url`, `save_as`
   - Optional: `method` (`GET` default, `POST`, `PUT`, `DELETE`), `body`, `headers`, `timeout_ms`
