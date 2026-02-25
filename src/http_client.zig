@@ -5,11 +5,18 @@ pub const RequestHeader = struct {
     value: []const u8,
 };
 
+pub const ResponseHeader = struct {
+    name: []u8,
+    value: []u8,
+};
+
 pub const Response = struct {
     status_code: u16,
+    headers: []ResponseHeader,
     body: []u8,
 
     pub fn deinit(self: *Response, allocator: std.mem.Allocator) void {
+        deinitResponseHeaders(allocator, self.headers);
         allocator.free(self.body);
         self.* = undefined;
     }
@@ -45,30 +52,145 @@ pub fn executeRequest(
         });
     }
 
-    const response_storage = try allocator.alloc(u8, max_response_bytes);
-    defer allocator.free(response_storage);
-
-    var response_writer = std.Io.Writer.fixed(response_storage);
-
     var client: std.http.Client = .{ .allocator = allocator };
     defer client.deinit();
 
-    const response = client.fetch(.{
-        .location = .{ .uri = parsed_uri },
-        .method = method,
-        .payload = payload,
-        .extra_headers = extra_headers.items,
+    var request = try client.request(method, parsed_uri, .{
         .redirect_behavior = .unhandled,
-        .response_writer = &response_writer,
-    }) catch |err| switch (err) {
+        .extra_headers = extra_headers.items,
+    });
+    defer request.deinit();
+
+    if (payload) |request_payload| {
+        request.transfer_encoding = .{ .content_length = request_payload.len };
+        var request_body = try request.sendBodyUnflushed(&.{});
+        try request_body.writer.writeAll(request_payload);
+        try request_body.end();
+        try request.connection.?.flush();
+    } else {
+        try request.sendBodiless();
+    }
+
+    var redirect_buffer: [8 * 1024]u8 = undefined;
+    var response = try request.receiveHead(&redirect_buffer);
+
+    var response_headers = std.ArrayList(ResponseHeader).empty;
+    defer response_headers.deinit(allocator);
+    errdefer {
+        deinitResponseHeaderFields(allocator, response_headers.items);
+    }
+
+    var header_it = response.head.iterateHeaders();
+    while (header_it.next()) |header| {
+        const header_name = try allocLowerHeaderName(allocator, header.name);
+        errdefer allocator.free(header_name);
+
+        const header_value = try allocator.dupe(u8, header.value);
+        errdefer allocator.free(header_value);
+
+        try response_headers.append(allocator, .{
+            .name = header_name,
+            .value = header_value,
+        });
+    }
+
+    const owned_headers = try response_headers.toOwnedSlice(allocator);
+    errdefer deinitResponseHeaders(allocator, owned_headers);
+
+    const response_storage = try allocator.alloc(u8, max_response_bytes);
+    defer allocator.free(response_storage);
+    var response_writer = std.Io.Writer.fixed(response_storage);
+
+    const decompress_buffer: []u8 = switch (response.head.content_encoding) {
+        .identity => &.{},
+        .zstd => try allocator.alloc(u8, std.compress.zstd.default_window_len),
+        .deflate, .gzip => try allocator.alloc(u8, std.compress.flate.max_window_len),
+        .compress => return error.UnsupportedCompressionMethod,
+    };
+    defer if (response.head.content_encoding != .identity) allocator.free(decompress_buffer);
+
+    var transfer_buffer: [64]u8 = undefined;
+    var decompress: std.http.Decompress = undefined;
+    const response_reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+    _ = response_reader.streamRemaining(&response_writer) catch |err| switch (err) {
+        error.ReadFailed => return response.bodyErr().?,
         error.WriteFailed => return error.StreamTooLong,
-        else => |fetch_err| return fetch_err,
+        else => |read_err| return read_err,
     };
 
     return .{
-        .status_code = @intFromEnum(response.status),
+        .status_code = @intFromEnum(response.head.status),
+        .headers = owned_headers,
         .body = try allocator.dupe(u8, response_writer.buffered()),
     };
+}
+
+fn deinitResponseHeaders(allocator: std.mem.Allocator, headers: []ResponseHeader) void {
+    deinitResponseHeaderFields(allocator, headers);
+    allocator.free(headers);
+}
+
+fn deinitResponseHeaderFields(allocator: std.mem.Allocator, headers: []ResponseHeader) void {
+    for (headers) |header| {
+        allocator.free(header.name);
+        allocator.free(header.value);
+    }
+}
+
+fn allocLowerHeaderName(allocator: std.mem.Allocator, header_name: []const u8) ![]u8 {
+    const lower_name = try allocator.alloc(u8, header_name.len);
+    for (header_name, 0..) |byte, index| {
+        lower_name[index] = std.ascii.toLower(byte);
+    }
+    return lower_name;
+}
+
+test "allocLowerHeaderName lowercases ASCII bytes" {
+    const actual = try allocLowerHeaderName(std.testing.allocator, "ConTent-TYPe");
+    defer std.testing.allocator.free(actual);
+    try std.testing.expectEqualStrings("content-type", actual);
+}
+
+test "response deinit frees owned response headers" {
+    var headers = try std.testing.allocator.alloc(ResponseHeader, 1);
+    headers[0] = .{
+        .name = try std.testing.allocator.dupe(u8, "location"),
+        .value = try std.testing.allocator.dupe(u8, "https://example.com"),
+    };
+    var response = Response{
+        .status_code = 301,
+        .headers = headers,
+        .body = try std.testing.allocator.dupe(u8, ""),
+    };
+    response.deinit(std.testing.allocator);
+}
+
+test "executeRequest rejects blocked localhost destinations" {
+    try std.testing.expectError(
+        error.DestinationNotAllowed,
+        executeRequest(
+            std.testing.allocator,
+            .GET,
+            "http://localhost:8080",
+            null,
+            &.{},
+            1024,
+            false,
+        ),
+    );
+
+    try std.testing.expectError(
+        error.DestinationNotAllowed,
+        executeRequest(
+            std.testing.allocator,
+            .GET,
+            "http://127.0.0.1:8080",
+            null,
+            &.{},
+            1024,
+            false,
+        ),
+    );
 }
 
 pub fn validateUriPolicy(
@@ -263,32 +385,4 @@ test "isBlockedAddress blocks private and loopback ranges" {
 
     const ipv6_mapped_loopback = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1 };
     try std.testing.expect(isBlockedAddress(std.net.Address.initIp6(ipv6_mapped_loopback, 443, 0, 0)));
-}
-
-test "executeRequest rejects blocked localhost destinations" {
-    try std.testing.expectError(
-        error.DestinationNotAllowed,
-        executeRequest(
-            std.testing.allocator,
-            .GET,
-            "http://localhost:8080",
-            null,
-            &.{},
-            1024,
-            false,
-        ),
-    );
-
-    try std.testing.expectError(
-        error.DestinationNotAllowed,
-        executeRequest(
-            std.testing.allocator,
-            .GET,
-            "http://127.0.0.1:8080",
-            null,
-            &.{},
-            1024,
-            false,
-        ),
-    );
 }

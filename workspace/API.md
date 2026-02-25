@@ -69,6 +69,7 @@ local res = endpoint:post(
   { headers = { ["Content-Type"] = "application/json" } }
 )
 print(res.status, res.ok)
+print(res.headers["content-type"])
 print(res.body)
 ```
 
@@ -176,10 +177,10 @@ Supported methods and return values:
 - `zoid.dir(path):grep(pattern, [options]) -> { { path, line, column, text }, ... }`
   - `options.recursive` (boolean, default `true`)
   - `options.max_matches` (integer, default `200`, max `5000`)
-- `zoid.uri(uri):get([options]) -> { status: integer, body: string, ok: boolean }`
-- `zoid.uri(uri):post([body], [options]) -> { status: integer, body: string, ok: boolean }`
-- `zoid.uri(uri):put([body], [options]) -> { status: integer, body: string, ok: boolean }`
-- `zoid.uri(uri):delete([options]) -> { status: integer, body: string, ok: boolean }`
+- `zoid.uri(uri):get([options]) -> { status: integer, headers: table<string,string>, body: string, ok: boolean }`
+- `zoid.uri(uri):post([body], [options]) -> { status: integer, headers: table<string,string>, body: string, ok: boolean }`
+- `zoid.uri(uri):put([body], [options]) -> { status: integer, headers: table<string,string>, body: string, ok: boolean }`
+- `zoid.uri(uri):delete([options]) -> { status: integer, headers: table<string,string>, body: string, ok: boolean }`
 - `zoid.config():list() -> { string, ... }` (sorted config keys)
 - `zoid.config():get(key) -> string | nil`
 - `zoid.config():set(key, value) -> boolean` (`true` on success)
@@ -310,6 +311,7 @@ Method-specific behavior:
 - Blocked header names: `Host`, `Content-Length`, `Transfer-Encoding` (case-insensitive)
 - Internal destinations are blocked by default (`localhost`, loopback, private IPv4 ranges, link-local, and private IPv6 ranges)
 - Redirects are not automatically followed (3xx responses are returned directly)
+- Response headers are exposed on `result.headers` with lowercase header names (for example `result.headers["location"]`)
 - Response body size is capped by sandbox policy
 
 ### Browser Automation Rules

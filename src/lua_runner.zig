@@ -1112,6 +1112,14 @@ fn luaZoidUriRequest(
 
     c.lua_pushboolean(state, if (result.status_code >= 200 and result.status_code < 300) 1 else 0);
     c.lua_setfield(state, -2, "ok");
+
+    c.lua_newtable(state);
+    for (result.headers) |header| {
+        _ = c.lua_pushlstring(state, header.name.ptr, header.name.len);
+        _ = c.lua_pushlstring(state, header.value.ptr, header.value.len);
+        c.lua_settable(state, -3);
+    }
+    c.lua_setfield(state, -2, "headers");
     return 1;
 }
 
@@ -3004,6 +3012,7 @@ const TestHttpExpectation = struct {
     target: []const u8,
     body: []const u8,
     headers: []const TestHttpHeaderExpectation = &.{},
+    response_headers: []const TestHttpHeaderExpectation = &.{},
     status_code: u16,
     response_body: []const u8,
 };
@@ -3147,17 +3156,30 @@ fn runTestHttpServer(context: *TestHttpServerContext) void {
             }
         }
 
-        var response_header_buffer: [256]u8 = undefined;
-        const response_header = std.fmt.bufPrint(
-            &response_header_buffer,
-            "HTTP/1.1 {d} OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+        var response_header_output = std.ArrayList(u8).empty;
+        defer response_header_output.deinit(std.heap.page_allocator);
+        response_header_output.writer(std.heap.page_allocator).print(
+            "HTTP/1.1 {d} OK\r\nContent-Length: {d}\r\nConnection: close\r\n",
             .{ expected.status_code, expected.response_body.len },
         ) catch {
             context.failure = error.ResponseBuildFailed;
             return;
         };
+        for (expected.response_headers) |response_header| {
+            response_header_output.writer(std.heap.page_allocator).print(
+                "{s}: {s}\r\n",
+                .{ response_header.name, response_header.value },
+            ) catch {
+                context.failure = error.ResponseBuildFailed;
+                return;
+            };
+        }
+        response_header_output.appendSlice(std.heap.page_allocator, "\r\n") catch {
+            context.failure = error.ResponseBuildFailed;
+            return;
+        };
 
-        connection.stream.writeAll(response_header) catch |err| {
+        connection.stream.writeAll(response_header_output.items) catch |err| {
             context.failure = err;
             return;
         };
@@ -3185,6 +3207,9 @@ test "executeLuaFileCaptureOutputTool supports zoid uri get/post/put/delete" {
             .headers = &.{
                 .{ .name = "X-Req-Id", .value = "g1" },
             },
+            .response_headers = &.{
+                .{ .name = "X-Reply", .value = "rg" },
+            },
             .status_code = 200,
             .response_body = "g",
         },
@@ -3194,6 +3219,9 @@ test "executeLuaFileCaptureOutputTool supports zoid uri get/post/put/delete" {
             .body = "alpha=1",
             .headers = &.{
                 .{ .name = "Authorization", .value = "Bearer test-token" },
+            },
+            .response_headers = &.{
+                .{ .name = "X-Reply", .value = "rp" },
             },
             .status_code = 201,
             .response_body = "p",
@@ -3205,6 +3233,9 @@ test "executeLuaFileCaptureOutputTool supports zoid uri get/post/put/delete" {
             .headers = &.{
                 .{ .name = "Content-Type", .value = "text/plain" },
             },
+            .response_headers = &.{
+                .{ .name = "X-Reply", .value = "ru" },
+            },
             .status_code = 202,
             .response_body = "u",
         },
@@ -3214,6 +3245,9 @@ test "executeLuaFileCaptureOutputTool supports zoid uri get/post/put/delete" {
             .body = "",
             .headers = &.{
                 .{ .name = "X-Req-Id", .value = "d1" },
+            },
+            .response_headers = &.{
+                .{ .name = "X-Reply", .value = "rd" },
             },
             .status_code = 200,
             .response_body = "d",
@@ -3239,10 +3273,10 @@ test "executeLuaFileCaptureOutputTool supports zoid uri get/post/put/delete" {
         \\local r2 = zoid.uri(base .. "/post"):post("alpha=1", { headers = { Authorization = "Bearer test-token" } })
         \\local r3 = zoid.uri(base .. "/put"):put("update-me", { headers = { ["Content-Type"] = "text/plain" } })
         \\local r4 = zoid.uri(base .. "/delete"):delete({ headers = { ["X-Req-Id"] = "d1" } })
-        \\print("GET", r1.status, r1.body, r1.ok)
-        \\print("POST", r2.status, r2.body, r2.ok)
-        \\print("PUT", r3.status, r3.body, r3.ok)
-        \\print("DELETE", r4.status, r4.body, r4.ok)
+        \\print("GET", r1.status, r1.body, r1.ok, r1.headers["x-reply"])
+        \\print("POST", r2.status, r2.body, r2.ok, r2.headers["x-reply"])
+        \\print("PUT", r3.status, r3.body, r3.ok, r3.headers["x-reply"])
+        \\print("DELETE", r4.status, r4.body, r4.ok, r4.headers["x-reply"])
         \\
     ,
         .{port},
@@ -3267,12 +3301,83 @@ test "executeLuaFileCaptureOutputTool supports zoid uri get/post/put/delete" {
     try std.testing.expect(output.status == .ok);
     try std.testing.expectEqualStrings("", output.stderr);
     try std.testing.expectEqualStrings(
-        "GET\t200\tg\ttrue\nPOST\t201\tp\ttrue\nPUT\t202\tu\ttrue\nDELETE\t200\td\ttrue\n",
+        "GET\t200\tg\ttrue\trg\nPOST\t201\tp\ttrue\trp\nPUT\t202\tu\ttrue\tru\nDELETE\t200\td\ttrue\trd\n",
         output.stdout,
     );
 
     try std.testing.expect(context.failure == null);
     try std.testing.expectEqual(expectations.len, context.completed_requests);
+}
+
+test "executeLuaFileCaptureOutputTool exposes redirect location header without auto follow" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var listen_address = try std.net.Address.parseIp4("127.0.0.1", 0);
+    const server = try listen_address.listen(.{ .reuse_address = true });
+
+    var location_buffer: [128]u8 = undefined;
+    const port = server.listen_address.getPort();
+    const location = try std.fmt.bufPrint(&location_buffer, "http://127.0.0.1:{d}/final", .{port});
+
+    const expectations = [_]TestHttpExpectation{
+        .{
+            .method = "GET",
+            .target = "/redirect",
+            .body = "",
+            .response_headers = &.{
+                .{ .name = "Location", .value = location },
+            },
+            .status_code = 301,
+            .response_body = "",
+        },
+    };
+
+    var context = TestHttpServerContext{
+        .server = server,
+        .expected = &expectations,
+    };
+
+    const server_thread = std.Thread.spawn(.{}, runTestHttpServer, .{&context}) catch |err| {
+        context.server.deinit();
+        return err;
+    };
+    defer server_thread.join();
+
+    const script_content = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\local base = "http://127.0.0.1:{d}"
+        \\local r = zoid.uri(base .. "/redirect"):get()
+        \\print(r.status, r.ok, r.headers["location"])
+        \\
+    ,
+        .{port},
+    );
+    defer std.testing.allocator.free(script_content);
+
+    const script = try tmp.dir.createFile("redirect.lua", .{});
+    defer script.close();
+    try script.writeAll(script_content);
+
+    const script_path = try tmp.dir.realpathAlloc(std.testing.allocator, "redirect.lua");
+    defer std.testing.allocator.free(script_path);
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    var output = try executeLuaFileCaptureOutputTool(std.testing.allocator, script_path, .{
+        .workspace_root = workspace_root,
+        .allow_private_http_destinations = true,
+    });
+    defer output.deinit(std.testing.allocator);
+
+    try std.testing.expect(output.status == .ok);
+    const expected_stdout = try std.fmt.allocPrint(std.testing.allocator, "301\tfalse\t{s}\n", .{location});
+    defer std.testing.allocator.free(expected_stdout);
+    try std.testing.expectEqualStrings(expected_stdout, output.stdout);
+    try std.testing.expectEqualStrings("", output.stderr);
+
+    try std.testing.expect(context.failure == null);
+    try std.testing.expectEqual(@as(usize, 1), context.completed_requests);
 }
 
 test "executeLuaFileCaptureOutputTool rejects unsupported uri schemes" {

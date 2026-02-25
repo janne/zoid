@@ -1388,6 +1388,8 @@ fn executeHttpRequestTool(
     try writeJsonString(allocator, writer, uri);
     try writer.writeAll(",\"status\":");
     try writer.print("{d}", .{result.status_code});
+    try writer.writeAll(",\"headers\":");
+    try writeHttpResponseHeadersJson(allocator, writer, result.headers);
     try writer.writeAll(",\"body\":");
     try writeJsonString(allocator, writer, result.body);
     try writer.writeAll("}");
@@ -1429,6 +1431,23 @@ fn writeJsonString(allocator: std.mem.Allocator, writer: *std.Io.Writer, value: 
     const escaped = try std.json.Stringify.valueAlloc(allocator, value, .{});
     defer allocator.free(escaped);
     try writer.writeAll(escaped);
+}
+
+fn writeHttpResponseHeadersJson(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    headers: []const http_client.ResponseHeader,
+) !void {
+    try writer.writeAll("{");
+    var first = true;
+    for (headers) |header| {
+        if (!first) try writer.writeAll(",");
+        first = false;
+        try writeJsonString(allocator, writer, header.name);
+        try writer.writeAll(":");
+        try writeJsonString(allocator, writer, header.value);
+    }
+    try writer.writeAll("}");
 }
 
 fn luaBrowserAttachmentKindToString(kind: lua_runner.BrowserAttachmentKind) []const u8 {
@@ -2573,6 +2592,7 @@ const ToolRuntimeHttpExpectation = struct {
     method: []const u8,
     target: []const u8,
     body: []const u8,
+    response_headers: []const http_client.RequestHeader = &.{},
     status_code: u16,
     response_body: []const u8,
 };
@@ -2693,17 +2713,30 @@ fn runToolRuntimeHttpServer(context: *ToolRuntimeHttpServerContext) void {
             return;
         }
 
-        var response_header_buffer: [256]u8 = undefined;
-        const response_header = std.fmt.bufPrint(
-            &response_header_buffer,
-            "HTTP/1.1 {d} OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+        var response_header_output = std.ArrayList(u8).empty;
+        defer response_header_output.deinit(std.heap.page_allocator);
+        response_header_output.writer(std.heap.page_allocator).print(
+            "HTTP/1.1 {d} OK\r\nContent-Length: {d}\r\nConnection: close\r\n",
             .{ expected.status_code, expected.response_body.len },
         ) catch {
             context.failure = error.ResponseBuildFailed;
             return;
         };
+        for (expected.response_headers) |response_header| {
+            response_header_output.writer(std.heap.page_allocator).print(
+                "{s}: {s}\r\n",
+                .{ response_header.name, response_header.value },
+            ) catch {
+                context.failure = error.ResponseBuildFailed;
+                return;
+            };
+        }
+        response_header_output.appendSlice(std.heap.page_allocator, "\r\n") catch {
+            context.failure = error.ResponseBuildFailed;
+            return;
+        };
 
-        connection.stream.writeAll(response_header) catch |err| {
+        connection.stream.writeAll(response_header_output.items) catch |err| {
             context.failure = err;
             return;
         };
@@ -2731,10 +2764,38 @@ test "http tools perform get/post/put/delete requests" {
     const server = try listen_address.listen(.{ .reuse_address = true });
 
     const expectations = [_]ToolRuntimeHttpExpectation{
-        .{ .method = "GET", .target = "/get", .body = "", .status_code = 200, .response_body = "g" },
-        .{ .method = "POST", .target = "/post", .body = "alpha=1", .status_code = 201, .response_body = "p" },
-        .{ .method = "PUT", .target = "/put", .body = "update-me", .status_code = 202, .response_body = "u" },
-        .{ .method = "DELETE", .target = "/delete", .body = "", .status_code = 204, .response_body = "" },
+        .{
+            .method = "GET",
+            .target = "/get",
+            .body = "",
+            .response_headers = &.{.{ .name = "X-Reply", .value = "g" }},
+            .status_code = 200,
+            .response_body = "g",
+        },
+        .{
+            .method = "POST",
+            .target = "/post",
+            .body = "alpha=1",
+            .response_headers = &.{.{ .name = "X-Reply", .value = "p" }},
+            .status_code = 201,
+            .response_body = "p",
+        },
+        .{
+            .method = "PUT",
+            .target = "/put",
+            .body = "update-me",
+            .response_headers = &.{.{ .name = "X-Reply", .value = "u" }},
+            .status_code = 202,
+            .response_body = "u",
+        },
+        .{
+            .method = "DELETE",
+            .target = "/delete",
+            .body = "",
+            .response_headers = &.{.{ .name = "X-Reply", .value = "d" }},
+            .status_code = 204,
+            .response_body = "",
+        },
     };
 
     var context = ToolRuntimeHttpServerContext{
@@ -2783,6 +2844,8 @@ test "http tools perform get/post/put/delete requests" {
     try std.testing.expectEqualStrings("http_get", get_object.get("tool").?.string);
     try std.testing.expectEqualStrings(get_uri, get_object.get("uri").?.string);
     try std.testing.expectEqual(@as(i64, 200), get_object.get("status").?.integer);
+    const get_headers = get_object.get("headers").?.object;
+    try std.testing.expectEqualStrings("g", get_headers.get("x-reply").?.string);
     try std.testing.expectEqualStrings("g", get_object.get("body").?.string);
 
     var parsed_post = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, post_result, .{});
@@ -2792,6 +2855,8 @@ test "http tools perform get/post/put/delete requests" {
     try std.testing.expectEqualStrings("http_post", post_object.get("tool").?.string);
     try std.testing.expectEqualStrings(post_uri, post_object.get("uri").?.string);
     try std.testing.expectEqual(@as(i64, 201), post_object.get("status").?.integer);
+    const post_headers = post_object.get("headers").?.object;
+    try std.testing.expectEqualStrings("p", post_headers.get("x-reply").?.string);
     try std.testing.expectEqualStrings("p", post_object.get("body").?.string);
 
     var parsed_put = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, put_result, .{});
@@ -2801,6 +2866,8 @@ test "http tools perform get/post/put/delete requests" {
     try std.testing.expectEqualStrings("http_put", put_object.get("tool").?.string);
     try std.testing.expectEqualStrings(put_uri, put_object.get("uri").?.string);
     try std.testing.expectEqual(@as(i64, 202), put_object.get("status").?.integer);
+    const put_headers = put_object.get("headers").?.object;
+    try std.testing.expectEqualStrings("u", put_headers.get("x-reply").?.string);
     try std.testing.expectEqualStrings("u", put_object.get("body").?.string);
 
     var parsed_delete = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, delete_result, .{});
@@ -2810,6 +2877,8 @@ test "http tools perform get/post/put/delete requests" {
     try std.testing.expectEqualStrings("http_delete", delete_object.get("tool").?.string);
     try std.testing.expectEqualStrings(delete_uri, delete_object.get("uri").?.string);
     try std.testing.expectEqual(@as(i64, 204), delete_object.get("status").?.integer);
+    const delete_headers = delete_object.get("headers").?.object;
+    try std.testing.expectEqualStrings("d", delete_headers.get("x-reply").?.string);
     try std.testing.expectEqualStrings("", delete_object.get("body").?.string);
 
     try std.testing.expect(context.failure == null);
@@ -2835,6 +2904,68 @@ test "http tools reject unsupported uri scheme" {
             "{\"uri\":\"ftp://example.com/file.txt\"}",
         ),
     );
+}
+
+test "http tools expose redirect location header without auto follow" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+    policy.allow_private_http_destinations = true;
+
+    var listen_address = try std.net.Address.parseIp4("127.0.0.1", 0);
+    const server = try listen_address.listen(.{ .reuse_address = true });
+
+    var location_buffer: [128]u8 = undefined;
+    const port = server.listen_address.getPort();
+    const location = try std.fmt.bufPrint(&location_buffer, "http://127.0.0.1:{d}/final", .{port});
+
+    const expectations = [_]ToolRuntimeHttpExpectation{
+        .{
+            .method = "GET",
+            .target = "/redirect",
+            .body = "",
+            .response_headers = &.{
+                .{ .name = "Location", .value = location },
+            },
+            .status_code = 301,
+            .response_body = "",
+        },
+    };
+
+    var context = ToolRuntimeHttpServerContext{
+        .server = server,
+        .expected = &expectations,
+    };
+
+    const server_thread = std.Thread.spawn(.{}, runToolRuntimeHttpServer, .{&context}) catch |err| {
+        context.server.deinit();
+        return err;
+    };
+    defer server_thread.join();
+
+    const redirect_uri = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/redirect", .{port});
+    defer std.testing.allocator.free(redirect_uri);
+    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"uri\":\"{s}\"}}", .{redirect_uri});
+    defer std.testing.allocator.free(args);
+
+    const result = try executeToolCall(std.testing.allocator, &policy, "http_get", args);
+    defer std.testing.allocator.free(result);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expect(!root.get("ok").?.bool);
+    try std.testing.expectEqual(@as(i64, 301), root.get("status").?.integer);
+    const headers = root.get("headers").?.object;
+    try std.testing.expectEqualStrings(location, headers.get("location").?.string);
+
+    try std.testing.expect(context.failure == null);
+    try std.testing.expectEqual(@as(usize, 1), context.completed_requests);
 }
 
 test "http tools block localhost destinations by default" {

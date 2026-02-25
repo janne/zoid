@@ -901,7 +901,7 @@ fn writeHttpGetToolDefinition(
 ) !void {
     const description = try std.fmt.allocPrint(
         allocator,
-        "Perform an HTTP GET request to a http:// or https:// URI. Internal destinations (localhost/private/link-local) are blocked. Returns response status and body (max {d} bytes).",
+        "Perform an HTTP GET request to a http:// or https:// URI. Internal destinations (localhost/private/link-local) are blocked. Returns response status, headers, and body (max {d} bytes).",
         .{tool_runtime.max_allowed_http_response_bytes},
     );
     defer allocator.free(description);
@@ -941,7 +941,7 @@ fn writeHttpPostToolDefinition(
 ) !void {
     const description = try std.fmt.allocPrint(
         allocator,
-        "Perform an HTTP POST request to a http:// or https:// URI with optional string body. Internal destinations (localhost/private/link-local) are blocked. Returns response status and body (max {d} bytes).",
+        "Perform an HTTP POST request to a http:// or https:// URI with optional string body. Internal destinations (localhost/private/link-local) are blocked. Returns response status, headers, and body (max {d} bytes).",
         .{tool_runtime.max_allowed_http_response_bytes},
     );
     defer allocator.free(description);
@@ -957,7 +957,7 @@ fn writeHttpPutToolDefinition(
 ) !void {
     const description = try std.fmt.allocPrint(
         allocator,
-        "Perform an HTTP PUT request to a http:// or https:// URI with optional string body. Internal destinations (localhost/private/link-local) are blocked. Returns response status and body (max {d} bytes).",
+        "Perform an HTTP PUT request to a http:// or https:// URI with optional string body. Internal destinations (localhost/private/link-local) are blocked. Returns response status, headers, and body (max {d} bytes).",
         .{tool_runtime.max_allowed_http_response_bytes},
     );
     defer allocator.free(description);
@@ -973,7 +973,7 @@ fn writeHttpDeleteToolDefinition(
 ) !void {
     const description = try std.fmt.allocPrint(
         allocator,
-        "Perform an HTTP DELETE request to a http:// or https:// URI. Internal destinations (localhost/private/link-local) are blocked. Returns response status and body (max {d} bytes).",
+        "Perform an HTTP DELETE request to a http:// or https:// URI. Internal destinations (localhost/private/link-local) are blocked. Returns response status, headers, and body (max {d} bytes).",
         .{tool_runtime.max_allowed_http_response_bytes},
     );
     defer allocator.free(description);
