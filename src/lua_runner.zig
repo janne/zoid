@@ -1,4 +1,5 @@
 const std = @import("std");
+const browser_tool = @import("browser_tool.zig");
 const config_runtime = @import("config_runtime.zig");
 const config_store = @import("config_store.zig");
 const http_client = @import("http_client.zig");
@@ -60,6 +61,7 @@ pub const ToolSandbox = struct {
     max_http_response_bytes: usize = default_tool_max_http_response_bytes,
     execution_timeout_ns: ?u64 = timeoutSecondsToNanoseconds(default_tool_execution_timeout_seconds),
     config_path_override: ?[]const u8 = null,
+    browser_app_data_dir_override: ?[]const u8 = null,
     allow_private_http_destinations: bool = false,
 };
 
@@ -94,6 +96,7 @@ const ToolLuaEnvironment = struct {
     max_read_bytes: usize,
     max_http_response_bytes: usize,
     config_path_override: ?[]const u8,
+    browser_app_data_dir_override: ?[]const u8,
     allow_private_http_destinations: bool,
     module_cache: std.StringHashMapUnmanaged(c_int) = .{},
     module_stack: std.ArrayList([]u8) = .empty,
@@ -1503,6 +1506,200 @@ fn luaZoidJobs(lua_state: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
+const max_lua_json_encode_depth: usize = 64;
+
+const LuaTableShape = enum {
+    object,
+    array,
+};
+
+const LuaTableDescriptor = struct {
+    shape: LuaTableShape,
+    array_len: usize = 0,
+};
+
+fn writeJsonString(allocator: std.mem.Allocator, writer: *std.Io.Writer, value: []const u8) !void {
+    const escaped = try std.json.Stringify.valueAlloc(allocator, value, .{});
+    defer allocator.free(escaped);
+    try writer.writeAll(escaped);
+}
+
+fn describeLuaTable(state: *c.lua_State, table_index: c_int) !LuaTableDescriptor {
+    const table_abs_index = c.lua_absindex(state, table_index);
+
+    var string_key_count: usize = 0;
+    var integer_key_count: usize = 0;
+    var max_integer_key: usize = 0;
+
+    c.lua_pushnil(state);
+    while (c.lua_next(state, table_abs_index) != 0) {
+        defer luaPop(state, 1);
+
+        switch (c.lua_type(state, -2)) {
+            c.LUA_TSTRING => {
+                if (integer_key_count != 0) return error.InvalidToolArguments;
+                string_key_count += 1;
+            },
+            c.LUA_TNUMBER => {
+                if (string_key_count != 0) return error.InvalidToolArguments;
+                if (c.lua_isinteger(state, -2) == 0) return error.InvalidToolArguments;
+                var isnum: c_int = 0;
+                const raw_index = c.lua_tointegerx(state, -2, &isnum);
+                if (isnum == 0 or raw_index <= 0) return error.InvalidToolArguments;
+                const index = std.math.cast(usize, raw_index) orelse return error.InvalidToolArguments;
+                integer_key_count += 1;
+                if (index > max_integer_key) max_integer_key = index;
+            },
+            else => return error.InvalidToolArguments,
+        }
+    }
+
+    if (string_key_count > 0) return .{ .shape = .object };
+    if (integer_key_count == 0) return .{ .shape = .object };
+    if (max_integer_key != integer_key_count) return error.InvalidToolArguments;
+    return .{
+        .shape = .array,
+        .array_len = max_integer_key,
+    };
+}
+
+fn writeLuaValueAsJson(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    state: *c.lua_State,
+    value_index: c_int,
+    depth: usize,
+) !void {
+    if (depth >= max_lua_json_encode_depth) return error.InvalidToolArguments;
+    const value_abs_index = c.lua_absindex(state, value_index);
+
+    switch (c.lua_type(state, value_abs_index)) {
+        c.LUA_TNIL => try writer.writeAll("null"),
+        c.LUA_TBOOLEAN => try writer.writeAll(if (c.lua_toboolean(state, value_abs_index) != 0) "true" else "false"),
+        c.LUA_TNUMBER => {
+            if (c.lua_isinteger(state, value_abs_index) != 0) {
+                var integer_isnum: c_int = 0;
+                const integer_value = c.lua_tointegerx(state, value_abs_index, &integer_isnum);
+                if (integer_isnum == 0) return error.InvalidToolArguments;
+                try writer.print("{d}", .{integer_value});
+            } else {
+                var number_isnum: c_int = 0;
+                const number_value = c.lua_tonumberx(state, value_abs_index, &number_isnum);
+                if (number_isnum == 0 or !std.math.isFinite(number_value)) return error.InvalidToolArguments;
+                try writer.print("{d}", .{number_value});
+            }
+        },
+        c.LUA_TSTRING => {
+            var value_len: usize = 0;
+            const value_ptr = c.lua_tolstring(state, value_abs_index, &value_len) orelse return error.InvalidToolArguments;
+            try writeJsonString(allocator, writer, value_ptr[0..value_len]);
+        },
+        c.LUA_TTABLE => {
+            const descriptor = try describeLuaTable(state, value_abs_index);
+            switch (descriptor.shape) {
+                .object => {
+                    try writer.writeAll("{");
+                    var first = true;
+                    c.lua_pushnil(state);
+                    while (c.lua_next(state, value_abs_index) != 0) {
+                        defer luaPop(state, 1);
+
+                        if (!first) try writer.writeAll(",");
+                        first = false;
+
+                        var key_len: usize = 0;
+                        const key_ptr = c.lua_tolstring(state, -2, &key_len) orelse return error.InvalidToolArguments;
+                        try writeJsonString(allocator, writer, key_ptr[0..key_len]);
+                        try writer.writeAll(":");
+                        try writeLuaValueAsJson(allocator, writer, state, -1, depth + 1);
+                    }
+                    try writer.writeAll("}");
+                },
+                .array => {
+                    try writer.writeAll("[");
+                    var index: usize = 1;
+                    while (index <= descriptor.array_len) : (index += 1) {
+                        if (index != 1) try writer.writeAll(",");
+
+                        _ = c.lua_geti(state, value_abs_index, @intCast(index));
+                        defer luaPop(state, 1);
+                        if (c.lua_type(state, -1) == c.LUA_TNIL) return error.InvalidToolArguments;
+                        try writeLuaValueAsJson(allocator, writer, state, -1, depth + 1);
+                    }
+                    try writer.writeAll("]");
+                },
+            }
+        },
+        else => return error.InvalidToolArguments,
+    }
+}
+
+fn serializeLuaValueToJsonAlloc(
+    allocator: std.mem.Allocator,
+    state: *c.lua_State,
+    value_index: c_int,
+) ![]u8 {
+    var output = std.Io.Writer.Allocating.init(allocator);
+    errdefer output.deinit();
+    try writeLuaValueAsJson(allocator, &output.writer, state, value_index, 0);
+    return output.toOwnedSlice();
+}
+
+fn luaZoidBrowserAutomate(lua_state: ?*c.lua_State) callconv(.c) c_int {
+    const state = lua_state orelse return 0;
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace context unavailable", .{});
+    const nargs = c.lua_gettop(state);
+
+    const options_index: c_int = switch (nargs) {
+        1 => blk: {
+            if (c.lua_type(state, 1) != c.LUA_TTABLE) {
+                return pushLuaErrorMessage(state, "zoid.browser.automate requires options table", .{});
+            }
+            break :blk 1;
+        },
+        2 => blk: {
+            if (c.lua_type(state, 1) != c.LUA_TTABLE or c.lua_type(state, 2) != c.LUA_TTABLE) {
+                return pushLuaErrorMessage(state, "zoid.browser.automate requires options table", .{});
+            }
+            break :blk 2;
+        },
+        else => return pushLuaErrorMessage(state, "zoid.browser.automate requires options table", .{}),
+    };
+
+    const arguments_json = serializeLuaValueToJsonAlloc(env.allocator, state, options_index) catch |err| {
+        return pushLuaErrorMessage(state, "zoid.browser.automate failed: {s}", .{@errorName(err)});
+    };
+    defer env.allocator.free(arguments_json);
+
+    const result_json = browser_tool.execute(env.allocator, .{
+        .workspace_root = env.workspace_root,
+        .allow_private_http_destinations = env.allow_private_http_destinations,
+        .browser_app_data_dir_override = env.browser_app_data_dir_override,
+    }, arguments_json) catch |err| {
+        return pushLuaErrorMessage(state, "zoid.browser.automate failed: {s}", .{@errorName(err)});
+    };
+    defer env.allocator.free(result_json);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, env.allocator, result_json, .{}) catch |err| {
+        return pushLuaErrorMessage(state, "zoid.browser.automate failed: {s}", .{@errorName(err)});
+    };
+    defer parsed.deinit();
+
+    pushLuaJsonValue(state, parsed.value, 0) catch |err| {
+        return pushLuaErrorMessage(state, "zoid.browser.automate failed: {s}", .{@errorName(err)});
+    };
+    return 1;
+}
+
+fn luaZoidBrowser(lua_state: ?*c.lua_State) callconv(.c) c_int {
+    const state = lua_state orelse return 0;
+
+    c.lua_newtable(state);
+    c.lua_pushcclosure(state, luaZoidBrowserAutomate, 0);
+    c.lua_setfield(state, -2, "automate");
+    return 1;
+}
+
 fn luaZoidJsonDecode(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
     const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace context unavailable", .{});
@@ -1795,6 +1992,8 @@ fn installZoidTable(lua_state: *c.lua_State, sandbox: *ToolLuaEnvironment) void 
     c.lua_setfield(lua_state, -2, "config");
     c.lua_pushcclosure(lua_state, luaZoidJobs, 0);
     c.lua_setfield(lua_state, -2, "jobs");
+    _ = luaZoidBrowser(lua_state);
+    c.lua_setfield(lua_state, -2, "browser");
     c.lua_pushcclosure(lua_state, luaZoidImport, 0);
     c.lua_setfield(lua_state, -2, "import");
     _ = luaZoidJson(lua_state);
@@ -1818,7 +2017,7 @@ fn setGlobalNil(lua_state: *c.lua_State, name: [*:0]const u8) void {
 fn restrictToolLuaEnvironment(lua_state: *c.lua_State, sandbox: *ToolLuaEnvironment) void {
     installZoidTable(lua_state, sandbox);
 
-    // Remove standard escape hatches; zoid.file(...), zoid.dir(...), zoid.uri(...), zoid.config(), zoid.import(...), zoid.json.decode, zoid.time, zoid.date, and zoid.eprint(...) are tool APIs.
+    // Remove standard escape hatches; zoid.file(...), zoid.dir(...), zoid.uri(...), zoid.config(), zoid.jobs, zoid.browser.automate(...), zoid.import(...), zoid.json.decode, zoid.time, zoid.date, and zoid.eprint(...) are tool APIs.
     setGlobalNil(lua_state, "workspace");
     setGlobalNil(lua_state, "os");
     setGlobalNil(lua_state, "package");
@@ -1863,6 +2062,7 @@ fn executeLuaFileCaptureOutputInternal(
         .max_read_bytes = sandbox.max_read_bytes,
         .max_http_response_bytes = sandbox.max_http_response_bytes,
         .config_path_override = sandbox.config_path_override,
+        .browser_app_data_dir_override = sandbox.browser_app_data_dir_override,
         .allow_private_http_destinations = sandbox.allow_private_http_destinations,
     };
     defer {
@@ -2989,6 +3189,63 @@ test "executeLuaFileCaptureOutputTool blocks localhost uri destinations by defau
     );
 
     const script_path = try tmp.dir.realpathAlloc(std.testing.allocator, "blocked_localhost.lua");
+    defer std.testing.allocator.free(script_path);
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    var output = try executeLuaFileCaptureOutputTool(std.testing.allocator, script_path, .{
+        .workspace_root = workspace_root,
+    });
+    defer output.deinit(std.testing.allocator);
+
+    try std.testing.expect(output.status == .runtime_failed);
+    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "DestinationNotAllowed") != null);
+}
+
+test "executeLuaFileCaptureOutputTool reports browser support not ready for zoid browser automate" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script = try tmp.dir.createFile("browser_missing.lua", .{});
+    defer script.close();
+    try script.writeAll(
+        \\zoid.browser.automate({
+        \\  actions = {
+        \\    { action = "wait_for_timeout", ms = 1 }
+        \\  }
+        \\})
+        \\
+    );
+
+    const script_path = try tmp.dir.realpathAlloc(std.testing.allocator, "browser_missing.lua");
+    defer std.testing.allocator.free(script_path);
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    var output = try executeLuaFileCaptureOutputTool(std.testing.allocator, script_path, .{
+        .workspace_root = workspace_root,
+        .browser_app_data_dir_override = workspace_root,
+    });
+    defer output.deinit(std.testing.allocator);
+
+    try std.testing.expect(output.status == .runtime_failed);
+    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "BrowserSupportNotReady") != null);
+}
+
+test "executeLuaFileCaptureOutputTool blocks localhost browser start_url by default" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script = try tmp.dir.createFile("browser_localhost.lua", .{});
+    defer script.close();
+    try script.writeAll(
+        \\zoid.browser.automate({
+        \\  start_url = "http://127.0.0.1:8080"
+        \\})
+        \\
+    );
+
+    const script_path = try tmp.dir.realpathAlloc(std.testing.allocator, "browser_localhost.lua");
     defer std.testing.allocator.free(script_path);
     const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace_root);

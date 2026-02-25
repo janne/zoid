@@ -27,6 +27,7 @@ Lua run through Zoid has a `zoid` global with:
 - `zoid.uri(uri)` HTTP request handles
 - `zoid.config()` config handles
 - `zoid.jobs` scheduler handles
+- `zoid.browser` browser automation handles
 - `zoid.import(path)` Lua module imports
 - `zoid.json.decode(json_text)` JSON decoder
 - `zoid.time([table])` epoch timestamp helper
@@ -118,6 +119,20 @@ zoid.jobs.resume(created.id)
 zoid.jobs.delete(created.id)
 ```
 
+Browser automation example:
+
+```lua
+local result = zoid.browser.automate({
+  start_url = "https://example.com",
+  actions = {
+    { action = "wait_for_selector", selector = "h1" },
+    { action = "extract_text", selector = "h1" }
+  }
+})
+
+print(result.ok, result.tool)
+```
+
 Import example:
 
 ```lua
@@ -174,6 +189,13 @@ Supported methods and return values:
 - `zoid.jobs.delete(job_id) -> boolean`
 - `zoid.jobs.pause(job_id) -> boolean`
 - `zoid.jobs.resume(job_id) -> boolean`
+- `zoid.browser.automate(options) -> table` (same payload shape as `browser_automate` tool output)
+  - Result shape highlights:
+  - `result.ok` is boolean success status
+  - `result.actions` is an array of per-action execution records
+  - `result.extracts` is an array of extract objects
+  - `extract_page_text` output is an extract object with `kind = "page_text"` and text in `value`
+  - `extract_links` output is an extract object with `kind = "links"` and link list in `items`
 - `zoid.import(path) -> any` (module return value; repeated imports return the cached module value; if module returns `nil`, import returns `true`)
 - `zoid.json.decode(json_text) -> any`
 - `zoid.json.null` sentinel value used when decoded JSON contains `null`
@@ -287,6 +309,85 @@ Method-specific behavior:
 - Internal destinations are blocked by default (`localhost`, loopback, private IPv4 ranges, link-local, and private IPv6 ranges)
 - Redirects are not automatically followed (3xx responses are returned directly)
 - Response body size is capped by sandbox policy
+
+### Browser Automation Rules
+
+`zoid.browser.automate(options)` uses the same policy and runtime as the `browser_automate` tool:
+
+- Browser support must be installed first (`zoid browser install`)
+- `start_url` and browser actions that take URLs follow the same outbound URI policy as HTTP tools
+- Screenshot/download/upload paths are restricted to workspace paths
+- `session_id` format validation matches tool behavior
+- On driver-level execution failures, returns structured payload with `ok = false` (same as tool behavior)
+
+Browser extraction result contract:
+
+- Read extracts from `result.extracts` as an array (`ipairs`), not as map fields
+- `extract_text` emits `{ kind = "text", name, selector, value }`
+- `extract_html` emits `{ kind = "html", name, selector, value }`
+- `extract_links` emits `{ kind = "links", name, selector, items = { { href, text }, ... } }`
+- `extract_page_text` emits `{ kind = "page_text", name, value }`
+- `evaluate` emits `{ kind = "evaluate", name, value }`
+- `screenshot` without `path` emits `{ kind = "screenshot_base64", name, mime, value, truncated }`
+
+Supported browser `actions` (complete list):
+
+- `goto` / `open`
+  - Required: `url`
+  - Optional: `wait_until`, `timeout_ms`
+- `click`
+  - Required: `selector`
+  - Optional: `timeout_ms`
+- `type`
+  - Required: `selector`, `text`
+  - Optional: `clear`, `delay_ms`, `timeout_ms`
+- `fill`
+  - Required: `selector`, `text`
+  - Optional: `timeout_ms`
+- `press`
+  - Required: `key`
+  - Optional: `selector`, `timeout_ms`
+- `select_option`
+  - Required: `selector`, `value` (`string` or array of strings)
+  - Optional: `timeout_ms`
+- `check`
+  - Required: `selector`
+  - Optional: `timeout_ms`
+- `uncheck`
+  - Required: `selector`
+  - Optional: `timeout_ms`
+- `wait_for_selector`
+  - Required: `selector`
+  - Optional: `state`, `timeout_ms`
+- `wait_for_url`
+  - Required: `value`
+  - Optional: `match` (`contains` default, `exact`, `regex`), `timeout_ms`
+- `wait_for_timeout`
+  - Optional: `ms` (default `250`), `timeout_ms`
+- `submit`
+  - Optional: `selector` (if omitted, presses Enter), `wait_for_navigation` (default `true`), `timeout_ms`
+- `extract_text`
+  - Required: `selector`
+  - Optional: `name`, `timeout_ms`
+- `extract_html`
+  - Required: `selector`
+  - Optional: `name`, `timeout_ms`
+- `extract_links`
+  - Optional: `selector` (default `"a"`), `name`, `max_links`, `timeout_ms`
+- `extract_page_text`
+  - Optional: `name`, `timeout_ms`
+- `evaluate`
+  - Required: `script`
+  - Optional: `arg`, `name`, `timeout_ms`
+- `screenshot`
+  - Optional: `selector`, `type` (`png` default or `jpeg`), `quality` (jpeg), `full_page`, `path`, `name`, `max_base64_chars`, `timeout_ms`
+  - Behavior: with `path`, writes file in workspace; without `path`, adds base64 image data to extracts
+- `download`
+  - Required: `url`, `save_as`
+  - Optional: `method` (`GET` default, `POST`, `PUT`, `DELETE`), `body`, `headers`, `timeout_ms`
+- `upload`
+  - Required: `selector` and one of `path` or `paths` (`string` or array of strings)
+  - Optional: `timeout_ms`
 
 ### Scheduler Rules
 

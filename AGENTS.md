@@ -118,7 +118,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - `lua_execute` must intercept Lua script output so it is never written to process stdout/stderr in TUI mode; instead surface captured streams in tool JSON (`stdout` and `stderr`, with truncation flags) so the agent can read outputs safely.
   - `http_get`/`http_post`/`http_put`/`http_delete` are direct HTTP(S) tools (no Lua script required); accepted input is a `uri` string plus optional `body` for `post`/`put`, and responses include `status` + `body` with `ok` reflecting 2xx status.
   - `datetime_now` takes an empty object and returns current wall-clock time as `epoch` (Unix seconds), plus `utc` and `local` ISO-8601 strings.
-  - In `lua_execute` tool-mode, remove `os`/`package`/`debug`/`require`/`dofile`/`loadfile`; expose `zoid.file(path)` metadata handles with `:read([max_bytes])/:write(content)/:delete()`, `zoid.dir(path)` metadata handles with `:list()/:create()/:remove()/:grep(pattern, [options])`, `zoid.uri(uri):get/post/put/delete`, `zoid.config():list/get/set/unset`, `zoid.import(path)`, `zoid.json.decode`, `zoid.time([table])`, `zoid.date([format[, epoch]])`, and `zoid.exit([code])`.
+  - In `lua_execute` tool-mode, remove `os`/`package`/`debug`/`require`/`dofile`/`loadfile`; expose `zoid.file(path)` metadata handles with `:read([max_bytes])/:write(content)/:delete()`, `zoid.dir(path)` metadata handles with `:list()/:create()/:remove()/:grep(pattern, [options])`, `zoid.uri(uri):get/post/put/delete`, `zoid.config():list/get/set/unset`, `zoid.jobs`, `zoid.browser.automate(options)`, `zoid.import(path)`, `zoid.json.decode`, `zoid.time([table])`, `zoid.date([format[, epoch]])`, and `zoid.exit([code])`.
   - `zoid.import(path)` only loads `.lua` files inside workspace root, resolves relative paths from the importing module's directory, caches loaded modules per script execution, and rejects cyclic imports.
   - `zoid.exit([code])` must stop only the current Lua script execution and never terminate the hosting `zoid` process; tool JSON should surface `exit_code` and report non-zero exits as `LuaExit`.
   - `zoid.dir(path):create()` must fail when the target directory already exists, and `zoid.dir(path):remove()` must fail when the target directory is non-empty.
@@ -129,6 +129,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - `zoid.uri(uri)` allows only HTTP/HTTPS requests and returns a Lua table with `status`, `body`, and `ok`; response body capture is capped by tool policy (currently 1 MiB in `lua_execute`).
   - Outbound HTTP tools (`zoid.uri(...)` and direct `http_*`) must reject internal destinations by default (`localhost`, loopback, private/link-local ranges including IPv6 private/link-local blocks), and should not auto-follow redirects.
   - `browser_automate` runs a headless Chromium automation session (Playwright) per tool call and supports multi-step page actions (navigation, click/type/fill/submit/wait/select/check, content extraction, and JS evaluation in page context).
+  - Shared browser-automation validation/runtime logic lives in `src/browser_tool.zig`; both direct `browser_automate` tool calls and Lua `zoid.browser.automate(...)` must use this module to avoid divergence.
   - `browser_automate` currently executes Playwright via `npx` at runtime while reusing browser binaries from app-data (`PLAYWRIGHT_BROWSERS_PATH`); missing `npx` should return a browser-runtime error.
   - In `browser_automate`, `npx -p playwright ... node -e ...` does not reliably make `require("playwright")` resolve from workspace context; JS driver bootstrap should include PATH `.bin`-based fallback module resolution for Playwright package discovery.
   - `browser_automate` requires browser setup from `zoid browser install`; if setup artifacts are missing it should fail with a clear browser-support error.
@@ -136,6 +137,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - `browser_automate` must enforce the same outbound destination policy as HTTP tools by default (block localhost/private/link-local destinations unless policy override explicitly allows private destinations).
   - `browser_automate` supports persistent session state via `session_id`; session files are stored under app-data browser storage and allow continuation across tool calls.
   - `browser_automate` supports `screenshot`, `download`, and `upload` actions; local file paths must always resolve inside workspace root (same path policy as filesystem tools).
+  - Browser automation results use `extracts` as an array of objects (not a map): `extract_page_text` yields `{ kind: "page_text", value }`, `extract_links` yields `{ kind: "links", items = [{ href, text }, ...] }`, and there is no `results` field.
   - `zoid.uri(...):get/delete/post/put` accept optional request options with `headers` table (string->string); header names/values are validated and dangerous overrides such as `Host`/`Content-Length` are rejected.
   - `zoid.json.decode` maps JSON values to Lua tables/scalars and maps JSON `null` to the sentinel `zoid.json.null`.
   - `zoid.time([table])` and `zoid.date([format[, epoch]])` provide safe time/date helpers while global `os` remains disabled; behavior is aligned with Lua `os.time`/`os.date`, including date-table normalization in `zoid.time`.
@@ -161,7 +163,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - `zoid.exit([code])` accepts only integer exit codes in range `0..125`; out-of-range values must fail with a Lua runtime error.
 
 ### Lua script examples (`workspace/scripts/*.lua`) changes:
-  - Keep scripts compatible with the `zoid` API surface (`zoid.file`, `zoid.dir`, `zoid.uri`, `zoid.config`, `zoid.jobs`, `zoid.import`, `zoid.json`, `zoid.time`, `zoid.date`, `zoid.exit`, `zoid.eprint`) and do not rely on removed globals like `os`/`package`/`require`.
+  - Keep scripts compatible with the `zoid` API surface (`zoid.file`, `zoid.dir`, `zoid.uri`, `zoid.config`, `zoid.jobs`, `zoid.browser.automate`, `zoid.import`, `zoid.json`, `zoid.time`, `zoid.date`, `zoid.exit`, `zoid.eprint`) and do not rely on removed globals like `os`/`package`/`require`.
   - `zoid execute <file.lua> [args...]` exposes Lua global `arg` with `arg[0]` as script path and `arg[1..]` as forwarded positional arguments.
   - `workspace/scripts/gmail.lua` is a CLI-style utility; it supports `--query`, `--limit`, `--id`, and `--labels`, with default query `is:unread in:inbox`.
   - `workspace/scripts/counter.lua` creates `counter.txt` with `1` when missing; otherwise it reads the current integer value, increments by `1`, and writes it back.
