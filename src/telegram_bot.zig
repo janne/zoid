@@ -1835,6 +1835,19 @@ test "sanitizeTelegramMarkdownV2Chunk escapes markdown-v2 reserved characters" {
     );
 }
 
+test "sanitizeTelegramMarkdownV2Chunk escapes heading markers at line start" {
+    const sanitized = try sanitizeTelegramMarkdownV2Chunk(
+        std.testing.allocator,
+        "# title\n## subtitle\n### section",
+    );
+    defer std.testing.allocator.free(sanitized);
+
+    try std.testing.expectEqualStrings(
+        "\\# title\n\\#\\# subtitle\n\\#\\#\\# section",
+        sanitized,
+    );
+}
+
 test "buildSendMessagePayload includes message thread when present" {
     const payload = try buildSendMessagePayload(
         std.testing.allocator,
