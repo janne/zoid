@@ -27,6 +27,7 @@ const serve_lock_file_name = "telegram_serve.lock";
 const typing_action_refresh_ns: u64 = 4 * std.time.ns_per_s;
 const typing_action_sleep_step_ns: u64 = 200 * std.time.ns_per_ms;
 const telegram_message_parse_mode = "MarkdownV2";
+const SanitizerError = std.mem.Allocator.Error;
 
 const InboundChatKind = enum {
     private,
@@ -1771,19 +1772,401 @@ fn sanitizeTelegramMarkdownV2Chunk(
     var escaped = std.ArrayList(u8).empty;
     errdefer escaped.deinit(allocator);
 
-    for (chunk) |byte| {
-        if (shouldEscapeTelegramMarkdownV2Byte(byte)) {
-            try escaped.append(allocator, '\\');
+    var index: usize = 0;
+    var at_line_start = true;
+    while (index < chunk.len) {
+        if (at_line_start) {
+            if (try appendSanitizedTelegramBlockquoteLine(allocator, &escaped, chunk, index)) |consumed| {
+                index += consumed;
+                at_line_start = false;
+                continue;
+            }
+            if (try appendSanitizedTelegramHeadingLine(allocator, &escaped, chunk, index)) |consumed| {
+                index += consumed;
+                at_line_start = false;
+                continue;
+            }
         }
-        try escaped.append(allocator, byte);
+
+        if (try appendSanitizedTelegramEntity(allocator, &escaped, chunk, index, false)) |consumed| {
+            index += consumed;
+            at_line_start = false;
+            continue;
+        }
+
+        const byte = chunk[index];
+        try appendEscapedTelegramMarkdownV2Byte(allocator, &escaped, byte);
+        at_line_start = byte == '\n' or byte == '\r';
+        index += 1;
     }
 
     return escaped.toOwnedSlice(allocator);
 }
 
+fn appendEscapedTelegramMarkdownV2Byte(
+    allocator: std.mem.Allocator,
+    escaped: *std.ArrayList(u8),
+    byte: u8,
+) !void {
+    if (shouldEscapeTelegramMarkdownV2Byte(byte)) {
+        try escaped.append(allocator, '\\');
+    }
+    try escaped.append(allocator, byte);
+}
+
+fn appendEscapedTelegramHeadingByte(
+    allocator: std.mem.Allocator,
+    escaped: *std.ArrayList(u8),
+    byte: u8,
+) !void {
+    try appendEscapedTelegramMarkdownV2Byte(allocator, escaped, byte);
+}
+
+fn appendSanitizedTelegramHeadingLine(
+    allocator: std.mem.Allocator,
+    escaped: *std.ArrayList(u8),
+    chunk: []const u8,
+    start: usize,
+) SanitizerError!?usize {
+    if (start >= chunk.len or chunk[start] != '#') return null;
+
+    var marker_end = start;
+    while (marker_end < chunk.len and chunk[marker_end] == '#') : (marker_end += 1) {}
+    if (marker_end == start) return null;
+    if (marker_end >= chunk.len) return null;
+    if (chunk[marker_end] != ' ' and chunk[marker_end] != '\t') return null;
+
+    var content_start = marker_end;
+    while (content_start < chunk.len and (chunk[content_start] == ' ' or chunk[content_start] == '\t')) : (content_start += 1) {}
+    if (content_start >= chunk.len) return null;
+    if (chunk[content_start] == '\n' or chunk[content_start] == '\r') return null;
+
+    var line_end = content_start;
+    while (line_end < chunk.len and chunk[line_end] != '\n' and chunk[line_end] != '\r') : (line_end += 1) {}
+
+    try escaped.append(allocator, '*');
+    var cursor = content_start;
+    while (cursor < line_end) {
+        if (try appendSanitizedTelegramEntity(allocator, escaped, chunk, cursor, true)) |consumed| {
+            cursor += consumed;
+            continue;
+        }
+
+        try appendEscapedTelegramHeadingByte(allocator, escaped, chunk[cursor]);
+        cursor += 1;
+    }
+    try escaped.append(allocator, '*');
+
+    return line_end - start;
+}
+
+fn appendSanitizedTelegramBlockquoteLine(
+    allocator: std.mem.Allocator,
+    escaped: *std.ArrayList(u8),
+    chunk: []const u8,
+    start: usize,
+) SanitizerError!?usize {
+    if (start >= chunk.len or chunk[start] != '>') return null;
+
+    var line_end = start;
+    while (line_end < chunk.len and chunk[line_end] != '\n' and chunk[line_end] != '\r') : (line_end += 1) {}
+
+    try escaped.append(allocator, '>');
+    var cursor = start + 1;
+    while (cursor < line_end) {
+        if (try appendSanitizedTelegramEntity(allocator, escaped, chunk, cursor, false)) |consumed| {
+            cursor += consumed;
+            continue;
+        }
+        try appendEscapedTelegramMarkdownV2Byte(allocator, escaped, chunk[cursor]);
+        cursor += 1;
+    }
+
+    return line_end - start;
+}
+
+fn appendSanitizedTelegramEntity(
+    allocator: std.mem.Allocator,
+    escaped: *std.ArrayList(u8),
+    chunk: []const u8,
+    start: usize,
+    escape_heading_star: bool,
+) SanitizerError!?usize {
+    if (try appendSanitizedTelegramCodeSpan(allocator, escaped, chunk, start, 3)) |consumed| {
+        return consumed;
+    }
+    if (try appendSanitizedTelegramCodeSpan(allocator, escaped, chunk, start, 1)) |consumed| {
+        return consumed;
+    }
+    if (try appendSanitizedTelegramInlineLink(allocator, escaped, chunk, start, escape_heading_star)) |consumed| {
+        return consumed;
+    }
+
+    if (try appendSanitizedTelegramStyledSpan(allocator, escaped, chunk, start, '_', 2, 2, escape_heading_star)) |consumed| {
+        return consumed;
+    }
+    if (try appendSanitizedTelegramStyledSpan(allocator, escaped, chunk, start, '|', 2, 2, escape_heading_star)) |consumed| {
+        return consumed;
+    }
+    // Accept common markdown-style double-tilde and normalize it to Telegram's single-tilde strikethrough.
+    if (try appendSanitizedTelegramStyledSpan(allocator, escaped, chunk, start, '~', 2, 1, escape_heading_star)) |consumed| {
+        return consumed;
+    }
+
+    if (!escape_heading_star) {
+        if (try appendSanitizedTelegramStyledSpan(allocator, escaped, chunk, start, '*', 1, 1, false)) |consumed| {
+            return consumed;
+        }
+    }
+    if (try appendSanitizedTelegramStyledSpan(allocator, escaped, chunk, start, '_', 1, 1, escape_heading_star)) |consumed| {
+        return consumed;
+    }
+    if (try appendSanitizedTelegramStyledSpan(allocator, escaped, chunk, start, '~', 1, 1, escape_heading_star)) |consumed| {
+        return consumed;
+    }
+
+    return null;
+}
+
+fn delimiterMatchesAt(
+    chunk: []const u8,
+    start: usize,
+    marker_byte: u8,
+    delimiter_len: usize,
+) bool {
+    if (delimiter_len == 0 or start + delimiter_len > chunk.len) return false;
+    var index: usize = 0;
+    while (index < delimiter_len) : (index += 1) {
+        if (chunk[start + index] != marker_byte) return false;
+    }
+    return true;
+}
+
+fn appendEscapedTelegramCodeByte(
+    allocator: std.mem.Allocator,
+    escaped: *std.ArrayList(u8),
+    byte: u8,
+) !void {
+    if (byte == '\\' or byte == '`') {
+        try escaped.append(allocator, '\\');
+    }
+    try escaped.append(allocator, byte);
+}
+
+fn appendSanitizedTelegramCodeSpan(
+    allocator: std.mem.Allocator,
+    escaped: *std.ArrayList(u8),
+    chunk: []const u8,
+    start: usize,
+    delimiter_len: usize,
+) SanitizerError!?usize {
+    if (!delimiterMatchesAt(chunk, start, '`', delimiter_len)) return null;
+    const content_start = start + delimiter_len;
+    if (content_start >= chunk.len) return null;
+
+    const allow_newlines = delimiter_len == 3;
+    var cursor = content_start;
+    var close_start: ?usize = null;
+    while (cursor < chunk.len) {
+        const byte = chunk[cursor];
+        if (!allow_newlines and (byte == '\n' or byte == '\r')) return null;
+        if (byte == '\\') {
+            if (cursor + 1 >= chunk.len) return null;
+            cursor += 2;
+            continue;
+        }
+        if (delimiterMatchesAt(chunk, cursor, '`', delimiter_len)) {
+            close_start = cursor;
+            break;
+        }
+        cursor += 1;
+    }
+
+    const resolved_close_start = close_start orelse return null;
+    if (resolved_close_start == content_start) return null;
+
+    var index: usize = 0;
+    while (index < delimiter_len) : (index += 1) {
+        try escaped.append(allocator, '`');
+    }
+
+    cursor = content_start;
+    while (cursor < resolved_close_start) : (cursor += 1) {
+        try appendEscapedTelegramCodeByte(allocator, escaped, chunk[cursor]);
+    }
+
+    index = 0;
+    while (index < delimiter_len) : (index += 1) {
+        try escaped.append(allocator, '`');
+    }
+    return resolved_close_start + delimiter_len - start;
+}
+
+fn appendSanitizedTelegramInlineLink(
+    allocator: std.mem.Allocator,
+    escaped: *std.ArrayList(u8),
+    chunk: []const u8,
+    start: usize,
+    escape_heading_star: bool,
+) SanitizerError!?usize {
+    if (start >= chunk.len or chunk[start] != '[') return null;
+
+    var label_end: ?usize = null;
+    var cursor = start + 1;
+    while (cursor < chunk.len) {
+        const byte = chunk[cursor];
+        if (byte == '\n' or byte == '\r') return null;
+        if (byte == '\\') {
+            if (cursor + 1 >= chunk.len) return null;
+            cursor += 2;
+            continue;
+        }
+        if (byte == ']') {
+            label_end = cursor;
+            break;
+        }
+        cursor += 1;
+    }
+
+    const resolved_label_end = label_end orelse return null;
+    if (resolved_label_end + 1 >= chunk.len or chunk[resolved_label_end + 1] != '(') return null;
+
+    const url_start = resolved_label_end + 2;
+    if (url_start >= chunk.len) return null;
+
+    var depth: usize = 1;
+    cursor = url_start;
+    var url_end: ?usize = null;
+    while (cursor < chunk.len) {
+        const byte = chunk[cursor];
+        if (byte == '\n' or byte == '\r') return null;
+        if (byte == '\\') {
+            if (cursor + 1 >= chunk.len) return null;
+            cursor += 2;
+            continue;
+        }
+        if (byte == '(') {
+            depth += 1;
+            cursor += 1;
+            continue;
+        }
+        if (byte == ')') {
+            if (depth == 0) return null;
+            depth -= 1;
+            if (depth == 0) {
+                url_end = cursor;
+                break;
+            }
+        }
+        cursor += 1;
+    }
+
+    const resolved_url_end = url_end orelse return null;
+    if (resolved_url_end == url_start) return null;
+
+    try escaped.append(allocator, '[');
+    cursor = start + 1;
+    while (cursor < resolved_label_end) : (cursor += 1) {
+        if (escape_heading_star) {
+            try appendEscapedTelegramHeadingByte(allocator, escaped, chunk[cursor]);
+        } else {
+            try appendEscapedTelegramMarkdownV2Byte(allocator, escaped, chunk[cursor]);
+        }
+    }
+    try escaped.appendSlice(allocator, "](");
+
+    cursor = url_start;
+    while (cursor < resolved_url_end) : (cursor += 1) {
+        const byte = chunk[cursor];
+        if (shouldEscapeTelegramMarkdownV2LinkUrlByte(byte)) {
+            try escaped.append(allocator, '\\');
+        }
+        try escaped.append(allocator, byte);
+    }
+    try escaped.append(allocator, ')');
+
+    return resolved_url_end + 1 - start;
+}
+
+fn appendSanitizedTelegramStyledSpan(
+    allocator: std.mem.Allocator,
+    escaped: *std.ArrayList(u8),
+    chunk: []const u8,
+    start: usize,
+    marker_byte: u8,
+    delimiter_len: usize,
+    output_delimiter_len: usize,
+    escape_heading_star: bool,
+) SanitizerError!?usize {
+    if (!delimiterMatchesAt(chunk, start, marker_byte, delimiter_len)) return null;
+    const content_start = start + delimiter_len;
+    if (content_start >= chunk.len) return null;
+
+    var cursor = content_start;
+    var close_start: ?usize = null;
+    while (cursor < chunk.len) {
+        const byte = chunk[cursor];
+        if (byte == '\n' or byte == '\r') return null;
+        if (byte == '\\') {
+            if (cursor + 1 >= chunk.len) return null;
+            cursor += 2;
+            continue;
+        }
+        if (delimiterMatchesAt(chunk, cursor, marker_byte, delimiter_len)) {
+            if (delimiter_len == 1 and marker_byte == '_' and delimiterMatchesAt(chunk, cursor, '_', 2)) {
+                cursor += 1;
+                continue;
+            }
+            if (delimiter_len == 1 and marker_byte == '~' and delimiterMatchesAt(chunk, cursor, '~', 2)) {
+                cursor += 1;
+                continue;
+            }
+            close_start = cursor;
+            break;
+        }
+        cursor += 1;
+    }
+
+    const resolved_close_start = close_start orelse return null;
+    if (resolved_close_start == content_start) return null;
+
+    var index: usize = 0;
+    while (index < output_delimiter_len) : (index += 1) {
+        try escaped.append(allocator, marker_byte);
+    }
+
+    cursor = content_start;
+    while (cursor < resolved_close_start) {
+        if (try appendSanitizedTelegramEntity(allocator, escaped, chunk, cursor, escape_heading_star)) |consumed| {
+            cursor += consumed;
+            continue;
+        }
+
+        if (escape_heading_star) {
+            try appendEscapedTelegramHeadingByte(allocator, escaped, chunk[cursor]);
+        } else {
+            try appendEscapedTelegramMarkdownV2Byte(allocator, escaped, chunk[cursor]);
+        }
+        cursor += 1;
+    }
+
+    index = 0;
+    while (index < output_delimiter_len) : (index += 1) {
+        try escaped.append(allocator, marker_byte);
+    }
+    return resolved_close_start + delimiter_len - start;
+}
+
+fn shouldEscapeTelegramMarkdownV2LinkUrlByte(byte: u8) bool {
+    return switch (byte) {
+        '\\', '(', ')' => true,
+        else => false,
+    };
+}
+
 fn shouldEscapeTelegramMarkdownV2Byte(byte: u8) bool {
     return switch (byte) {
-        '_', '[', ']', '(', ')', '~', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!', '\\' => true,
+        '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!', '\\' => true,
         else => false,
     };
 }
@@ -2231,7 +2614,7 @@ test "sanitizeTelegramMarkdownV2Chunk escapes markdown-v2 reserved characters" {
     defer std.testing.allocator.free(sanitized);
 
     try std.testing.expectEqualStrings(
-        "*bold* `code\\.with\\.dots` \\[label\\]\\(https://example\\.com/path\\)\\! browser\\_automate",
+        "*bold* `code.with.dots` [label](https://example.com/path)\\! browser\\_automate",
         sanitized,
     );
 }
@@ -2244,7 +2627,72 @@ test "sanitizeTelegramMarkdownV2Chunk escapes heading markers at line start" {
     defer std.testing.allocator.free(sanitized);
 
     try std.testing.expectEqualStrings(
-        "\\# title\n\\#\\# subtitle\n\\#\\#\\# section",
+        "*title*\n*subtitle*\n*section*",
+        sanitized,
+    );
+}
+
+test "sanitizeTelegramMarkdownV2Chunk keeps inline link labels and escapes url parens" {
+    const sanitized = try sanitizeTelegramMarkdownV2Chunk(
+        std.testing.allocator,
+        "[Article](https://en.wikipedia.org/wiki/Function_(mathematics))",
+    );
+    defer std.testing.allocator.free(sanitized);
+
+    try std.testing.expectEqualStrings(
+        "[Article](https://en.wikipedia.org/wiki/Function_\\(mathematics\\))",
+        sanitized,
+    );
+}
+
+test "sanitizeTelegramMarkdownV2Chunk keeps markdown-v2 style markers" {
+    const sanitized = try sanitizeTelegramMarkdownV2Chunk(
+        std.testing.allocator,
+        "*fet* _kursiv_ ~overstruken~ __understruken__ ||spoiler||",
+    );
+    defer std.testing.allocator.free(sanitized);
+
+    try std.testing.expectEqualStrings(
+        "*fet* _kursiv_ ~overstruken~ __understruken__ ||spoiler||",
+        sanitized,
+    );
+}
+
+test "sanitizeTelegramMarkdownV2Chunk normalizes markdown double-tilde to telegram strikethrough" {
+    const sanitized = try sanitizeTelegramMarkdownV2Chunk(
+        std.testing.allocator,
+        "~~legacy~~",
+    );
+    defer std.testing.allocator.free(sanitized);
+
+    try std.testing.expectEqualStrings(
+        "~legacy~",
+        sanitized,
+    );
+}
+
+test "sanitizeTelegramMarkdownV2Chunk keeps blockquote marker at line start" {
+    const sanitized = try sanitizeTelegramMarkdownV2Chunk(
+        std.testing.allocator,
+        "> cited\nplain > text",
+    );
+    defer std.testing.allocator.free(sanitized);
+
+    try std.testing.expectEqualStrings(
+        "> cited\nplain \\> text",
+        sanitized,
+    );
+}
+
+test "sanitizeTelegramMarkdownV2Chunk escapes unmatched style markers" {
+    const sanitized = try sanitizeTelegramMarkdownV2Chunk(
+        std.testing.allocator,
+        "~over _under ~~legacy",
+    );
+    defer std.testing.allocator.free(sanitized);
+
+    try std.testing.expectEqualStrings(
+        "\\~over \\_under \\~\\~legacy",
         sanitized,
     );
 }
