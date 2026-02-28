@@ -380,7 +380,6 @@ pub fn runLongPolling(allocator: std.mem.Allocator, settings: Settings) !void {
     const workspace_root = try resolveWorkspaceRoot(allocator);
     defer allocator.free(workspace_root);
 
-    std.debug.print("Starting Telegram long-polling loop.\n", .{});
     std.debug.print(
         "Starting Telegram inbound worker pool with {d} workers.\n",
         .{settings.limits.telegram_inbound_worker_count},
