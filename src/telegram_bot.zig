@@ -1724,7 +1724,11 @@ fn sendMessageInChunks(
             markdown_chunk,
             telegram_message_parse_mode,
         ) catch |err| switch (err) {
-            error.TelegramApiRequestFailed => try sendMessage(allocator, bot_token, chat_id, thread_id, chunk, null),
+            error.TelegramApiRequestFailed => {
+                const plain_chunk = try plainTelegramFallbackChunk(allocator, markdown_chunk);
+                defer allocator.free(plain_chunk);
+                try sendMessage(allocator, bot_token, chat_id, thread_id, plain_chunk, null);
+            },
             else => return err,
         };
         start = end;
@@ -1793,13 +1797,37 @@ fn sanitizeTelegramMarkdownV2Chunk(
             continue;
         }
 
-        const byte = chunk[index];
-        try appendEscapedTelegramMarkdownV2Byte(allocator, &escaped, byte);
-        at_line_start = byte == '\n' or byte == '\r';
-        index += 1;
+        const consumed = try appendEscapedTelegramMarkdownV2SliceByte(allocator, &escaped, chunk, index, false);
+        const last_byte = chunk[index + consumed - 1];
+        at_line_start = last_byte == '\n' or last_byte == '\r';
+        index += consumed;
     }
 
     return escaped.toOwnedSlice(allocator);
+}
+
+fn appendEscapedTelegramMarkdownV2SliceByte(
+    allocator: std.mem.Allocator,
+    escaped: *std.ArrayList(u8),
+    chunk: []const u8,
+    cursor: usize,
+    escape_heading_star: bool,
+) !usize {
+    if (chunk[cursor] == '\\' and cursor + 1 < chunk.len) {
+        const next = chunk[cursor + 1];
+        if (shouldEscapeTelegramMarkdownV2Byte(next)) {
+            try escaped.append(allocator, '\\');
+            try escaped.append(allocator, next);
+            return 2;
+        }
+    }
+
+    if (escape_heading_star) {
+        try appendEscapedTelegramHeadingByte(allocator, escaped, chunk[cursor]);
+    } else {
+        try appendEscapedTelegramMarkdownV2Byte(allocator, escaped, chunk[cursor]);
+    }
+    return 1;
 }
 
 fn appendEscapedTelegramMarkdownV2Byte(
@@ -1819,6 +1847,29 @@ fn appendEscapedTelegramHeadingByte(
     byte: u8,
 ) !void {
     try appendEscapedTelegramMarkdownV2Byte(allocator, escaped, byte);
+}
+
+fn appendEscapedTelegramLinkUrlSliceByte(
+    allocator: std.mem.Allocator,
+    escaped: *std.ArrayList(u8),
+    chunk: []const u8,
+    cursor: usize,
+) !usize {
+    if (chunk[cursor] == '\\' and cursor + 1 < chunk.len) {
+        const next = chunk[cursor + 1];
+        if (shouldEscapeTelegramMarkdownV2LinkUrlByte(next)) {
+            try escaped.append(allocator, '\\');
+            try escaped.append(allocator, next);
+            return 2;
+        }
+    }
+
+    const byte = chunk[cursor];
+    if (shouldEscapeTelegramMarkdownV2LinkUrlByte(byte)) {
+        try escaped.append(allocator, '\\');
+    }
+    try escaped.append(allocator, byte);
+    return 1;
 }
 
 fn appendSanitizedTelegramHeadingLine(
@@ -1851,8 +1902,7 @@ fn appendSanitizedTelegramHeadingLine(
             continue;
         }
 
-        try appendEscapedTelegramHeadingByte(allocator, escaped, chunk[cursor]);
-        cursor += 1;
+        cursor += try appendEscapedTelegramMarkdownV2SliceByte(allocator, escaped, chunk, cursor, true);
     }
     try escaped.append(allocator, '*');
 
@@ -1877,8 +1927,7 @@ fn appendSanitizedTelegramBlockquoteLine(
             cursor += consumed;
             continue;
         }
-        try appendEscapedTelegramMarkdownV2Byte(allocator, escaped, chunk[cursor]);
-        cursor += 1;
+        cursor += try appendEscapedTelegramMarkdownV2SliceByte(allocator, escaped, chunk, cursor, false);
     }
 
     return line_end - start;
@@ -2065,22 +2114,25 @@ fn appendSanitizedTelegramInlineLink(
 
     try escaped.append(allocator, '[');
     cursor = start + 1;
-    while (cursor < resolved_label_end) : (cursor += 1) {
-        if (escape_heading_star) {
-            try appendEscapedTelegramHeadingByte(allocator, escaped, chunk[cursor]);
-        } else {
-            try appendEscapedTelegramMarkdownV2Byte(allocator, escaped, chunk[cursor]);
-        }
+    while (cursor < resolved_label_end) {
+        cursor += try appendEscapedTelegramMarkdownV2SliceByte(
+            allocator,
+            escaped,
+            chunk,
+            cursor,
+            escape_heading_star,
+        );
     }
     try escaped.appendSlice(allocator, "](");
 
     cursor = url_start;
-    while (cursor < resolved_url_end) : (cursor += 1) {
-        const byte = chunk[cursor];
-        if (shouldEscapeTelegramMarkdownV2LinkUrlByte(byte)) {
-            try escaped.append(allocator, '\\');
-        }
-        try escaped.append(allocator, byte);
+    while (cursor < resolved_url_end) {
+        cursor += try appendEscapedTelegramLinkUrlSliceByte(
+            allocator,
+            escaped,
+            chunk,
+            cursor,
+        );
     }
     try escaped.append(allocator, ')');
 
@@ -2141,12 +2193,13 @@ fn appendSanitizedTelegramStyledSpan(
             continue;
         }
 
-        if (escape_heading_star) {
-            try appendEscapedTelegramHeadingByte(allocator, escaped, chunk[cursor]);
-        } else {
-            try appendEscapedTelegramMarkdownV2Byte(allocator, escaped, chunk[cursor]);
-        }
-        cursor += 1;
+        cursor += try appendEscapedTelegramMarkdownV2SliceByte(
+            allocator,
+            escaped,
+            chunk,
+            cursor,
+            escape_heading_star,
+        );
     }
 
     index = 0;
@@ -2168,6 +2221,31 @@ fn shouldEscapeTelegramMarkdownV2Byte(byte: u8) bool {
         '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!', '\\' => true,
         else => false,
     };
+}
+
+fn plainTelegramFallbackChunk(
+    allocator: std.mem.Allocator,
+    markdown_chunk: []const u8,
+) ![]u8 {
+    var plain = std.ArrayList(u8).empty;
+    errdefer plain.deinit(allocator);
+
+    var index: usize = 0;
+    while (index < markdown_chunk.len) {
+        if (markdown_chunk[index] == '\\' and index + 1 < markdown_chunk.len) {
+            const next = markdown_chunk[index + 1];
+            if (shouldEscapeTelegramMarkdownV2Byte(next)) {
+                try plain.append(allocator, next);
+                index += 2;
+                continue;
+            }
+        }
+
+        try plain.append(allocator, markdown_chunk[index]);
+        index += 1;
+    }
+
+    return plain.toOwnedSlice(allocator);
 }
 
 fn sendMessage(
@@ -2644,6 +2722,32 @@ test "sanitizeTelegramMarkdownV2Chunk keeps inline link labels and escapes url p
     );
 }
 
+test "sanitizeTelegramMarkdownV2Chunk preserves existing parenthesis escapes" {
+    const sanitized = try sanitizeTelegramMarkdownV2Chunk(
+        std.testing.allocator,
+        "\\(already escaped\\) and (plain)",
+    );
+    defer std.testing.allocator.free(sanitized);
+
+    try std.testing.expectEqualStrings(
+        "\\(already escaped\\) and \\(plain\\)",
+        sanitized,
+    );
+}
+
+test "sanitizeTelegramMarkdownV2Chunk preserves existing escaped link-url parens" {
+    const sanitized = try sanitizeTelegramMarkdownV2Chunk(
+        std.testing.allocator,
+        "[Article](https://example.com/wiki/Function_\\(mathematics\\))",
+    );
+    defer std.testing.allocator.free(sanitized);
+
+    try std.testing.expectEqualStrings(
+        "[Article](https://example.com/wiki/Function_\\(mathematics\\))",
+        sanitized,
+    );
+}
+
 test "sanitizeTelegramMarkdownV2Chunk keeps markdown-v2 style markers" {
     const sanitized = try sanitizeTelegramMarkdownV2Chunk(
         std.testing.allocator,
@@ -2693,6 +2797,19 @@ test "sanitizeTelegramMarkdownV2Chunk escapes unmatched style markers" {
     try std.testing.expectEqualStrings(
         "\\~over \\_under \\~\\~legacy",
         sanitized,
+    );
+}
+
+test "plainTelegramFallbackChunk removes markdown-v2 escapes" {
+    const plain = try plainTelegramFallbackChunk(
+        std.testing.allocator,
+        "\\- item\n\\(paren\\) \\[label\\] and \\\\",
+    );
+    defer std.testing.allocator.free(plain);
+
+    try std.testing.expectEqualStrings(
+        "- item\n(paren) [label] and \\",
+        plain,
     );
 }
 
