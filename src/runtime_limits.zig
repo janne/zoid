@@ -11,6 +11,10 @@ pub const default_telegram_user_inactivity_reset_seconds: i64 = 8 * std.time.s_p
 pub const min_telegram_user_inactivity_reset_seconds: i64 = 60;
 pub const max_telegram_user_inactivity_reset_seconds: i64 = 7 * 24 * std.time.s_per_hour;
 
+pub const default_telegram_inbound_worker_count: usize = 4;
+pub const min_telegram_inbound_worker_count: usize = 1;
+pub const max_telegram_inbound_worker_count: usize = 32;
+
 pub const default_openai_max_workspace_instruction_chars: usize = 256 * 1024;
 pub const min_openai_max_workspace_instruction_chars: usize = 1_024;
 pub const max_openai_max_workspace_instruction_chars: usize = 1_048_576;
@@ -23,6 +27,7 @@ pub const Limits = struct {
     openai: openai_client.Limits = .{},
     telegram_max_conversation_messages: usize = default_telegram_max_conversation_messages,
     telegram_user_inactivity_reset_seconds: i64 = default_telegram_user_inactivity_reset_seconds,
+    telegram_inbound_worker_count: usize = default_telegram_inbound_worker_count,
     openai_max_workspace_instruction_chars: usize = default_openai_max_workspace_instruction_chars,
 };
 
@@ -84,6 +89,14 @@ pub fn loadWithContext(
             default_telegram_user_inactivity_reset_seconds,
             min_telegram_user_inactivity_reset_seconds,
             max_telegram_user_inactivity_reset_seconds,
+        ),
+        .telegram_inbound_worker_count = try readBoundedUsize(
+            allocator,
+            context,
+            config_keys.telegram_inbound_worker_count,
+            default_telegram_inbound_worker_count,
+            min_telegram_inbound_worker_count,
+            max_telegram_inbound_worker_count,
         ),
         .openai_max_workspace_instruction_chars = try readBoundedUsize(
             allocator,
@@ -164,6 +177,7 @@ test "loadWithContext returns defaults when keys are missing" {
     try std.testing.expectEqual(openai_client.default_max_tool_result_chars, limits.openai.max_tool_result_chars);
     try std.testing.expectEqual(default_telegram_max_conversation_messages, limits.telegram_max_conversation_messages);
     try std.testing.expectEqual(default_telegram_user_inactivity_reset_seconds, limits.telegram_user_inactivity_reset_seconds);
+    try std.testing.expectEqual(default_telegram_inbound_worker_count, limits.telegram_inbound_worker_count);
     try std.testing.expectEqual(default_openai_max_workspace_instruction_chars, limits.openai_max_workspace_instruction_chars);
 }
 
@@ -182,6 +196,7 @@ test "loadWithContext applies valid numeric overrides" {
     try config_store.setValueAtPath(std.testing.allocator, config_path, config_keys.openai_max_tool_result_chars, "6000");
     try config_store.setValueAtPath(std.testing.allocator, config_path, config_keys.telegram_max_conversation_messages, "30");
     try config_store.setValueAtPath(std.testing.allocator, config_path, config_keys.telegram_user_inactivity_reset_seconds, "3600");
+    try config_store.setValueAtPath(std.testing.allocator, config_path, config_keys.telegram_inbound_worker_count, "6");
     try config_store.setValueAtPath(std.testing.allocator, config_path, config_keys.openai_max_workspace_instruction_chars, "65536");
 
     const limits = try loadWithContext(std.testing.allocator, .{
@@ -193,6 +208,7 @@ test "loadWithContext applies valid numeric overrides" {
     try std.testing.expectEqual(@as(usize, 6000), limits.openai.max_tool_result_chars);
     try std.testing.expectEqual(@as(usize, 30), limits.telegram_max_conversation_messages);
     try std.testing.expectEqual(@as(i64, 3600), limits.telegram_user_inactivity_reset_seconds);
+    try std.testing.expectEqual(@as(usize, 6), limits.telegram_inbound_worker_count);
     try std.testing.expectEqual(@as(usize, 65536), limits.openai_max_workspace_instruction_chars);
 }
 
@@ -211,6 +227,7 @@ test "loadWithContext falls back when values are invalid or out of range" {
     try config_store.setValueAtPath(std.testing.allocator, config_path, config_keys.openai_max_tool_result_chars, "999999999");
     try config_store.setValueAtPath(std.testing.allocator, config_path, config_keys.telegram_max_conversation_messages, "1");
     try config_store.setValueAtPath(std.testing.allocator, config_path, config_keys.telegram_user_inactivity_reset_seconds, "30");
+    try config_store.setValueAtPath(std.testing.allocator, config_path, config_keys.telegram_inbound_worker_count, "0");
     try config_store.setValueAtPath(std.testing.allocator, config_path, config_keys.openai_max_workspace_instruction_chars, "999999999");
 
     const limits = try loadWithContext(std.testing.allocator, .{
@@ -222,5 +239,6 @@ test "loadWithContext falls back when values are invalid or out of range" {
     try std.testing.expectEqual(openai_client.default_max_tool_result_chars, limits.openai.max_tool_result_chars);
     try std.testing.expectEqual(default_telegram_max_conversation_messages, limits.telegram_max_conversation_messages);
     try std.testing.expectEqual(default_telegram_user_inactivity_reset_seconds, limits.telegram_user_inactivity_reset_seconds);
+    try std.testing.expectEqual(default_telegram_inbound_worker_count, limits.telegram_inbound_worker_count);
     try std.testing.expectEqual(default_openai_max_workspace_instruction_chars, limits.openai_max_workspace_instruction_chars);
 }

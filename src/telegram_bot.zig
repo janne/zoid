@@ -132,6 +132,239 @@ const TypingNotifier = struct {
     }
 };
 
+const ConversationState = struct {
+    mutex: std.Thread.Mutex = .{},
+    conversations: ConversationStore,
+    state_path: []const u8,
+    limits: runtime_limits.Limits,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        state_path: []const u8,
+        limits: runtime_limits.Limits,
+    ) ConversationState {
+        return .{
+            .conversations = ConversationStore.init(allocator),
+            .state_path = state_path,
+            .limits = limits,
+        };
+    }
+
+    fn deinit(self: *ConversationState, allocator: std.mem.Allocator) void {
+        deinitConversationStore(allocator, &self.conversations);
+    }
+};
+
+const InboundMessageQueue = struct {
+    mutex: std.Thread.Mutex = .{},
+    condition: std.Thread.Condition = .{},
+    pending_by_key: std.AutoHashMap(ConversationKey, std.ArrayList(InboundMessage)),
+    active_keys: std.AutoHashMap(ConversationKey, void),
+    shutting_down: bool = false,
+
+    fn init(allocator: std.mem.Allocator) InboundMessageQueue {
+        return .{
+            .pending_by_key = std.AutoHashMap(ConversationKey, std.ArrayList(InboundMessage)).init(allocator),
+            .active_keys = std.AutoHashMap(ConversationKey, void).init(allocator),
+        };
+    }
+
+    fn deinit(self: *InboundMessageQueue, allocator: std.mem.Allocator) void {
+        var iterator = self.pending_by_key.iterator();
+        while (iterator.next()) |entry| {
+            for (entry.value_ptr.items) |message| allocator.free(message.text);
+            entry.value_ptr.deinit(allocator);
+        }
+        self.pending_by_key.deinit();
+        self.active_keys.deinit();
+    }
+
+    fn enqueue(self: *InboundMessageQueue, allocator: std.mem.Allocator, message: InboundMessage) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const key: ConversationKey = .{
+            .chat_id = message.chat_id,
+            .thread_id = message.thread_id,
+        };
+        const entry = try self.pending_by_key.getOrPut(key);
+        if (!entry.found_existing) {
+            entry.value_ptr.* = .empty;
+        }
+        errdefer if (!entry.found_existing and entry.value_ptr.items.len == 0) {
+            _ = self.pending_by_key.remove(key);
+        };
+        try entry.value_ptr.append(allocator, message);
+        self.condition.signal();
+    }
+
+    fn take(self: *InboundMessageQueue) !?InboundMessage {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        while (true) {
+            if (self.shutting_down) return null;
+
+            var iterator = self.pending_by_key.iterator();
+            while (iterator.next()) |entry| {
+                if (entry.value_ptr.items.len == 0) continue;
+                const key = entry.key_ptr.*;
+                if (self.active_keys.contains(key)) continue;
+                try self.active_keys.put(key, {});
+                return entry.value_ptr.orderedRemove(0);
+            }
+
+            self.condition.wait(&self.mutex);
+        }
+    }
+
+    fn complete(self: *InboundMessageQueue, allocator: std.mem.Allocator, key: ConversationKey) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        _ = self.active_keys.remove(key);
+        if (self.pending_by_key.getPtr(key)) |pending| {
+            if (pending.items.len == 0) {
+                pending.deinit(allocator);
+                _ = self.pending_by_key.remove(key);
+            }
+        }
+        self.condition.signal();
+    }
+
+    fn shutdown(self: *InboundMessageQueue) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.shutting_down = true;
+        self.condition.broadcast();
+    }
+};
+
+const InboundMessageWorkerPool = struct {
+    allocator: std.mem.Allocator,
+    conversation_state: *ConversationState,
+    workspace_root: []const u8,
+    api_key: []const u8,
+    model: []const u8,
+    bot_token: []const u8,
+    workspace_instruction: ?[]const u8,
+    queue: InboundMessageQueue,
+    workers: ?[]std.Thread = null,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        conversation_state: *ConversationState,
+        workspace_root: []const u8,
+        api_key: []const u8,
+        model: []const u8,
+        bot_token: []const u8,
+        workspace_instruction: ?[]const u8,
+    ) InboundMessageWorkerPool {
+        return .{
+            .allocator = allocator,
+            .conversation_state = conversation_state,
+            .workspace_root = workspace_root,
+            .api_key = api_key,
+            .model = model,
+            .bot_token = bot_token,
+            .workspace_instruction = workspace_instruction,
+            .queue = InboundMessageQueue.init(allocator),
+        };
+    }
+
+    fn deinit(self: *InboundMessageWorkerPool) void {
+        self.queue.shutdown();
+        if (self.workers) |workers| {
+            for (workers) |worker| worker.join();
+            self.allocator.free(workers);
+            self.workers = null;
+        }
+        self.queue.deinit(self.allocator);
+    }
+
+    fn start(self: *InboundMessageWorkerPool, worker_count: usize) !void {
+        if (self.workers != null) return;
+        const workers = try self.allocator.alloc(std.Thread, worker_count);
+        errdefer self.allocator.free(workers);
+
+        var started: usize = 0;
+        errdefer {
+            self.queue.shutdown();
+            while (started > 0) {
+                started -= 1;
+                workers[started].join();
+            }
+        }
+
+        for (workers) |*worker| {
+            worker.* = try std.Thread.spawn(.{}, runWorker, .{self});
+            started += 1;
+        }
+
+        self.workers = workers;
+    }
+
+    fn enqueue(self: *InboundMessageWorkerPool, message: InboundMessage) !void {
+        const text = try self.allocator.dupe(u8, message.text);
+        errdefer self.allocator.free(text);
+
+        try self.queue.enqueue(self.allocator, .{
+            .chat_id = message.chat_id,
+            .thread_id = message.thread_id,
+            .chat_kind = message.chat_kind,
+            .text = text,
+        });
+    }
+
+    fn runWorker(self: *InboundMessageWorkerPool) void {
+        while (true) {
+            const message = self.queue.take() catch |err| {
+                std.debug.print("Telegram inbound queue take failed: {s}\n", .{@errorName(err)});
+                std.Thread.sleep(50 * std.time.ns_per_ms);
+                continue;
+            } orelse break;
+            defer self.allocator.free(message.text);
+
+            const key: ConversationKey = .{
+                .chat_id = message.chat_id,
+                .thread_id = message.thread_id,
+            };
+            defer self.queue.complete(self.allocator, key);
+
+            processInboundMessage(
+                self.allocator,
+                self.conversation_state,
+                self.workspace_root,
+                self.api_key,
+                self.model,
+                self.bot_token,
+                message.chat_id,
+                message.thread_id,
+                message.text,
+                self.workspace_instruction,
+            ) catch |err| {
+                std.debug.print(
+                    "Failed to process Telegram message for chat {d}: {s}\n",
+                    .{ message.chat_id, @errorName(err) },
+                );
+                sendMessageInChunks(
+                    self.allocator,
+                    self.bot_token,
+                    message.chat_id,
+                    message.thread_id,
+                    "Failed to process your request. Please try again.",
+                ) catch |send_err| {
+                    std.debug.print(
+                        "Failed to send Telegram error response for chat {d}: {s}\n",
+                        .{ message.chat_id, @errorName(send_err) },
+                    );
+                };
+            };
+        }
+    }
+};
+
 pub fn runLongPolling(allocator: std.mem.Allocator, settings: Settings) !void {
     if (settings.bot_token.len == 0) return error.EmptyTelegramBotToken;
     if (settings.openai_api_key.len == 0) return error.EmptyApiKey;
@@ -147,14 +380,18 @@ pub fn runLongPolling(allocator: std.mem.Allocator, settings: Settings) !void {
     defer allocator.free(workspace_root);
 
     std.debug.print("Starting Telegram long-polling loop.\n", .{});
+    std.debug.print(
+        "Starting Telegram inbound worker pool with {d} workers.\n",
+        .{settings.limits.telegram_inbound_worker_count},
+    );
 
-    var conversations = ConversationStore.init(allocator);
-    defer deinitConversationStore(allocator, &conversations);
+    var conversation_state = ConversationState.init(allocator, runtime_paths.state_path, settings.limits);
+    defer conversation_state.deinit(allocator);
 
     loadConversationStoreAtPath(
         allocator,
         runtime_paths.state_path,
-        &conversations,
+        &conversation_state.conversations,
         settings.limits.telegram_max_conversation_messages,
     ) catch |err| {
         std.debug.print(
@@ -162,6 +399,18 @@ pub fn runLongPolling(allocator: std.mem.Allocator, settings: Settings) !void {
             .{@errorName(err)},
         );
     };
+
+    var inbound_workers = InboundMessageWorkerPool.init(
+        allocator,
+        &conversation_state,
+        workspace_root,
+        settings.openai_api_key,
+        settings.openai_model,
+        settings.bot_token,
+        settings.workspace_instruction,
+    );
+    defer inbound_workers.deinit();
+    try inbound_workers.start(settings.limits.telegram_inbound_worker_count);
 
     var next_offset: i64 = 0;
     while (true) {
@@ -214,22 +463,9 @@ pub fn runLongPolling(allocator: std.mem.Allocator, settings: Settings) !void {
                 };
             }
 
-            processInboundMessage(
-                allocator,
-                &conversations,
-                runtime_paths.state_path,
-                workspace_root,
-                settings.openai_api_key,
-                settings.openai_model,
-                settings.bot_token,
-                settings.limits,
-                message.chat_id,
-                message.thread_id,
-                message.text,
-                settings.workspace_instruction,
-            ) catch |err| {
+            inbound_workers.enqueue(message) catch |err| {
                 std.debug.print(
-                    "Failed to process Telegram message for chat {d}: {s}\n",
+                    "Failed to enqueue Telegram message for chat {d}: {s}\n",
                     .{ message.chat_id, @errorName(err) },
                 );
                 sendMessageInChunks(
@@ -251,13 +487,11 @@ pub fn runLongPolling(allocator: std.mem.Allocator, settings: Settings) !void {
 
 fn processInboundMessage(
     allocator: std.mem.Allocator,
-    conversations: *ConversationStore,
-    state_path: []const u8,
+    conversation_state: *ConversationState,
     workspace_root: []const u8,
     api_key: []const u8,
     model: []const u8,
     bot_token: []const u8,
-    limits: runtime_limits.Limits,
     chat_id: i64,
     thread_id: ?i64,
     raw_text: []const u8,
@@ -281,12 +515,23 @@ fn processInboundMessage(
     };
 
     if (isResetCommand(prompt)) {
-        const had_conversation = clearConversationForKey(allocator, conversations, conversation_key);
+        var had_conversation = false;
+        conversation_state.mutex.lock();
+        had_conversation = clearConversationForKey(
+            allocator,
+            &conversation_state.conversations,
+            conversation_key,
+        );
         if (had_conversation) {
-            persistConversationStoreAtPath(allocator, state_path, conversations) catch |err| {
+            persistConversationStoreAtPath(
+                allocator,
+                conversation_state.state_path,
+                &conversation_state.conversations,
+            ) catch |err| {
                 std.debug.print("Failed to persist Telegram conversation state: {s}\n", .{@errorName(err)});
             };
         }
+        conversation_state.mutex.unlock();
         try sendMessageInChunks(
             allocator,
             bot_token,
@@ -299,13 +544,11 @@ fn processInboundMessage(
 
     try processPromptForChat(
         allocator,
-        conversations,
-        state_path,
+        conversation_state,
         workspace_root,
         api_key,
         model,
         bot_token,
-        limits,
         conversation_key,
         prompt,
         workspace_instruction,
@@ -349,24 +592,56 @@ fn isResetCommand(prompt: []const u8) bool {
     return std.mem.eql(u8, prompt, "/new") or std.mem.eql(u8, prompt, "/reset");
 }
 
-fn processPromptForChat(
+fn cloneMessageSnapshot(
     allocator: std.mem.Allocator,
-    conversations: *ConversationStore,
-    state_path: []const u8,
-    workspace_root: []const u8,
-    api_key: []const u8,
-    model: []const u8,
-    bot_token: []const u8,
-    limits: runtime_limits.Limits,
+    messages: []const openai_client.Message,
+) ![]openai_client.Message {
+    const snapshot = try allocator.alloc(openai_client.Message, messages.len);
+    errdefer allocator.free(snapshot);
+
+    var copied: usize = 0;
+    errdefer {
+        for (snapshot[0..copied]) |message| allocator.free(message.content);
+    }
+
+    for (messages, 0..) |message, index| {
+        snapshot[index] = .{
+            .role = message.role,
+            .content = try allocator.dupe(u8, message.content),
+        };
+        copied += 1;
+    }
+    return snapshot;
+}
+
+fn freeMessageSnapshot(allocator: std.mem.Allocator, snapshot: []openai_client.Message) void {
+    for (snapshot) |message| allocator.free(message.content);
+    allocator.free(snapshot);
+}
+
+fn stageConversationPrompt(
+    allocator: std.mem.Allocator,
+    conversation_state: *ConversationState,
     key: ConversationKey,
     prompt: []const u8,
-    workspace_instruction: ?[]const u8,
-) !void {
+) ![]openai_client.Message {
     const now = std.time.timestamp();
-    if (conversations.getPtr(key)) |existing| {
-        if (shouldResetConversationForInactivity(existing, now, limits.telegram_user_inactivity_reset_seconds)) {
-            _ = clearConversationForKey(allocator, conversations, key);
-            persistConversationStoreAtPath(allocator, state_path, conversations) catch |err| {
+
+    conversation_state.mutex.lock();
+    defer conversation_state.mutex.unlock();
+
+    if (conversation_state.conversations.getPtr(key)) |existing| {
+        if (shouldResetConversationForInactivity(
+            existing,
+            now,
+            conversation_state.limits.telegram_user_inactivity_reset_seconds,
+        )) {
+            _ = clearConversationForKey(allocator, &conversation_state.conversations, key);
+            persistConversationStoreAtPath(
+                allocator,
+                conversation_state.state_path,
+                &conversation_state.conversations,
+            ) catch |err| {
                 std.debug.print(
                     "Failed to persist Telegram conversation state after inactivity reset: {s}\n",
                     .{@errorName(err)},
@@ -375,16 +650,72 @@ fn processPromptForChat(
         }
     }
 
-    const conversation = try getOrCreateConversation(conversations, key);
+    const conversation = try getOrCreateConversation(&conversation_state.conversations, key);
     conversation.last_user_message_at = now;
     try conversation.appendMessage(allocator, .user, prompt);
 
-    var conversation_turn_committed = false;
-    errdefer {
-        if (!conversation_turn_committed) {
-            conversation.popLastMessage(allocator);
-        }
-    }
+    return cloneMessageSnapshot(allocator, conversation.messages.items) catch |err| {
+        conversation.popLastMessage(allocator);
+        return err;
+    };
+}
+
+fn rollbackConversationPrompt(
+    allocator: std.mem.Allocator,
+    conversation_state: *ConversationState,
+    key: ConversationKey,
+) void {
+    conversation_state.mutex.lock();
+    defer conversation_state.mutex.unlock();
+
+    const conversation = conversation_state.conversations.getPtr(key) orelse return;
+    conversation.popLastMessage(allocator);
+    persistConversationStoreAtPath(
+        allocator,
+        conversation_state.state_path,
+        &conversation_state.conversations,
+    ) catch |err| {
+        std.debug.print("Failed to persist Telegram conversation state: {s}\n", .{@errorName(err)});
+    };
+}
+
+fn commitConversationReply(
+    allocator: std.mem.Allocator,
+    conversation_state: *ConversationState,
+    key: ConversationKey,
+    reply: []const u8,
+) !void {
+    conversation_state.mutex.lock();
+    defer conversation_state.mutex.unlock();
+
+    const conversation = conversation_state.conversations.getPtr(key) orelse return error.MissingConversation;
+    try conversation.appendMessage(allocator, .assistant, reply);
+    enforceConversationLimit(conversation, allocator, conversation_state.limits.telegram_max_conversation_messages);
+    persistConversationStoreAtPath(
+        allocator,
+        conversation_state.state_path,
+        &conversation_state.conversations,
+    ) catch |err| {
+        std.debug.print("Failed to persist Telegram conversation state: {s}\n", .{@errorName(err)});
+    };
+}
+
+fn processPromptForChat(
+    allocator: std.mem.Allocator,
+    conversation_state: *ConversationState,
+    workspace_root: []const u8,
+    api_key: []const u8,
+    model: []const u8,
+    bot_token: []const u8,
+    key: ConversationKey,
+    prompt: []const u8,
+    workspace_instruction: ?[]const u8,
+) !void {
+    const request_messages = try stageConversationPrompt(allocator, conversation_state, key, prompt);
+    defer freeMessageSnapshot(allocator, request_messages);
+
+    var should_rollback_prompt = true;
+    defer if (should_rollback_prompt) rollbackConversationPrompt(allocator, conversation_state, key);
 
     var typing_notifier: TypingNotifier = .{};
     typing_notifier.start(bot_token, key.chat_id, key.thread_id) catch |err| {
@@ -399,19 +730,19 @@ fn processPromptForChat(
         allocator,
         api_key,
         model,
-        conversation.messages.items,
+        request_messages,
         .{
             .request_chat_id = key.chat_id,
             .workspace_instruction = workspace_instruction,
-            .limits = limits.openai,
+            .limits = conversation_state.limits.openai,
         },
     );
     defer reply.deinit(allocator);
 
     const trimmed_reply = std.mem.trim(u8, reply.content, " \t\r\n");
     if (trimmed_reply.len == 0 and reply.attachments.len == 0) {
-        conversation.popLastMessage(allocator);
-        conversation_turn_committed = true;
+        rollbackConversationPrompt(allocator, conversation_state, key);
+        should_rollback_prompt = false;
         try sendMessageInChunks(
             allocator,
             bot_token,
@@ -433,13 +764,8 @@ fn processPromptForChat(
     );
 
     const conversation_reply = if (trimmed_reply.len > 0) trimmed_reply else "[Attachment delivered]";
-    try conversation.appendMessage(allocator, .assistant, conversation_reply);
-    enforceConversationLimit(conversation, allocator, limits.telegram_max_conversation_messages);
-    conversation_turn_committed = true;
-
-    persistConversationStoreAtPath(allocator, state_path, conversations) catch |err| {
-        std.debug.print("Failed to persist Telegram conversation state: {s}\n", .{@errorName(err)});
-    };
+    try commitConversationReply(allocator, conversation_state, key, conversation_reply);
+    should_rollback_prompt = false;
 }
 
 fn shouldResetConversationForInactivity(
@@ -1726,6 +2052,81 @@ test "parsePollBatch extracts text or caption and preserves thread ids" {
     try std.testing.expectEqual(@as(?i64, null), batch.messages[1].thread_id);
     try std.testing.expectEqual(InboundChatKind.group_like, batch.messages[1].chat_kind);
     try std.testing.expectEqualStrings("hej", batch.messages[1].text);
+}
+
+test "inbound message queue serializes per conversation key" {
+    var queue = InboundMessageQueue.init(std.testing.allocator);
+    defer queue.deinit(std.testing.allocator);
+
+    {
+        const text = try std.testing.allocator.dupe(u8, "a1");
+        queue.enqueue(std.testing.allocator, .{
+            .chat_id = 1,
+            .thread_id = 10,
+            .chat_kind = .group_like,
+            .text = text,
+        }) catch |err| {
+            std.testing.allocator.free(text);
+            return err;
+        };
+    }
+    {
+        const text = try std.testing.allocator.dupe(u8, "a2");
+        queue.enqueue(std.testing.allocator, .{
+            .chat_id = 1,
+            .thread_id = 10,
+            .chat_kind = .group_like,
+            .text = text,
+        }) catch |err| {
+            std.testing.allocator.free(text);
+            return err;
+        };
+    }
+
+    const first = (try queue.take()).?;
+    defer std.testing.allocator.free(first.text);
+    try std.testing.expectEqual(@as(i64, 1), first.chat_id);
+    try std.testing.expectEqual(@as(?i64, 10), first.thread_id);
+    try std.testing.expectEqualStrings("a1", first.text);
+
+    {
+        const text = try std.testing.allocator.dupe(u8, "b1");
+        queue.enqueue(std.testing.allocator, .{
+            .chat_id = 2,
+            .thread_id = 20,
+            .chat_kind = .group_like,
+            .text = text,
+        }) catch |err| {
+            std.testing.allocator.free(text);
+            return err;
+        };
+    }
+
+    const second = (try queue.take()).?;
+    defer std.testing.allocator.free(second.text);
+    try std.testing.expectEqual(@as(i64, 2), second.chat_id);
+    try std.testing.expectEqual(@as(?i64, 20), second.thread_id);
+    try std.testing.expectEqualStrings("b1", second.text);
+
+    queue.complete(std.testing.allocator, .{ .chat_id = 2, .thread_id = 20 });
+    queue.complete(std.testing.allocator, .{ .chat_id = 1, .thread_id = 10 });
+
+    const third = (try queue.take()).?;
+    defer std.testing.allocator.free(third.text);
+    try std.testing.expectEqual(@as(i64, 1), third.chat_id);
+    try std.testing.expectEqual(@as(?i64, 10), third.thread_id);
+    try std.testing.expectEqualStrings("a2", third.text);
+
+    queue.complete(std.testing.allocator, .{ .chat_id = 1, .thread_id = 10 });
+}
+
+test "inbound message queue returns null after shutdown" {
+    var queue = InboundMessageQueue.init(std.testing.allocator);
+    defer queue.deinit(std.testing.allocator);
+
+    queue.shutdown();
+    const next = try queue.take();
+    try std.testing.expect(next == null);
 }
 
 test "nextMarkdownChunkBoundary keeps utf-8 boundaries" {

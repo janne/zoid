@@ -13,17 +13,25 @@
 
 Use `zoid config` (CLI), the `config` tool, or Lua `zoid.config():set(...)` to override runtime defaults.
 
-Defaults:
+### Key-by-Key Reference
 
-- `OPENAI_MAX_INPUT_TOKENS=180000`
-- `OPENAI_MAX_MESSAGE_CHARS=12000`
-- `OPENAI_MAX_TOOL_ROUNDS=16`
-- `OPENAI_MAX_TOOL_RESULT_CHARS=12000`
-- `OPENAI_MAX_WORKSPACE_INSTRUCTION_CHARS=262144`
-- `TELEGRAM_MAX_CONVERSATION_MESSAGES=20`
-- `TELEGRAM_USER_INACTIVITY_RESET_SECONDS=28800`
+| Key | Purpose | Default | Min | Max | Unit / Notes |
+| --- | --- | ---: | ---: | ---: | --- |
+| `OPENAI_MAX_INPUT_TOKENS` | Request token budget before old non-system messages are trimmed. | `180000` | `1000` | `500000` | Tokens (estimated). |
+| `OPENAI_MAX_MESSAGE_CHARS` | Max chars kept per message when building OpenAI requests. | `12000` | `256` | `200000` | Characters. |
+| `OPENAI_MAX_TOOL_ROUNDS` | Max assistant/tool loop iterations before forcing a final non-tool response. | `16` | `1` | `64` | Iterations. |
+| `OPENAI_MAX_TOOL_RESULT_CHARS` | Max chars retained from each tool result before truncation. | `12000` | `256` | `200000` | Characters. |
+| `OPENAI_MAX_WORKSPACE_INSTRUCTION_CHARS` | Max chars loaded from `ZOID.md` into system instructions. | `262144` | `1024` | `1048576` | Characters. |
+| `TELEGRAM_MAX_CONVERSATION_MESSAGES` | Per-conversation history cap (`chat_id` + optional `message_thread_id`). | `20` | `2` | `500` | Messages. |
+| `TELEGRAM_USER_INACTIVITY_RESET_SECONDS` | Auto-reset conversation state after inactivity. | `28800` | `60` | `604800` | Seconds (`8h` default, max `7d`). |
+| `TELEGRAM_INBOUND_WORKER_COUNT` | Number of inbound Telegram workers in `zoid serve`. | `4` | `1` | `32` | Workers. Higher = more parallel topics. |
 
-These values control how much context is sent to OpenAI and how long Telegram chat history is retained.
+### Behavior Notes
+
+- `zoid serve` reads these settings on startup; restart the service to apply updated values.
+- Values outside allowed ranges (or non-numeric values) are ignored and fall back to defaults.
+- Concurrency is still serialized per conversation key (`chat_id` + optional `message_thread_id`) even when `TELEGRAM_INBOUND_WORKER_COUNT > 1`.
+- Increasing `TELEGRAM_INBOUND_WORKER_COUNT` can improve responsiveness across topics, but may increase CPU/memory usage and upstream API rate-limit pressure.
 
 Examples:
 
@@ -32,6 +40,7 @@ CLI:
 ```sh
 zoid config set OPENAI_MAX_INPUT_TOKENS 160000
 zoid config set TELEGRAM_MAX_CONVERSATION_MESSAGES 30
+zoid config set TELEGRAM_INBOUND_WORKER_COUNT 8
 ```
 
 Tool call (agent mode):
@@ -45,8 +54,6 @@ Lua:
 ```lua
 zoid.config():set("OPENAI_MAX_TOOL_RESULT_CHARS", "6000")
 ```
-
-`zoid serve` reads these settings on startup; restart the service to apply updated values.
 
 ## Personality
 
