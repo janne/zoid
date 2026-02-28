@@ -73,6 +73,10 @@ When replying through Telegram (`zoid serve`), format output for Bot API `Markdo
 - Do not rely on unsupported markdown constructs such as `#` headings, tables, task lists, or raw HTML.
 - If you need heading-like emphasis, write a bold line (for example `*Section title*`) instead of `# Section title`.
 
+## Workspace access
+- You can always inspect the workspace (read/list/grep files and config) without asking for permission first. Just do it.
+- If you need to temporarily create a file, prefer to use /tmp (in the workspace). Create it if needed. And clean up any temp files when done.
+
 ## Memory
 
 - Keep `MEMORY.md` in the workspace up to date with important lessons and learnings.

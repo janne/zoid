@@ -1,7 +1,7 @@
--- Fetch "Senaste" headlines from omni.se using browser automation.
+-- Fetch headlines from omni.se using browser automation.
 --
 -- Usage:
---   zoid execute scripts/omni_senaste.lua [count]
+--   zoid execute scripts/omni_latest.lua [count]
 --
 -- Notes:
 -- - Relies on browser support being installed (zoid browser install).
@@ -29,7 +29,7 @@ local res = zoid.browser.automate({
   max_text_chars = 200000,
   actions = {
     { action = "wait_for_timeout", ms = 2500 },
-    { action = "extract_links", selector = "a", max_links = 500 },
+    { action = "extract_links",    selector = "a", max_links = 500 },
 
     -- Extract visible page text; we then pick headline-like lines.
     { action = "extract_page_text" },
