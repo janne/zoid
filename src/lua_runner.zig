@@ -73,6 +73,16 @@ const max_json_decode_depth: usize = 64;
 const timeout_error_token = "__zoid_timeout_seconds__:";
 var json_null_sentinel: u8 = 0;
 
+const rsa_encryption_oid = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01 };
+const rsa_sha256_digest_info_prefix = [_]u8{
+    0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
+    0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
+    0x00, 0x04, 0x20,
+};
+const rsa_max_modulus_bits = 4096;
+const RsaModulus = std.crypto.ff.Modulus(rsa_max_modulus_bits);
+const RsaFe = RsaModulus.Fe;
+
 pub const ToolSandbox = struct {
     workspace_root: []const u8,
     max_read_bytes: usize = default_tool_max_read_bytes,
@@ -145,6 +155,25 @@ const ToolLuaEnvironment = struct {
         for (self.browser_attachments.items) |*attachment| attachment.deinit(self.allocator);
         self.browser_attachments.deinit(self.allocator);
     }
+};
+
+const RsaPrivateKeyMaterial = struct {
+    modulus: []u8,
+    public_exponent: []u8,
+    private_exponent: []u8,
+
+    fn deinit(self: *RsaPrivateKeyMaterial, allocator: std.mem.Allocator) void {
+        allocator.free(self.modulus);
+        allocator.free(self.public_exponent);
+        allocator.free(self.private_exponent);
+        self.* = undefined;
+    }
+};
+
+const RsaPrivateKeySlices = struct {
+    modulus: []const u8,
+    public_exponent: []const u8,
+    private_exponent: []const u8,
 };
 
 const LuaExecutionTimeout = struct {
@@ -1659,6 +1688,15 @@ fn writeLuaValueAsJson(
                 },
             }
         },
+        c.LUA_TLIGHTUSERDATA => {
+            const pointer = c.lua_touserdata(state, value_abs_index) orelse return error.InvalidToolArguments;
+            const json_null_ptr: *anyopaque = @ptrCast(&json_null_sentinel);
+            if (pointer == json_null_ptr) {
+                try writer.writeAll("null");
+            } else {
+                return error.InvalidToolArguments;
+            }
+        },
         else => return error.InvalidToolArguments,
     }
 }
@@ -1825,14 +1863,364 @@ fn luaZoidJsonDecode(lua_state: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
+fn luaZoidJsonEncode(lua_state: ?*c.lua_State) callconv(.c) c_int {
+    const state = lua_state orelse return 0;
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace context unavailable", .{});
+
+    if (c.lua_gettop(state) != 1) {
+        return pushLuaErrorMessage(state, "zoid.json.encode requires exactly one argument", .{});
+    }
+
+    const encoded = serializeLuaValueToJsonAlloc(env.allocator, state, 1) catch |err| {
+        return pushLuaErrorMessage(state, "zoid.json.encode failed: {s}", .{@errorName(err)});
+    };
+    defer env.allocator.free(encoded);
+
+    _ = c.lua_pushlstring(state, encoded.ptr, encoded.len);
+    return 1;
+}
+
 fn luaZoidJson(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
 
     c.lua_newtable(state);
     c.lua_pushcclosure(state, luaZoidJsonDecode, 0);
     c.lua_setfield(state, -2, "decode");
+    c.lua_pushcclosure(state, luaZoidJsonEncode, 0);
+    c.lua_setfield(state, -2, "encode");
     pushJsonNull(state);
     c.lua_setfield(state, -2, "null");
+    return 1;
+}
+
+fn stripLeadingZeroes(bytes: []const u8) []const u8 {
+    var index: usize = 0;
+    while (index + 1 < bytes.len and bytes[index] == 0) : (index += 1) {}
+    return bytes[index..];
+}
+
+fn parseDerElementAt(bytes: []const u8, index: usize) !std.crypto.Certificate.der.Element {
+    if (index >= bytes.len) return error.InvalidPrivateKey;
+    const element = std.crypto.Certificate.der.Element.parse(bytes, @intCast(index)) catch return error.InvalidPrivateKey;
+    if (element.slice.start > element.slice.end or element.slice.end > bytes.len) return error.InvalidPrivateKey;
+    return element;
+}
+
+fn parseDerPositiveInteger(bytes: []const u8, element: std.crypto.Certificate.der.Element) ![]const u8 {
+    if (element.identifier.tag != .integer) return error.InvalidPrivateKey;
+    if (element.slice.start >= element.slice.end) return error.InvalidPrivateKey;
+    const integer_bytes = stripLeadingZeroes(bytes[element.slice.start..element.slice.end]);
+    if (integer_bytes.len == 0) return error.InvalidPrivateKey;
+
+    var all_zero = true;
+    for (integer_bytes) |byte| {
+        if (byte != 0) {
+            all_zero = false;
+            break;
+        }
+    }
+    if (all_zero) return error.InvalidPrivateKey;
+    return integer_bytes;
+}
+
+fn decodePemBlockAlloc(
+    allocator: std.mem.Allocator,
+    pem_text: []const u8,
+    begin_marker: []const u8,
+    end_marker: []const u8,
+) ![]u8 {
+    const begin = std.mem.indexOf(u8, pem_text, begin_marker) orelse return error.PemBlockNotFound;
+    const payload_start = begin + begin_marker.len;
+    const end = std.mem.indexOfPos(u8, pem_text, payload_start, end_marker) orelse return error.InvalidPrivateKeyPem;
+    const payload = pem_text[payload_start..end];
+
+    var compact = std.ArrayList(u8).empty;
+    defer compact.deinit(allocator);
+    for (payload) |char| {
+        if (std.ascii.isWhitespace(char)) continue;
+        try compact.append(allocator, char);
+    }
+    if (compact.items.len == 0) return error.InvalidPrivateKeyPem;
+
+    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(compact.items) catch return error.InvalidPrivateKeyPem;
+    const decoded = try allocator.alloc(u8, decoded_len);
+    errdefer allocator.free(decoded);
+    std.base64.standard.Decoder.decode(decoded, compact.items) catch return error.InvalidPrivateKeyPem;
+    return decoded;
+}
+
+fn parseRsaPrivateKeyDerPkcs1(der_bytes: []const u8) !RsaPrivateKeySlices {
+    const root = try parseDerElementAt(der_bytes, 0);
+    if (root.identifier.tag != .sequence) return error.InvalidPrivateKey;
+
+    var index: usize = root.slice.start;
+
+    const version = try parseDerElementAt(der_bytes, index);
+    if (version.identifier.tag != .integer) return error.InvalidPrivateKey;
+    index = version.slice.end;
+
+    const modulus_element = try parseDerElementAt(der_bytes, index);
+    const modulus = try parseDerPositiveInteger(der_bytes, modulus_element);
+    index = modulus_element.slice.end;
+
+    const public_exponent_element = try parseDerElementAt(der_bytes, index);
+    const public_exponent = try parseDerPositiveInteger(der_bytes, public_exponent_element);
+    index = public_exponent_element.slice.end;
+
+    const private_exponent_element = try parseDerElementAt(der_bytes, index);
+    const private_exponent = try parseDerPositiveInteger(der_bytes, private_exponent_element);
+
+    return .{
+        .modulus = modulus,
+        .public_exponent = public_exponent,
+        .private_exponent = private_exponent,
+    };
+}
+
+fn parseRsaPrivateKeyDerPkcs8(der_bytes: []const u8) !RsaPrivateKeySlices {
+    const root = try parseDerElementAt(der_bytes, 0);
+    if (root.identifier.tag != .sequence) return error.InvalidPrivateKey;
+
+    var index: usize = root.slice.start;
+
+    const version = try parseDerElementAt(der_bytes, index);
+    if (version.identifier.tag != .integer) return error.InvalidPrivateKey;
+    index = version.slice.end;
+
+    const algorithm = try parseDerElementAt(der_bytes, index);
+    if (algorithm.identifier.tag != .sequence) return error.InvalidPrivateKey;
+    index = algorithm.slice.end;
+
+    const algorithm_oid = try parseDerElementAt(der_bytes, algorithm.slice.start);
+    if (algorithm_oid.identifier.tag != .object_identifier) return error.InvalidPrivateKey;
+    const oid_bytes = der_bytes[algorithm_oid.slice.start..algorithm_oid.slice.end];
+    if (!std.mem.eql(u8, oid_bytes, &rsa_encryption_oid)) return error.InvalidPrivateKey;
+
+    const private_key_element = try parseDerElementAt(der_bytes, index);
+    if (private_key_element.identifier.tag != .octetstring) return error.InvalidPrivateKey;
+    const private_key_bytes = der_bytes[private_key_element.slice.start..private_key_element.slice.end];
+    return parseRsaPrivateKeyDerPkcs1(private_key_bytes);
+}
+
+fn parseRsaPrivateKeyMaterialFromPemAlloc(
+    allocator: std.mem.Allocator,
+    pem_text: []const u8,
+) !RsaPrivateKeyMaterial {
+    var decoded_der: ?[]u8 = null;
+
+    decoded_der = decodePemBlockAlloc(
+        allocator,
+        pem_text,
+        "-----BEGIN PRIVATE KEY-----",
+        "-----END PRIVATE KEY-----",
+    ) catch |err| switch (err) {
+        error.PemBlockNotFound => null,
+        else => return err,
+    };
+
+    var key_slices: RsaPrivateKeySlices = undefined;
+    if (decoded_der) |der_bytes| {
+        defer allocator.free(der_bytes);
+        key_slices = try parseRsaPrivateKeyDerPkcs8(der_bytes);
+    } else {
+        const pkcs1_der = try decodePemBlockAlloc(
+            allocator,
+            pem_text,
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "-----END RSA PRIVATE KEY-----",
+        );
+        defer allocator.free(pkcs1_der);
+        key_slices = try parseRsaPrivateKeyDerPkcs1(pkcs1_der);
+    }
+
+    // Validate modulus/public exponent constraints before signing.
+    _ = std.crypto.Certificate.rsa.PublicKey.fromBytes(
+        key_slices.public_exponent,
+        key_slices.modulus,
+    ) catch return error.InvalidPrivateKey;
+
+    const modulus = try allocator.dupe(u8, key_slices.modulus);
+    errdefer allocator.free(modulus);
+    const public_exponent = try allocator.dupe(u8, key_slices.public_exponent);
+    errdefer allocator.free(public_exponent);
+    const private_exponent = try allocator.dupe(u8, key_slices.private_exponent);
+    errdefer allocator.free(private_exponent);
+
+    return .{
+        .modulus = modulus,
+        .public_exponent = public_exponent,
+        .private_exponent = private_exponent,
+    };
+}
+
+fn encodeBase64UrlNoPadAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    const encoded_len = std.base64.url_safe_no_pad.Encoder.calcSize(input.len);
+    const encoded = try allocator.alloc(u8, encoded_len);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(encoded, input);
+    return encoded;
+}
+
+fn buildPkcs1v15Sha256EncodedMessageAlloc(
+    allocator: std.mem.Allocator,
+    message: []const u8,
+    modulus_len: usize,
+) ![]u8 {
+    const digest_len = std.crypto.hash.sha2.Sha256.digest_length;
+    const total_digest_info_len = rsa_sha256_digest_info_prefix.len + digest_len;
+    if (modulus_len < total_digest_info_len + 11) return error.InvalidPrivateKey;
+
+    var digest: [digest_len]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(message, &digest, .{});
+
+    const encoded = try allocator.alloc(u8, modulus_len);
+    const ps_len = modulus_len - total_digest_info_len - 3;
+    encoded[0] = 0x00;
+    encoded[1] = 0x01;
+    @memset(encoded[2 .. 2 + ps_len], 0xff);
+    encoded[2 + ps_len] = 0x00;
+    @memcpy(encoded[3 + ps_len ..][0..rsa_sha256_digest_info_prefix.len], &rsa_sha256_digest_info_prefix);
+    @memcpy(encoded[3 + ps_len + rsa_sha256_digest_info_prefix.len ..][0..digest_len], &digest);
+    return encoded;
+}
+
+fn signRs256Pkcs1v15Alloc(
+    allocator: std.mem.Allocator,
+    message: []const u8,
+    key_material: *const RsaPrivateKeyMaterial,
+) ![]u8 {
+    const modulus = RsaModulus.fromBytes(key_material.modulus, .big) catch return error.InvalidPrivateKey;
+    const encoded_message = try buildPkcs1v15Sha256EncodedMessageAlloc(allocator, message, key_material.modulus.len);
+    defer allocator.free(encoded_message);
+
+    const message_field_element = RsaFe.fromBytes(modulus, encoded_message, .big) catch return error.InvalidPrivateKey;
+    const signature_field_element = modulus.powWithEncodedExponent(
+        message_field_element,
+        key_material.private_exponent,
+        .big,
+    ) catch return error.InvalidPrivateKey;
+
+    const signature = try allocator.alloc(u8, key_material.modulus.len);
+    errdefer allocator.free(signature);
+    signature_field_element.toBytes(signature, .big) catch return error.InvalidPrivateKey;
+    return signature;
+}
+
+const SignatureOutputEncoding = enum {
+    raw,
+    base64,
+    base64url,
+    hex,
+};
+
+fn parseSignatureOutputEncoding(encoding: []const u8) !SignatureOutputEncoding {
+    if (std.mem.eql(u8, encoding, "raw")) return .raw;
+    if (std.mem.eql(u8, encoding, "base64")) return .base64;
+    if (std.mem.eql(u8, encoding, "base64url")) return .base64url;
+    if (std.mem.eql(u8, encoding, "hex")) return .hex;
+    return error.InvalidEncoding;
+}
+
+fn encodeSignatureByEncodingAlloc(
+    allocator: std.mem.Allocator,
+    signature: []const u8,
+    encoding: SignatureOutputEncoding,
+) ![]u8 {
+    switch (encoding) {
+        .raw => return allocator.dupe(u8, signature),
+        .base64 => {
+            const encoded_len = std.base64.standard.Encoder.calcSize(signature.len);
+            const encoded = try allocator.alloc(u8, encoded_len);
+            _ = std.base64.standard.Encoder.encode(encoded, signature);
+            return encoded;
+        },
+        .base64url => return encodeBase64UrlNoPadAlloc(allocator, signature),
+        .hex => {
+            const encoded = try allocator.alloc(u8, signature.len * 2);
+            const alphabet = "0123456789abcdef";
+            for (signature, 0..) |byte, index| {
+                encoded[index * 2] = alphabet[(byte >> 4) & 0x0f];
+                encoded[index * 2 + 1] = alphabet[byte & 0x0f];
+            }
+            return encoded;
+        },
+    }
+}
+
+fn luaZoidCryptoBase64UrlEncode(lua_state: ?*c.lua_State) callconv(.c) c_int {
+    const state = lua_state orelse return 0;
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace context unavailable", .{});
+
+    var input_len: usize = 0;
+    const input_ptr = c.luaL_checklstring(state, 1, &input_len) orelse {
+        return pushLuaErrorMessage(state, "zoid.crypto.base64url_encode requires string input", .{});
+    };
+    const encoded = encodeBase64UrlNoPadAlloc(env.allocator, input_ptr[0..input_len]) catch |err| {
+        return pushLuaErrorMessage(state, "zoid.crypto.base64url_encode failed: {s}", .{@errorName(err)});
+    };
+    defer env.allocator.free(encoded);
+
+    _ = c.lua_pushlstring(state, encoded.ptr, encoded.len);
+    return 1;
+}
+
+fn luaZoidCryptoSignRs256(lua_state: ?*c.lua_State) callconv(.c) c_int {
+    const state = lua_state orelse return 0;
+    const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace context unavailable", .{});
+
+    const nargs = c.lua_gettop(state);
+    if (nargs < 2 or nargs > 3) {
+        return pushLuaErrorMessage(state, "zoid.crypto.sign_rs256 requires private_key_pem, data, and optional encoding", .{});
+    }
+
+    var private_key_len: usize = 0;
+    const private_key_ptr = c.luaL_checklstring(state, 1, &private_key_len) orelse {
+        return pushLuaErrorMessage(state, "zoid.crypto.sign_rs256 requires private_key_pem string", .{});
+    };
+    if (private_key_len == 0) return pushLuaErrorMessage(state, "zoid.crypto.sign_rs256 requires non-empty private_key_pem", .{});
+
+    var data_len: usize = 0;
+    const data_ptr = c.luaL_checklstring(state, 2, &data_len) orelse {
+        return pushLuaErrorMessage(state, "zoid.crypto.sign_rs256 requires data string", .{});
+    };
+
+    var output_encoding: SignatureOutputEncoding = .base64url;
+    if (nargs == 3) {
+        var encoding_len: usize = 0;
+        const encoding_ptr = c.luaL_checklstring(state, 3, &encoding_len) orelse {
+            return pushLuaErrorMessage(state, "zoid.crypto.sign_rs256 optional encoding must be string", .{});
+        };
+        output_encoding = parseSignatureOutputEncoding(encoding_ptr[0..encoding_len]) catch {
+            return pushLuaErrorMessage(state, "zoid.crypto.sign_rs256 encoding must be one of raw, base64, base64url, hex", .{});
+        };
+    }
+
+    var key_material = parseRsaPrivateKeyMaterialFromPemAlloc(env.allocator, private_key_ptr[0..private_key_len]) catch |err| {
+        return pushLuaErrorMessage(state, "zoid.crypto.sign_rs256 failed: {s}", .{@errorName(err)});
+    };
+    defer key_material.deinit(env.allocator);
+
+    const signature = signRs256Pkcs1v15Alloc(env.allocator, data_ptr[0..data_len], &key_material) catch |err| {
+        return pushLuaErrorMessage(state, "zoid.crypto.sign_rs256 failed: {s}", .{@errorName(err)});
+    };
+    defer env.allocator.free(signature);
+
+    const encoded_signature = encodeSignatureByEncodingAlloc(env.allocator, signature, output_encoding) catch |err| {
+        return pushLuaErrorMessage(state, "zoid.crypto.sign_rs256 failed: {s}", .{@errorName(err)});
+    };
+    defer env.allocator.free(encoded_signature);
+
+    _ = c.lua_pushlstring(state, encoded_signature.ptr, encoded_signature.len);
+    return 1;
+}
+
+fn luaZoidCrypto(lua_state: ?*c.lua_State) callconv(.c) c_int {
+    const state = lua_state orelse return 0;
+
+    c.lua_newtable(state);
+    c.lua_pushcclosure(state, luaZoidCryptoBase64UrlEncode, 0);
+    c.lua_setfield(state, -2, "base64url_encode");
+    c.lua_pushcclosure(state, luaZoidCryptoSignRs256, 0);
+    c.lua_setfield(state, -2, "sign_rs256");
     return 1;
 }
 
@@ -2104,6 +2492,8 @@ fn installZoidTable(lua_state: *c.lua_State, sandbox: *ToolLuaEnvironment) void 
     c.lua_setfield(lua_state, -2, "import");
     _ = luaZoidJson(lua_state);
     c.lua_setfield(lua_state, -2, "json");
+    _ = luaZoidCrypto(lua_state);
+    c.lua_setfield(lua_state, -2, "crypto");
     c.lua_pushcclosure(lua_state, luaZoidTime, 0);
     c.lua_setfield(lua_state, -2, "time");
     c.lua_pushcclosure(lua_state, luaZoidDate, 0);
@@ -2123,7 +2513,7 @@ fn setGlobalNil(lua_state: *c.lua_State, name: [*:0]const u8) void {
 fn restrictToolLuaEnvironment(lua_state: *c.lua_State, sandbox: *ToolLuaEnvironment) void {
     installZoidTable(lua_state, sandbox);
 
-    // Remove standard escape hatches; zoid.file(...), zoid.dir(...), zoid.uri(...), zoid.config(), zoid.jobs, zoid.browser.automate(...), zoid.import(...), zoid.json.decode, zoid.time, zoid.date, and zoid.eprint(...) are tool APIs.
+    // Remove standard escape hatches; zoid.file(...), zoid.dir(...), zoid.uri(...), zoid.config(), zoid.jobs, zoid.browser.automate(...), zoid.import(...), zoid.json.decode/encode, zoid.crypto.base64url_encode/sign_rs256, zoid.time, zoid.date, and zoid.eprint(...) are tool APIs.
     setGlobalNil(lua_state, "workspace");
     setGlobalNil(lua_state, "os");
     setGlobalNil(lua_state, "package");
@@ -3002,6 +3392,61 @@ test "executeLuaFileCaptureOutputTool blocks workspace traversal" {
     try std.testing.expect(std.mem.indexOf(u8, output.stderr, "PathNotAllowed") != null);
 }
 
+const test_rsa_private_key_pem =
+    \\-----BEGIN PRIVATE KEY-----
+    \\MIICdwIBADANBgkqhkiG9w0BAQEFAASCAmEwggJdAgEAAoGBAPCOYn3FyViFWDBm
+    \\VpHZKBrYDg//hfxlh6JcvaGqlLmxGtzvWNhnyzIvv3GLT9Vi/h0dsqQkq7ZCCn8L
+    \\FaJRIMk/TFh99+akc81tlIfR+ziCQxDq/Wmv2STphSfAYIgTJqjRHHCuscmSYO8p
+    \\zhfQRv0DFNiVQDND8XevRSWzKxhVAgMBAAECgYABvWXk9vs/0qcSoorZvzJVD176
+    \\qqRzcOCMQhN1CeDNfwRsuKZx2j5T/Jhr39ASAQdJep+CJGnBhbTBunjLlb6g8mcs
+    \\vandCI6EV4/RDiH9vWK/q4GNUDGB9Kja8uGMOXXc4/RpdYHtpOFnFvDCP1mdgJdL
+    \\71JLxkocMdG5GUK1QQJBAPwuxwm8tANnUhqtNp5N2F3rFztRLxXVlG/g2w4gcpI2
+    \\AYnUxyEUAs4++NCOYvx+B7CwTSc7FZhE5RGVxTTA+rkCQQD0Mo3CwderA1rgUeux
+    \\feq9drrmGfawQQ2vNlV65MC0vbItu46XqzJYoXA47PjRsuUCB126lljDgAY7bya2
+    \\sAx9AkEAoU9Gr/rN5xNzGG9N7ar7yO+1F5NRnBTXc00QshOdVdtH1qONkKIdPVJY
+    \\lAdQWBRB1Qqg/4QyxwjiwgHceGcsuQJARI54zAedo65Cch2tnNvr7hsKJ5V8c0kg
+    \\LWOEpgbYryVeg4ZXZu8yKD3SgrjMthqSPnqQ7tRMwT4NAdyXssxEBQJBANgynAp+
+    \\sSUwKv2Rouex+sq7W51RlFgGbkdF64RnQje73rd/BGzL/JQfyHYsDOr5ixJam4ex
+    \\AwMHQlJMjhYp2TA=
+    \\-----END PRIVATE KEY-----
+;
+
+fn verifyRs256Signature(
+    allocator: std.mem.Allocator,
+    message: []const u8,
+    signature: []const u8,
+    key_material: *const RsaPrivateKeyMaterial,
+) !void {
+    if (signature.len != key_material.modulus.len) return error.InvalidSignature;
+
+    const modulus = RsaModulus.fromBytes(key_material.modulus, .big) catch return error.InvalidSignature;
+    const signature_element = RsaFe.fromBytes(modulus, signature, .big) catch return error.InvalidSignature;
+    const decoded_element = modulus.powWithEncodedPublicExponent(
+        signature_element,
+        key_material.public_exponent,
+        .big,
+    ) catch return error.InvalidSignature;
+
+    const expected_encoded = try buildPkcs1v15Sha256EncodedMessageAlloc(allocator, message, key_material.modulus.len);
+    defer allocator.free(expected_encoded);
+
+    const actual_encoded = try allocator.alloc(u8, key_material.modulus.len);
+    defer allocator.free(actual_encoded);
+    decoded_element.toBytes(actual_encoded, .big) catch return error.InvalidSignature;
+
+    if (!std.mem.eql(u8, expected_encoded, actual_encoded)) return error.InvalidSignature;
+}
+
+test "signRs256Pkcs1v15Alloc produces valid RS256 signature" {
+    const message = "header.payload";
+    var key_material = try parseRsaPrivateKeyMaterialFromPemAlloc(std.testing.allocator, test_rsa_private_key_pem);
+    defer key_material.deinit(std.testing.allocator);
+
+    const signature = try signRs256Pkcs1v15Alloc(std.testing.allocator, message, &key_material);
+    defer std.testing.allocator.free(signature);
+    try verifyRs256Signature(std.testing.allocator, message, signature, &key_material);
+}
+
 const TestHttpHeaderExpectation = struct {
     name: []const u8,
     value: []const u8,
@@ -3011,6 +3456,7 @@ const TestHttpExpectation = struct {
     method: []const u8,
     target: []const u8,
     body: []const u8,
+    body_prefix: ?[]const u8 = null,
     headers: []const TestHttpHeaderExpectation = &.{},
     response_headers: []const TestHttpHeaderExpectation = &.{},
     status_code: u16,
@@ -3143,9 +3589,17 @@ fn runTestHttpServer(context: *TestHttpServerContext) void {
         const expected = context.expected[context.completed_requests];
 
         if (!std.mem.eql(u8, parsed.method, expected.method) or
-            !std.mem.eql(u8, parsed.target, expected.target) or
-            !std.mem.eql(u8, parsed.body, expected.body))
+            !std.mem.eql(u8, parsed.target, expected.target))
         {
+            context.failure = error.UnexpectedRequest;
+            return;
+        }
+        if (expected.body_prefix) |prefix| {
+            if (!std.mem.startsWith(u8, parsed.body, prefix)) {
+                context.failure = error.UnexpectedRequest;
+                return;
+            }
+        } else if (!std.mem.eql(u8, parsed.body, expected.body)) {
             context.failure = error.UnexpectedRequest;
             return;
         }
@@ -3307,6 +3761,94 @@ test "executeLuaFileCaptureOutputTool supports zoid uri get/post/put/delete" {
 
     try std.testing.expect(context.failure == null);
     try std.testing.expectEqual(expectations.len, context.completed_requests);
+}
+
+test "executeLuaFileCaptureOutputTool can build OAuth JWT bearer request with json and crypto helpers" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var listen_address = try std.net.Address.parseIp4("127.0.0.1", 0);
+    const server = try listen_address.listen(.{ .reuse_address = true });
+    const port = server.listen_address.getPort();
+
+    const expectations = [_]TestHttpExpectation{
+        .{
+            .method = "POST",
+            .target = "/token",
+            .body = "",
+            .body_prefix = "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=",
+            .headers = &.{
+                .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" },
+            },
+            .status_code = 200,
+            .response_body = "{\"access_token\":\"ya29.test-token\",\"token_type\":\"Bearer\",\"expires_in\":3599}",
+        },
+    };
+
+    var context = TestHttpServerContext{
+        .server = server,
+        .expected = &expectations,
+    };
+
+    const server_thread = std.Thread.spawn(.{}, runTestHttpServer, .{&context}) catch |err| {
+        context.server.deinit();
+        return err;
+    };
+    defer server_thread.join();
+
+    const script_content = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\local now = zoid.time()
+        \\local token_uri = "http://127.0.0.1:{d}/token"
+        \\local header = zoid.json.encode({ alg = "RS256", typ = "JWT" })
+        \\local claims = zoid.json.encode({
+        \\  iss = "svc@example.iam.gserviceaccount.com",
+        \\  scope = "https://www.googleapis.com/auth/cloud-platform",
+        \\  aud = token_uri,
+        \\  iat = now,
+        \\  exp = now + 1200
+        \\})
+        \\local header_seg = zoid.crypto.base64url_encode(header)
+        \\local claims_seg = zoid.crypto.base64url_encode(claims)
+        \\local signing_input = header_seg .. "." .. claims_seg
+        \\local signature = zoid.crypto.sign_rs256([=[{s}]=], signing_input, "base64url")
+        \\local assertion = signing_input .. "." .. signature
+        \\local response = zoid.uri(token_uri):post(
+        \\  "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=" .. assertion,
+        \\  { headers = { ["Content-Type"] = "application/x-www-form-urlencoded" } }
+        \\)
+        \\local token = zoid.json.decode(response.body)
+        \\print(response.status, response.ok, token.access_token, token.token_type, token.expires_in)
+        \\
+    ,
+        .{ port, test_rsa_private_key_pem },
+    );
+    defer std.testing.allocator.free(script_content);
+
+    const script = try tmp.dir.createFile("oauth_jwt.lua", .{});
+    defer script.close();
+    try script.writeAll(script_content);
+
+    const script_path = try tmp.dir.realpathAlloc(std.testing.allocator, "oauth_jwt.lua");
+    defer std.testing.allocator.free(script_path);
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    var output = try executeLuaFileCaptureOutputTool(std.testing.allocator, script_path, .{
+        .workspace_root = workspace_root,
+        .allow_private_http_destinations = true,
+    });
+    defer output.deinit(std.testing.allocator);
+
+    try std.testing.expect(output.status == .ok);
+    try std.testing.expectEqualStrings(
+        "200\ttrue\tya29.test-token\tBearer\t3599\n",
+        output.stdout,
+    );
+    try std.testing.expectEqualStrings("", output.stderr);
+
+    try std.testing.expect(context.failure == null);
+    try std.testing.expectEqual(@as(usize, 1), context.completed_requests);
 }
 
 test "executeLuaFileCaptureOutputTool exposes redirect location header without auto follow" {
@@ -3541,6 +4083,35 @@ test "executeLuaFileCaptureOutputTool supports zoid json decode" {
         "3\ttrue\t1\ttrue\tzoid\nroot_null\ttrue\n",
         output.stdout,
     );
+    try std.testing.expectEqualStrings("", output.stderr);
+}
+
+test "executeLuaFileCaptureOutputTool supports zoid json encode and null sentinel" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script = try tmp.dir.createFile("json_encode.lua", .{});
+    defer script.close();
+    try script.writeAll(
+        \\local decoded = zoid.json.decode('{"ok":true,"items":[1,null,"x"]}')
+        \\local encoded = zoid.json.encode(decoded)
+        \\print(encoded)
+        \\
+    );
+
+    const script_path = try tmp.dir.realpathAlloc(std.testing.allocator, "json_encode.lua");
+    defer std.testing.allocator.free(script_path);
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    var output = try executeLuaFileCaptureOutputTool(std.testing.allocator, script_path, .{
+        .workspace_root = workspace_root,
+    });
+    defer output.deinit(std.testing.allocator);
+
+    try std.testing.expect(output.status == .ok);
+    try std.testing.expect(std.mem.indexOf(u8, output.stdout, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.stdout, "\"items\":[1,null,\"x\"]") != null);
     try std.testing.expectEqualStrings("", output.stderr);
 }
 

@@ -25,11 +25,13 @@ Lua run through Zoid has a `zoid` global with:
 - `zoid.file(path)` file handles with metadata
 - `zoid.dir(path)` directory handles with metadata
 - `zoid.uri(uri)` HTTP request handles
+- `zoid.crypto` cryptographic helpers
 - `zoid.config()` config handles
 - `zoid.jobs` scheduler handles
 - `zoid.browser` browser automation handles
 - `zoid.import(path)` Lua module imports
 - `zoid.json.decode(json_text)` JSON decoder
+- `zoid.json.encode(value)` JSON encoder
 - `zoid.time([table])` epoch timestamp helper
 - `zoid.date([format[, epoch]])` date/time formatter helper
 - `zoid.exit([code])` script exit helper
@@ -73,6 +75,41 @@ print(res.headers["content-type"])
 print(res.body)
 ```
 
+Crypto + JWT example:
+
+```lua
+local private_key = [[-----BEGIN PRIVATE KEY-----
+...
+-----END PRIVATE KEY-----]]
+
+local now = zoid.time()
+local header = zoid.json.encode({ alg = "RS256", typ = "JWT" })
+local claims = zoid.json.encode({
+  iss = "svc@example.iam.gserviceaccount.com",
+  scope = "https://www.googleapis.com/auth/cloud-platform",
+  aud = "https://oauth2.googleapis.com/token",
+  iat = now,
+  exp = now + 3600,
+})
+
+local header_seg = zoid.crypto.base64url_encode(header)
+local claims_seg = zoid.crypto.base64url_encode(claims)
+local signing_input = header_seg .. "." .. claims_seg
+local signature = zoid.crypto.sign_rs256(private_key, signing_input, "base64url")
+local assertion = signing_input .. "." .. signature
+
+local token_response = zoid.uri("https://oauth2.googleapis.com/token"):post(
+  "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=" .. assertion,
+  { headers = { ["Content-Type"] = "application/x-www-form-urlencoded" } }
+)
+local token = zoid.json.decode(token_response.body)
+
+local projects = zoid.uri("https://cloudresourcemanager.googleapis.com/v1/projects"):get({
+  headers = { Authorization = "Bearer " .. token.access_token },
+})
+print(projects.status, projects.ok)
+```
+
 Config example:
 
 ```lua
@@ -90,6 +127,8 @@ JSON example:
 ```lua
 local payload = zoid.json.decode('{"ok":true,"count":2,"items":[1,null]}')
 print(payload.ok, payload.count, payload.items[2] == zoid.json.null)
+local text = zoid.json.encode(payload)
+print(text)
 ```
 
 Time/date example:
@@ -181,6 +220,11 @@ Supported methods and return values:
 - `zoid.uri(uri):post([body], [options]) -> { status: integer, headers: table<string,string>, body: string, ok: boolean }`
 - `zoid.uri(uri):put([body], [options]) -> { status: integer, headers: table<string,string>, body: string, ok: boolean }`
 - `zoid.uri(uri):delete([options]) -> { status: integer, headers: table<string,string>, body: string, ok: boolean }`
+- `zoid.crypto.base64url_encode(data) -> string` (URL-safe base64 without `=` padding)
+- `zoid.crypto.sign_rs256(private_key_pem, data, [encoding]) -> string`
+  - signs `data` using RSASSA-PKCS1-v1_5 + SHA-256 with PEM private key
+  - `private_key_pem` accepts `BEGIN PRIVATE KEY` (PKCS#8) and `BEGIN RSA PRIVATE KEY` (PKCS#1)
+  - `encoding` is optional; one of `base64url` (default), `base64`, `hex`, `raw`
 - `zoid.config():list() -> { string, ... }` (sorted config keys)
 - `zoid.config():get(key) -> string | nil`
 - `zoid.config():set(key, value) -> boolean` (`true` on success)
@@ -199,6 +243,7 @@ Supported methods and return values:
   - `extract_links` output is an extract object with `kind = "links"` and link list in `items`
 - `zoid.import(path) -> any` (module return value; repeated imports return the cached module value; if module returns `nil`, import returns `true`)
 - `zoid.json.decode(json_text) -> any`
+- `zoid.json.encode(value) -> string` (supports JSON-compatible Lua values and `zoid.json.null`)
 - `zoid.json.null` sentinel value used when decoded JSON contains `null`
 - `zoid.time([table]) -> integer` (Lua-compatible with `os.time`: `year`/`month`/`day` required, optional `hour`/`min`/`sec`/`isdst`; numeric fields are normalized by `mktime`, and table fields are updated with normalized values)
 - `zoid.date([format[, epoch]]) -> string | table` (`*t` format returns table fields `year`, `month`, `day`, `hour`, `min`, `sec`, `wday`, `yday`, optional `isdst`; `!` prefix forces UTC)
