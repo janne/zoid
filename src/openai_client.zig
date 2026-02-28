@@ -901,14 +901,14 @@ fn writeHttpGetToolDefinition(
 ) !void {
     const description = try std.fmt.allocPrint(
         allocator,
-        "Perform an HTTP GET request to a http:// or https:// URI. Internal destinations (localhost/private/link-local) are blocked. Returns response status, headers, and body (max {d} bytes).",
+        "Perform an HTTP GET request to a http:// or https:// URI with optional request headers. Internal destinations (localhost/private/link-local) are blocked. Returns response status, headers, and body (max {d} bytes).",
         .{tool_runtime.max_allowed_http_response_bytes},
     );
     defer allocator.free(description);
 
     try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"http_get\",\"description\":");
     try writeJsonString(allocator, writer, description);
-    try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"uri\":{\"type\":\"string\"}},\"required\":[\"uri\"],\"additionalProperties\":false}}}");
+    try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"uri\":{\"type\":\"string\"},\"headers\":{\"type\":\"object\",\"additionalProperties\":{\"type\":\"string\"}}},\"required\":[\"uri\"],\"additionalProperties\":false}}}");
 }
 
 fn writeConfigToolDefinition(
@@ -941,14 +941,14 @@ fn writeHttpPostToolDefinition(
 ) !void {
     const description = try std.fmt.allocPrint(
         allocator,
-        "Perform an HTTP POST request to a http:// or https:// URI with optional string body. Internal destinations (localhost/private/link-local) are blocked. Returns response status, headers, and body (max {d} bytes).",
+        "Perform an HTTP POST request to a http:// or https:// URI with optional string body and request headers. Internal destinations (localhost/private/link-local) are blocked. Returns response status, headers, and body (max {d} bytes).",
         .{tool_runtime.max_allowed_http_response_bytes},
     );
     defer allocator.free(description);
 
     try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"http_post\",\"description\":");
     try writeJsonString(allocator, writer, description);
-    try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"uri\":{\"type\":\"string\"},\"body\":{\"type\":\"string\"}},\"required\":[\"uri\"],\"additionalProperties\":false}}}");
+    try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"uri\":{\"type\":\"string\"},\"body\":{\"type\":\"string\"},\"headers\":{\"type\":\"object\",\"additionalProperties\":{\"type\":\"string\"}}},\"required\":[\"uri\"],\"additionalProperties\":false}}}");
 }
 
 fn writeHttpPutToolDefinition(
@@ -957,14 +957,14 @@ fn writeHttpPutToolDefinition(
 ) !void {
     const description = try std.fmt.allocPrint(
         allocator,
-        "Perform an HTTP PUT request to a http:// or https:// URI with optional string body. Internal destinations (localhost/private/link-local) are blocked. Returns response status, headers, and body (max {d} bytes).",
+        "Perform an HTTP PUT request to a http:// or https:// URI with optional string body and request headers. Internal destinations (localhost/private/link-local) are blocked. Returns response status, headers, and body (max {d} bytes).",
         .{tool_runtime.max_allowed_http_response_bytes},
     );
     defer allocator.free(description);
 
     try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"http_put\",\"description\":");
     try writeJsonString(allocator, writer, description);
-    try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"uri\":{\"type\":\"string\"},\"body\":{\"type\":\"string\"}},\"required\":[\"uri\"],\"additionalProperties\":false}}}");
+    try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"uri\":{\"type\":\"string\"},\"body\":{\"type\":\"string\"},\"headers\":{\"type\":\"object\",\"additionalProperties\":{\"type\":\"string\"}}},\"required\":[\"uri\"],\"additionalProperties\":false}}}");
 }
 
 fn writeHttpDeleteToolDefinition(
@@ -973,14 +973,14 @@ fn writeHttpDeleteToolDefinition(
 ) !void {
     const description = try std.fmt.allocPrint(
         allocator,
-        "Perform an HTTP DELETE request to a http:// or https:// URI. Internal destinations (localhost/private/link-local) are blocked. Returns response status, headers, and body (max {d} bytes).",
+        "Perform an HTTP DELETE request to a http:// or https:// URI with optional request headers. Internal destinations (localhost/private/link-local) are blocked. Returns response status, headers, and body (max {d} bytes).",
         .{tool_runtime.max_allowed_http_response_bytes},
     );
     defer allocator.free(description);
 
     try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":\"http_delete\",\"description\":");
     try writeJsonString(allocator, writer, description);
-    try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"uri\":{\"type\":\"string\"}},\"required\":[\"uri\"],\"additionalProperties\":false}}}");
+    try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{\"uri\":{\"type\":\"string\"},\"headers\":{\"type\":\"object\",\"additionalProperties\":{\"type\":\"string\"}}},\"required\":[\"uri\"],\"additionalProperties\":false}}}");
 }
 
 fn writeDateTimeNowToolDefinition(
@@ -1309,6 +1309,17 @@ test "buildChatCompletionsPayload creates valid payload" {
     try std.testing.expectEqualStrings("http_post", tools[12].object.get("function").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("http_put", tools[13].object.get("function").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("http_delete", tools[14].object.get("function").?.object.get("name").?.string);
+    const http_get_parameters = tools[11].object.get("function").?.object.get("parameters").?.object;
+    const http_get_properties = http_get_parameters.get("properties").?.object;
+    const http_get_headers = http_get_properties.get("headers").?.object;
+    try std.testing.expectEqualStrings("object", http_get_headers.get("type").?.string);
+    try std.testing.expectEqualStrings("string", http_get_headers.get("additionalProperties").?.object.get("type").?.string);
+    const http_post_properties = tools[12].object.get("function").?.object.get("parameters").?.object.get("properties").?.object;
+    try std.testing.expectEqualStrings("object", http_post_properties.get("headers").?.object.get("type").?.string);
+    const http_put_properties = tools[13].object.get("function").?.object.get("parameters").?.object.get("properties").?.object;
+    try std.testing.expectEqualStrings("object", http_put_properties.get("headers").?.object.get("type").?.string);
+    const http_delete_properties = tools[14].object.get("function").?.object.get("parameters").?.object.get("properties").?.object;
+    try std.testing.expectEqualStrings("object", http_delete_properties.get("headers").?.object.get("type").?.string);
     try std.testing.expectEqualStrings("datetime_now", tools[15].object.get("function").?.object.get("name").?.string);
     try std.testing.expectEqualStrings("browser_automate", tools[16].object.get("function").?.object.get("name").?.string);
 }

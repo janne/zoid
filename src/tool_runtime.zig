@@ -1363,12 +1363,34 @@ fn executeHttpRequestTool(
         };
     }
 
+    var request_headers = std.ArrayList(http_client.RequestHeader).empty;
+    defer request_headers.deinit(allocator);
+    if (root_object.get("headers")) |headers_value| {
+        const headers_object = switch (headers_value) {
+            .object => |object| object,
+            else => return error.InvalidToolArguments,
+        };
+        try request_headers.ensureTotalCapacityPrecise(allocator, headers_object.count());
+
+        var iterator = headers_object.iterator();
+        while (iterator.next()) |entry| {
+            const header_value = switch (entry.value_ptr.*) {
+                .string => |value| value,
+                else => return error.InvalidToolArguments,
+            };
+            request_headers.appendAssumeCapacity(.{
+                .name = entry.key_ptr.*,
+                .value = header_value,
+            });
+        }
+    }
+
     var result = try http_client.executeRequest(
         allocator,
         method,
         uri,
         payload,
-        &.{},
+        request_headers.items,
         max_allowed_http_response_bytes,
         policy.allow_private_http_destinations,
     );
@@ -2592,6 +2614,7 @@ const ToolRuntimeHttpExpectation = struct {
     method: []const u8,
     target: []const u8,
     body: []const u8,
+    request_headers: []const http_client.RequestHeader = &.{},
     response_headers: []const http_client.RequestHeader = &.{},
     status_code: u16,
     response_body: []const u8,
@@ -2607,6 +2630,7 @@ const ToolRuntimeHttpServerContext = struct {
 const ParsedToolRuntimeHttpRequest = struct {
     method: []const u8,
     target: []const u8,
+    headers: []const u8,
     body: []const u8,
 };
 
@@ -2626,8 +2650,25 @@ fn parseToolRuntimeHttpRequest(request_bytes: []const u8) !ParsedToolRuntimeHttp
     return .{
         .method = method,
         .target = target,
+        .headers = headers[request_line_end + 2 ..],
         .body = body,
     };
+}
+
+fn hasToolRuntimeExpectedHeader(headers_blob: []const u8, name: []const u8, expected_value: []const u8) bool {
+    var lines = std.mem.splitSequence(u8, headers_blob, "\r\n");
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+
+        const separator = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const line_name = std.mem.trim(u8, line[0..separator], " \t");
+        if (!std.ascii.eqlIgnoreCase(line_name, name)) continue;
+
+        const line_value = std.mem.trim(u8, line[separator + 1 ..], " \t");
+        if (std.mem.eql(u8, line_value, expected_value)) return true;
+    }
+
+    return false;
 }
 
 fn parseToolRuntimeContentLength(headers: []const u8) !usize {
@@ -2712,6 +2753,12 @@ fn runToolRuntimeHttpServer(context: *ToolRuntimeHttpServerContext) void {
             context.failure = error.UnexpectedRequest;
             return;
         }
+        for (expected.request_headers) |expected_header| {
+            if (!hasToolRuntimeExpectedHeader(parsed.headers, expected_header.name, expected_header.value)) {
+                context.failure = error.UnexpectedRequest;
+                return;
+            }
+        }
 
         var response_header_output = std.ArrayList(u8).empty;
         defer response_header_output.deinit(std.heap.page_allocator);
@@ -2768,6 +2815,7 @@ test "http tools perform get/post/put/delete requests" {
             .method = "GET",
             .target = "/get",
             .body = "",
+            .request_headers = &.{.{ .name = "X-Req-Id", .value = "g1" }},
             .response_headers = &.{.{ .name = "X-Reply", .value = "g" }},
             .status_code = 200,
             .response_body = "g",
@@ -2776,6 +2824,7 @@ test "http tools perform get/post/put/delete requests" {
             .method = "POST",
             .target = "/post",
             .body = "alpha=1",
+            .request_headers = &.{.{ .name = "Authorization", .value = "Bearer test-token" }},
             .response_headers = &.{.{ .name = "X-Reply", .value = "p" }},
             .status_code = 201,
             .response_body = "p",
@@ -2784,6 +2833,7 @@ test "http tools perform get/post/put/delete requests" {
             .method = "PUT",
             .target = "/put",
             .body = "update-me",
+            .request_headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
             .response_headers = &.{.{ .name = "X-Reply", .value = "u" }},
             .status_code = 202,
             .response_body = "u",
@@ -2792,6 +2842,7 @@ test "http tools perform get/post/put/delete requests" {
             .method = "DELETE",
             .target = "/delete",
             .body = "",
+            .request_headers = &.{.{ .name = "X-Req-Id", .value = "d1" }},
             .response_headers = &.{.{ .name = "X-Reply", .value = "d" }},
             .status_code = 204,
             .response_body = "",
@@ -2819,13 +2870,13 @@ test "http tools perform get/post/put/delete requests" {
     const delete_uri = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/delete", .{port});
     defer std.testing.allocator.free(delete_uri);
 
-    const get_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"uri\":\"{s}\"}}", .{get_uri});
+    const get_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"uri\":\"{s}\",\"headers\":{{\"X-Req-Id\":\"g1\"}}}}", .{get_uri});
     defer std.testing.allocator.free(get_args);
-    const post_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"uri\":\"{s}\",\"body\":\"alpha=1\"}}", .{post_uri});
+    const post_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"uri\":\"{s}\",\"body\":\"alpha=1\",\"headers\":{{\"Authorization\":\"Bearer test-token\"}}}}", .{post_uri});
     defer std.testing.allocator.free(post_args);
-    const put_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"uri\":\"{s}\",\"body\":\"update-me\"}}", .{put_uri});
+    const put_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"uri\":\"{s}\",\"body\":\"update-me\",\"headers\":{{\"Content-Type\":\"text/plain\"}}}}", .{put_uri});
     defer std.testing.allocator.free(put_args);
-    const delete_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"uri\":\"{s}\"}}", .{delete_uri});
+    const delete_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"uri\":\"{s}\",\"headers\":{{\"X-Req-Id\":\"d1\"}}}}", .{delete_uri});
     defer std.testing.allocator.free(delete_args);
 
     const get_result = try executeToolCall(std.testing.allocator, &policy, "http_get", get_args);
@@ -3016,6 +3067,58 @@ test "http get and delete reject body argument" {
             &policy,
             "http_delete",
             "{\"uri\":\"https://example.com\",\"body\":\"unexpected\"}",
+        ),
+    );
+}
+
+test "http tools reject invalid headers argument values" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+
+    try std.testing.expectError(
+        error.InvalidToolArguments,
+        executeToolCall(
+            std.testing.allocator,
+            &policy,
+            "http_get",
+            "{\"uri\":\"https://example.com\",\"headers\":[\"bad\"]}",
+        ),
+    );
+
+    try std.testing.expectError(
+        error.InvalidToolArguments,
+        executeToolCall(
+            std.testing.allocator,
+            &policy,
+            "http_get",
+            "{\"uri\":\"https://example.com\",\"headers\":{\"Authorization\":123}}",
+        ),
+    );
+}
+
+test "http tools reject blocked request headers" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+
+    try std.testing.expectError(
+        error.HeaderNotAllowed,
+        executeToolCall(
+            std.testing.allocator,
+            &policy,
+            "http_get",
+            "{\"uri\":\"https://example.com\",\"headers\":{\"Host\":\"example.com\"}}",
         ),
     );
 }
