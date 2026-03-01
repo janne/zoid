@@ -173,6 +173,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - Keep Lua execution entrypoints tool-policy-only.
   - Tool-mode `zoid.jobs` API mirrors scheduler operations: `create/list/delete/pause/resume`.
   - `zoid.exit([code])` accepts only integer exit codes in range `0..125`; out-of-range values must fail with a Lua runtime error.
+  - `zoid.crypto.sign_rs256` must validate RSA key parameters via local invariant checks and avoid `std.crypto.Certificate.rsa.PublicKey.fromBytes` pre-validation, because malformed key material can crash inside that stdlib path on some platforms.
 
 ### Lua script examples (`workspace/scripts/*.lua`) changes:
   - Keep scripts compatible with the `zoid` API surface (`zoid.file`, `zoid.dir`, `zoid.uri`, `zoid.crypto`, `zoid.config`, `zoid.jobs`, `zoid.browser.automate`, `zoid.import`, `zoid.json`, `zoid.time`, `zoid.date`, `zoid.exit`, `zoid.eprint`) and do not rely on removed globals like `os`/`package`/`require`.

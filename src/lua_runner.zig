@@ -2002,13 +2002,57 @@ fn parseRsaPrivateKeyDerPkcs8(der_bytes: []const u8) !RsaPrivateKeySlices {
     return parseRsaPrivateKeyDerPkcs1(private_key_bytes);
 }
 
+fn isBytesAllZero(bytes: []const u8) bool {
+    for (bytes) |byte| {
+        if (byte != 0) return false;
+    }
+    return true;
+}
+
+fn isOneBigEndian(bytes: []const u8) bool {
+    if (bytes.len == 0) return false;
+    var seen_non_zero = false;
+    for (bytes[0 .. bytes.len - 1]) |byte| {
+        if (byte != 0) {
+            seen_non_zero = true;
+            break;
+        }
+    }
+    return !seen_non_zero and bytes[bytes.len - 1] == 1;
+}
+
+fn compareBigEndian(a: []const u8, b: []const u8) std.math.Order {
+    const a_norm = stripLeadingZeroes(a);
+    const b_norm = stripLeadingZeroes(b);
+    if (a_norm.len < b_norm.len) return .lt;
+    if (a_norm.len > b_norm.len) return .gt;
+    return std.mem.order(u8, a_norm, b_norm);
+}
+
+fn validateRsaPrivateKeySlices(key_slices: RsaPrivateKeySlices) !void {
+    // RSA modulus/private exponent sizes should be non-zero and practical.
+    if (key_slices.modulus.len < 64) return error.InvalidPrivateKey;
+    if (key_slices.private_exponent.len == 0) return error.InvalidPrivateKey;
+
+    if (isBytesAllZero(key_slices.modulus)) return error.InvalidPrivateKey;
+    if (isBytesAllZero(key_slices.public_exponent)) return error.InvalidPrivateKey;
+    if (isBytesAllZero(key_slices.private_exponent)) return error.InvalidPrivateKey;
+
+    // RSA modulus and exponents must be odd and public exponent must be > 1.
+    if ((key_slices.modulus[key_slices.modulus.len - 1] & 1) == 0) return error.InvalidPrivateKey;
+    if ((key_slices.public_exponent[key_slices.public_exponent.len - 1] & 1) == 0) return error.InvalidPrivateKey;
+    if (isOneBigEndian(key_slices.public_exponent)) return error.InvalidPrivateKey;
+
+    // Public/private exponents should be smaller than the modulus.
+    if (compareBigEndian(key_slices.public_exponent, key_slices.modulus) != .lt) return error.InvalidPrivateKey;
+    if (compareBigEndian(key_slices.private_exponent, key_slices.modulus) != .lt) return error.InvalidPrivateKey;
+}
+
 fn parseRsaPrivateKeyMaterialFromPemAlloc(
     allocator: std.mem.Allocator,
     pem_text: []const u8,
 ) !RsaPrivateKeyMaterial {
-    var decoded_der: ?[]u8 = null;
-
-    decoded_der = decodePemBlockAlloc(
+    const decoded_pkcs8_der = decodePemBlockAlloc(
         allocator,
         pem_text,
         "-----BEGIN PRIVATE KEY-----",
@@ -2018,26 +2062,27 @@ fn parseRsaPrivateKeyMaterialFromPemAlloc(
         else => return err,
     };
 
-    var key_slices: RsaPrivateKeySlices = undefined;
-    if (decoded_der) |der_bytes| {
-        defer allocator.free(der_bytes);
-        key_slices = try parseRsaPrivateKeyDerPkcs8(der_bytes);
-    } else {
-        const pkcs1_der = try decodePemBlockAlloc(
+    const key_der = if (decoded_pkcs8_der) |pkcs8_der|
+        pkcs8_der
+    else
+        try decodePemBlockAlloc(
             allocator,
             pem_text,
             "-----BEGIN RSA PRIVATE KEY-----",
             "-----END RSA PRIVATE KEY-----",
         );
-        defer allocator.free(pkcs1_der);
-        key_slices = try parseRsaPrivateKeyDerPkcs1(pkcs1_der);
+    defer allocator.free(key_der);
+
+    var key_slices: RsaPrivateKeySlices = undefined;
+    if (decoded_pkcs8_der != null) {
+        key_slices = try parseRsaPrivateKeyDerPkcs8(key_der);
+    } else {
+        key_slices = try parseRsaPrivateKeyDerPkcs1(key_der);
     }
 
-    // Validate modulus/public exponent constraints before signing.
-    _ = std.crypto.Certificate.rsa.PublicKey.fromBytes(
-        key_slices.public_exponent,
-        key_slices.modulus,
-    ) catch return error.InvalidPrivateKey;
+    // Validate RSA key invariants with local checks to avoid stdlib parser crashes
+    // on malformed key material.
+    try validateRsaPrivateKeySlices(key_slices);
 
     const modulus = try allocator.dupe(u8, key_slices.modulus);
     errdefer allocator.free(modulus);
@@ -3445,6 +3490,28 @@ test "signRs256Pkcs1v15Alloc produces valid RS256 signature" {
     const signature = try signRs256Pkcs1v15Alloc(std.testing.allocator, message, &key_material);
     defer std.testing.allocator.free(signature);
     try verifyRs256Signature(std.testing.allocator, message, signature, &key_material);
+}
+
+test "validateRsaPrivateKeySlices rejects invalid public exponent" {
+    const modulus = [_]u8{0xff} ** 64;
+    const public_exponent = [_]u8{0x01};
+    const private_exponent = [_]u8{0x03};
+    try std.testing.expectError(error.InvalidPrivateKey, validateRsaPrivateKeySlices(.{
+        .modulus = &modulus,
+        .public_exponent = &public_exponent,
+        .private_exponent = &private_exponent,
+    }));
+}
+
+test "validateRsaPrivateKeySlices accepts plausible RSA parameters" {
+    const modulus = [_]u8{0xff} ** 64;
+    const public_exponent = [_]u8{ 0x01, 0x00, 0x01 };
+    const private_exponent = [_]u8{0x11} ** 64;
+    try validateRsaPrivateKeySlices(.{
+        .modulus = &modulus,
+        .public_exponent = &public_exponent,
+        .private_exponent = &private_exponent,
+    });
 }
 
 const TestHttpHeaderExpectation = struct {
