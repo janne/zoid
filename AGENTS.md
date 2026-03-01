@@ -178,7 +178,9 @@ If you change command behavior, error handling, config format, or Lua execution 
   - Keep scripts compatible with the `zoid` API surface (`zoid.file`, `zoid.dir`, `zoid.uri`, `zoid.crypto`, `zoid.config`, `zoid.jobs`, `zoid.browser.automate`, `zoid.import`, `zoid.json`, `zoid.time`, `zoid.date`, `zoid.exit`, `zoid.eprint`) and do not rely on removed globals like `os`/`package`/`require`.
   - `zoid execute <file.lua> [args...]` exposes Lua global `arg` with `arg[0]` as script path and `arg[1..]` as forwarded positional arguments.
   - `workspace/scripts/gmail.lua` is a CLI-style utility; it supports `--query`, `--limit`, `--id`, and `--labels`, with default query `is:unread in:inbox`.
+  - `workspace/scripts/gcloud.lua` is a CLI-style Google Cloud utility; currently it supports `compute instances list` with `--project`, `--zone`, and `--limit`, defaulting project selection from `GCLOUD_PROJECT_ID`.
   - `workspace/scripts/counter.lua` creates `counter.txt` with `1` when missing; otherwise it reads the current integer value, increments by `1`, and writes it back.
+  - Workspace template module `workspace/lib/gcloud.lua` provides a Google Cloud REST helper; import it as `zoid.import("/lib/gcloud.lua")` (workspace-absolute path with explicit `.lua` suffix). It supports service-account JWT flow and `GCLOUD_ACCESS_TOKEN` fallback for runtimes without `zoid.crypto`.
 
 ### Public module surface:
   - Keep `src/root.zig` exports aligned with intended package API.

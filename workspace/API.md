@@ -181,6 +181,26 @@ local features = zoid.import("lib/features.lua")
 print(util.version, features.enabled)
 ```
 
+Bundled Google Cloud helper example:
+
+```lua
+local gcloud = zoid.import("/lib/gcloud.lua")
+local client = gcloud.from_config()
+local page = client.compute.instances.list({ zone = "europe-west1-b" })
+
+for _, item in ipairs(page.items or {}) do
+  print(item.name, item.status)
+end
+```
+
+`gcloud.from_config()` reads these optional config keys:
+
+- `GCLOUD_SERVICE_ACCOUNT_JSON` (raw service-account JSON)
+- `GCLOUD_SERVICE_ACCOUNT_FILE` (workspace path to JSON credentials file)
+- `GCLOUD_PROJECT_ID`
+- `GCLOUD_SCOPES` (comma-separated scopes)
+- `GCLOUD_ACCESS_TOKEN` (optional pre-minted bearer token; useful when `zoid.crypto` is unavailable)
+
 Alternative module patterns:
 
 ```lua
