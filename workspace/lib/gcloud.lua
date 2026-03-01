@@ -2,7 +2,7 @@
 -- Google Cloud REST helper for Zoid Lua scripts.
 --
 -- Recommended usage:
---   local gcloud = zoid.import("/lib/gcloud.lua")
+--   local gcloud = zoid.require("gcloud")
 --   local client = gcloud.from_config()
 --   local page = client.compute.instances.list({ zone = "europe-west1-b" })
 --   for _, item in ipairs(page.items or {}) do
@@ -270,9 +270,9 @@ function client_methods:_fetch_access_token()
   local now_epoch = current_epoch()
   local assertion = build_jwt_assertion(self, now_epoch)
   local body = "grant_type=" ..
-    url_encode(JWT_GRANT_TYPE) ..
-    "&assertion=" ..
-    url_encode(assertion)
+      url_encode(JWT_GRANT_TYPE) ..
+      "&assertion=" ..
+      url_encode(assertion)
 
   local response = zoid.uri(self.token_uri):post(body, {
     headers = {
@@ -307,7 +307,7 @@ function client_methods:get_access_token()
 
   local now_epoch = current_epoch()
   if is_non_empty_string(self._access_token) and
-    (self._access_token_expires_at - self.token_refresh_skew_seconds) > now_epoch then
+      (self._access_token_expires_at - self.token_refresh_skew_seconds) > now_epoch then
     return self._access_token
   end
   return self:_fetch_access_token()
@@ -353,8 +353,8 @@ function client_methods:request(options)
     ["User-Agent"] = self.user_agent,
   })
   if is_non_empty_string(self.quota_project) and
-    headers["X-Goog-User-Project"] == nil and
-    headers["x-goog-user-project"] == nil then
+      headers["X-Goog-User-Project"] == nil and
+      headers["x-goog-user-project"] == nil then
     headers["X-Goog-User-Project"] = self.quota_project
   end
   if inferred_content_type ~= nil and headers["Content-Type"] == nil and headers["content-type"] == nil then
@@ -437,11 +437,11 @@ local function build_compute_api(client)
       version = "v1",
       method = "GET",
       path = "/projects/" ..
-        url_encode(project) ..
-        "/zones/" ..
-        url_encode(zone) ..
-        "/instances/" ..
-        url_encode(instance),
+          url_encode(project) ..
+          "/zones/" ..
+          url_encode(zone) ..
+          "/instances/" ..
+          url_encode(instance),
     })
     return return_json_or_result(result)
   end
@@ -459,12 +459,12 @@ local function build_compute_api(client)
       version = "v1",
       method = "POST",
       path = "/projects/" ..
-        url_encode(project) ..
-        "/zones/" ..
-        url_encode(zone) ..
-        "/instances/" ..
-        url_encode(instance) ..
-        "/start",
+          url_encode(project) ..
+          "/zones/" ..
+          url_encode(zone) ..
+          "/instances/" ..
+          url_encode(instance) ..
+          "/start",
       body = options.body or {},
     })
     return return_json_or_result(result)
@@ -483,12 +483,12 @@ local function build_compute_api(client)
       version = "v1",
       method = "POST",
       path = "/projects/" ..
-        url_encode(project) ..
-        "/zones/" ..
-        url_encode(zone) ..
-        "/instances/" ..
-        url_encode(instance) ..
-        "/stop",
+          url_encode(project) ..
+          "/zones/" ..
+          url_encode(zone) ..
+          "/instances/" ..
+          url_encode(instance) ..
+          "/stop",
       body = options.body or {},
     })
     return return_json_or_result(result)
@@ -507,11 +507,11 @@ local function build_compute_api(client)
       version = "v1",
       method = "DELETE",
       path = "/projects/" ..
-        url_encode(project) ..
-        "/zones/" ..
-        url_encode(zone) ..
-        "/instances/" ..
-        url_encode(instance),
+          url_encode(project) ..
+          "/zones/" ..
+          url_encode(zone) ..
+          "/instances/" ..
+          url_encode(instance),
       query = options.query,
     })
     return return_json_or_result(result)

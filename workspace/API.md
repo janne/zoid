@@ -29,7 +29,7 @@ Lua run through Zoid has a `zoid` global with:
 - `zoid.config()` config handles
 - `zoid.jobs` scheduler handles
 - `zoid.browser` browser automation handles
-- `zoid.import(path)` Lua module imports
+- `zoid.require(name)` Lua module loader
 - `zoid.json.decode(json_text)` JSON decoder
 - `zoid.json.encode(value)` JSON encoder
 - `zoid.time([table])` epoch timestamp helper
@@ -173,18 +173,18 @@ local result = zoid.browser.automate({
 print(result.ok, result.tool)
 ```
 
-Import example:
+Require example:
 
 ```lua
-local util = zoid.import("lib/util.lua")
-local features = zoid.import("lib/features.lua")
+local util = zoid.require("util")
+local features = zoid.require("features")
 print(util.version, features.enabled)
 ```
 
 Bundled Google Cloud helper example:
 
 ```lua
-local gcloud = zoid.import("/lib/gcloud.lua")
+local gcloud = zoid.require("/lib/gcloud")
 local client = gcloud.from_config()
 local page = client.compute.instances.list({ zone = "europe-west1-b" })
 
@@ -261,7 +261,7 @@ Supported methods and return values:
   - `result.extracts` is an array of extract objects
   - `extract_page_text` output is an extract object with `kind = "page_text"` and text in `value`
   - `extract_links` output is an extract object with `kind = "links"` and link list in `items`
-- `zoid.import(path) -> any` (module return value; repeated imports return the cached module value; if module returns `nil`, import returns `true`)
+- `zoid.require(name) -> any` (module return value; repeated requires return the cached module value; if a module returns `nil`, `zoid.require` returns `true`)
 - `zoid.json.decode(json_text) -> any`
 - `zoid.json.encode(value) -> string` (supports JSON-compatible Lua values and `zoid.json.null`)
 - `zoid.json.null` sentinel value used when decoded JSON contains `null`
@@ -291,7 +291,7 @@ The following standard Lua escape hatches are removed:
 - `loadfile`
 - `io`
 
-Use `zoid.import(path)` for sandboxed module loading instead.
+Use `zoid.require(name)` for sandboxed module loading instead.
 
 ### `print` and `zoid.eprint` Behavior
 
@@ -354,14 +354,24 @@ Method-specific behavior:
 - `zoid.dir(path):remove()` removes an existing empty directory and fails if it is missing or non-empty
 - `zoid.dir(path):grep(pattern, [options])` searches file content under the directory and can recurse into subdirectories
 
-### Import Rules
+### Module Loading Rules
 
-`zoid.import(path)` enforces sandboxed module loading rules:
+`zoid.require(name)` enforces sandboxed module loading rules:
 
-- path must resolve to a `.lua` file under workspace root
-- relative paths are resolved from the importing module's directory
-- repeated imports use a module cache and do not re-execute module top-level code
-- cyclic imports fail with a runtime error
+- only `.lua` modules under workspace root can be loaded
+- explicit path forms are supported:
+  - workspace-absolute names starting with `/` (for example `/lib/gcloud`)
+  - relative names starting with `./` or `../` from the importing module's directory
+  - when the explicit path does not end with `.lua`, loader tries `<path>.lua` then `<path>/init.lua`
+- module-name forms (no leading `/`, `./`, or `../`) use this search order:
+  - `./?.lua`
+  - `./?/init.lua`
+  - `/lib/?.lua`
+  - `/lib/?/init.lua`
+  - `/scripts/?.lua`
+  - `/scripts/?/init.lua`
+- repeated requires use a module cache and do not re-execute module top-level code
+- cyclic requires fail with a runtime error
 
 ### HTTP Request Rules
 

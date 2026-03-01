@@ -830,26 +830,165 @@ fn luaZoidDir(lua_state: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-fn resolveImportPath(
+const RequireSearchScope = enum {
+    caller_dir,
+    workspace_root,
+};
+
+const RequireSearchTemplate = struct {
+    scope: RequireSearchScope,
+    pattern: []const u8,
+};
+
+const require_search_templates = [_]RequireSearchTemplate{
+    .{ .scope = .caller_dir, .pattern = "?.lua" },
+    .{ .scope = .caller_dir, .pattern = "?/init.lua" },
+    .{ .scope = .workspace_root, .pattern = "lib/?.lua" },
+    .{ .scope = .workspace_root, .pattern = "lib/?/init.lua" },
+    .{ .scope = .workspace_root, .pattern = "scripts/?.lua" },
+    .{ .scope = .workspace_root, .pattern = "scripts/?/init.lua" },
+};
+
+fn isExplicitRelativeModulePath(requested_name: []const u8) bool {
+    return std.mem.eql(u8, requested_name, ".") or
+        std.mem.eql(u8, requested_name, "..") or
+        std.mem.startsWith(u8, requested_name, "./") or
+        std.mem.startsWith(u8, requested_name, "../") or
+        std.mem.startsWith(u8, requested_name, ".\\") or
+        std.mem.startsWith(u8, requested_name, "..\\");
+}
+
+fn moduleNameWithoutLuaSuffix(requested_name: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, requested_name, ".lua")) {
+        return requested_name[0 .. requested_name.len - 4];
+    }
+    return requested_name;
+}
+
+fn currentModuleDirectoryWorkspacePath(
     allocator: std.mem.Allocator,
     env: *ToolLuaEnvironment,
-    requested_path: []const u8,
 ) ![]u8 {
-    if (requested_path.len == 0) return error.InvalidToolArguments;
-    if (std.fs.path.isAbsolute(requested_path)) {
-        return workspace_fs.resolveAllowedReadPath(allocator, env.workspace_root, requested_path);
-    }
-
     if (env.module_stack.items.len == 0) {
-        return workspace_fs.resolveAllowedReadPath(allocator, env.workspace_root, requested_path);
+        return allocator.dupe(u8, "/");
     }
 
     const caller_path = env.module_stack.items[env.module_stack.items.len - 1];
-    const caller_dir = std.fs.path.dirname(caller_path) orelse env.workspace_root;
-    const candidate_path = try std.fs.path.join(allocator, &.{ caller_dir, requested_path });
-    defer allocator.free(candidate_path);
+    const caller_workspace_path = try workspace_fs.toWorkspaceAbsolutePath(
+        allocator,
+        env.workspace_root,
+        caller_path,
+    );
+    errdefer allocator.free(caller_workspace_path);
 
-    return workspace_fs.resolveAllowedReadPath(allocator, env.workspace_root, candidate_path);
+    const caller_dir = std.fs.path.dirname(caller_workspace_path) orelse "/";
+    if (std.mem.eql(u8, caller_dir, caller_workspace_path)) {
+        return caller_workspace_path;
+    }
+
+    const owned_caller_dir = try allocator.dupe(u8, caller_dir);
+    allocator.free(caller_workspace_path);
+    return owned_caller_dir;
+}
+
+fn appendRequireCandidatePath(
+    allocator: std.mem.Allocator,
+    candidates: *std.ArrayList([]u8),
+    path: []const u8,
+) !void {
+    for (candidates.items) |existing| {
+        if (std.mem.eql(u8, existing, path)) return;
+    }
+    try candidates.append(allocator, try allocator.dupe(u8, path));
+}
+
+fn resolveRequireTemplatePath(
+    allocator: std.mem.Allocator,
+    template: []const u8,
+    module_name: []const u8,
+) ![]u8 {
+    const marker_index = std.mem.indexOfScalar(u8, template, '?') orelse return error.InvalidToolArguments;
+    return std.mem.concat(
+        allocator,
+        u8,
+        &.{ template[0..marker_index], module_name, template[marker_index + 1 ..] },
+    );
+}
+
+fn resolveRequirePath(
+    allocator: std.mem.Allocator,
+    env: *ToolLuaEnvironment,
+    requested_name: []const u8,
+) ![]u8 {
+    if (requested_name.len == 0) return error.InvalidToolArguments;
+
+    const caller_dir_workspace_path = try currentModuleDirectoryWorkspacePath(allocator, env);
+    defer allocator.free(caller_dir_workspace_path);
+
+    var candidates = std.ArrayList([]u8).empty;
+    defer {
+        for (candidates.items) |candidate| allocator.free(candidate);
+        candidates.deinit(allocator);
+    }
+
+    const explicit_path = std.fs.path.isAbsolute(requested_name) or isExplicitRelativeModulePath(requested_name);
+    if (explicit_path) {
+        const base_path = if (std.fs.path.isAbsolute(requested_name))
+            try allocator.dupe(u8, requested_name)
+        else
+            try std.fs.path.join(allocator, &.{ caller_dir_workspace_path, requested_name });
+        defer allocator.free(base_path);
+
+        if (std.mem.eql(u8, std.fs.path.extension(requested_name), ".lua")) {
+            try appendRequireCandidatePath(allocator, &candidates, base_path);
+        } else {
+            const with_lua_extension = try std.fmt.allocPrint(allocator, "{s}.lua", .{base_path});
+            defer allocator.free(with_lua_extension);
+            try appendRequireCandidatePath(allocator, &candidates, with_lua_extension);
+
+            const with_init_suffix = try std.fs.path.join(allocator, &.{ base_path, "init.lua" });
+            defer allocator.free(with_init_suffix);
+            try appendRequireCandidatePath(allocator, &candidates, with_init_suffix);
+        }
+    } else {
+        const module_name = moduleNameWithoutLuaSuffix(requested_name);
+        for (require_search_templates) |template| {
+            const template_path = try resolveRequireTemplatePath(
+                allocator,
+                template.pattern,
+                module_name,
+            );
+            defer allocator.free(template_path);
+
+            const base_dir = switch (template.scope) {
+                .caller_dir => caller_dir_workspace_path,
+                .workspace_root => "/",
+            };
+            const candidate_path = try std.fs.path.join(allocator, &.{ base_dir, template_path });
+            defer allocator.free(candidate_path);
+
+            try appendRequireCandidatePath(allocator, &candidates, candidate_path);
+        }
+    }
+
+    for (candidates.items) |candidate_path| {
+        const resolved_path = workspace_fs.resolveAllowedReadPath(
+            allocator,
+            env.workspace_root,
+            candidate_path,
+        ) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+
+        if (!std.mem.eql(u8, std.fs.path.extension(resolved_path), ".lua")) {
+            allocator.free(resolved_path);
+            continue;
+        }
+        return resolved_path;
+    }
+
+    return error.FileNotFound;
 }
 
 fn moduleStackContains(module_stack: []const []u8, module_path: []const u8) bool {
@@ -859,30 +998,27 @@ fn moduleStackContains(module_stack: []const []u8, module_path: []const u8) bool
     return false;
 }
 
-fn luaZoidImport(lua_state: ?*c.lua_State) callconv(.c) c_int {
+fn luaZoidRequire(lua_state: ?*c.lua_State) callconv(.c) c_int {
     const state = lua_state orelse return 0;
     const env = toolEnvironmentFromLuaState(state) orelse return pushLuaErrorMessage(state, "workspace context unavailable", .{});
 
     const nargs = c.lua_gettop(state);
     if (nargs != 1) {
-        return pushLuaErrorMessage(state, "zoid.import requires exactly one path argument", .{});
+        return pushLuaErrorMessage(state, "zoid.require requires exactly one module argument", .{});
     }
 
-    var requested_path_len: usize = 0;
-    const requested_path_ptr = c.luaL_checklstring(state, 1, &requested_path_len) orelse {
-        return pushLuaErrorMessage(state, "zoid.import requires path", .{});
+    var requested_name_len: usize = 0;
+    const requested_name_ptr = c.luaL_checklstring(state, 1, &requested_name_len) orelse {
+        return pushLuaErrorMessage(state, "zoid.require requires module name", .{});
     };
-    const requested_path = requested_path_ptr[0..requested_path_len];
+    const requested_name = requested_name_ptr[0..requested_name_len];
 
-    const resolved_module_path = resolveImportPath(env.allocator, env, requested_path) catch |err| {
-        return pushLuaErrorMessage(state, "zoid.import(path) failed: {s}", .{@errorName(err)});
+    const resolved_module_path = resolveRequirePath(env.allocator, env, requested_name) catch |err| switch (err) {
+        error.FileNotFound => return pushLuaErrorMessage(state, "zoid.require(name) module not found: {s}", .{requested_name}),
+        else => return pushLuaErrorMessage(state, "zoid.require(name) failed: {s}", .{@errorName(err)}),
     };
     var keep_resolved_module_path = false;
     defer if (!keep_resolved_module_path) env.allocator.free(resolved_module_path);
-
-    if (!std.mem.eql(u8, std.fs.path.extension(resolved_module_path), ".lua")) {
-        return pushLuaErrorMessage(state, "zoid.import(path) requires a .lua module path", .{});
-    }
 
     if (env.module_cache.get(resolved_module_path)) |cached_ref| {
         _ = c.lua_rawgeti(state, c.LUA_REGISTRYINDEX, cached_ref);
@@ -890,26 +1026,26 @@ fn luaZoidImport(lua_state: ?*c.lua_State) callconv(.c) c_int {
     }
 
     if (moduleStackContains(env.module_stack.items, resolved_module_path)) {
-        return pushLuaErrorMessage(state, "zoid.import(path) cyclic import detected: {s}", .{resolved_module_path});
+        return pushLuaErrorMessage(state, "zoid.require(name) cyclic import detected: {s}", .{resolved_module_path});
     }
 
     const c_module_path = env.allocator.dupeZ(u8, resolved_module_path) catch |err| {
-        return pushLuaErrorMessage(state, "zoid.import(path) failed: {s}", .{@errorName(err)});
+        return pushLuaErrorMessage(state, "zoid.require(name) failed: {s}", .{@errorName(err)});
     };
     defer env.allocator.free(c_module_path);
 
     if (c.luaL_loadfilex(state, c_module_path.ptr, "t") != c.LUA_OK) {
-        return pushLuaErrorMessage(state, "zoid.import(path) load failed: {s}", .{luaErrorMessage(state)});
+        return pushLuaErrorMessage(state, "zoid.require(name) load failed: {s}", .{luaErrorMessage(state)});
     }
 
     env.pushModuleStackPath(resolved_module_path) catch |err| {
         luaPop(state, 1);
-        return pushLuaErrorMessage(state, "zoid.import(path) failed: {s}", .{@errorName(err)});
+        return pushLuaErrorMessage(state, "zoid.require(name) failed: {s}", .{@errorName(err)});
     };
     defer env.popModuleStackPath();
 
     if (c.lua_pcallk(state, 0, 1, 0, 0, null) != c.LUA_OK) {
-        return pushLuaErrorMessage(state, "zoid.import(path) runtime failed: {s}", .{luaErrorMessage(state)});
+        return pushLuaErrorMessage(state, "zoid.require(name) runtime failed: {s}", .{luaErrorMessage(state)});
     }
 
     if (c.lua_type(state, -1) == c.LUA_TNIL) {
@@ -922,7 +1058,7 @@ fn luaZoidImport(lua_state: ?*c.lua_State) callconv(.c) c_int {
 
     env.module_cache.put(env.allocator, resolved_module_path, module_ref) catch |err| {
         c.luaL_unref(state, c.LUA_REGISTRYINDEX, module_ref);
-        return pushLuaErrorMessage(state, "zoid.import(path) failed: {s}", .{@errorName(err)});
+        return pushLuaErrorMessage(state, "zoid.require(name) failed: {s}", .{@errorName(err)});
     };
     keep_resolved_module_path = true;
     return 1;
@@ -2533,8 +2669,8 @@ fn installZoidTable(lua_state: *c.lua_State, sandbox: *ToolLuaEnvironment) void 
     c.lua_setfield(lua_state, -2, "jobs");
     _ = luaZoidBrowser(lua_state);
     c.lua_setfield(lua_state, -2, "browser");
-    c.lua_pushcclosure(lua_state, luaZoidImport, 0);
-    c.lua_setfield(lua_state, -2, "import");
+    c.lua_pushcclosure(lua_state, luaZoidRequire, 0);
+    c.lua_setfield(lua_state, -2, "require");
     _ = luaZoidJson(lua_state);
     c.lua_setfield(lua_state, -2, "json");
     _ = luaZoidCrypto(lua_state);
@@ -2558,7 +2694,7 @@ fn setGlobalNil(lua_state: *c.lua_State, name: [*:0]const u8) void {
 fn restrictToolLuaEnvironment(lua_state: *c.lua_State, sandbox: *ToolLuaEnvironment) void {
     installZoidTable(lua_state, sandbox);
 
-    // Remove standard escape hatches; zoid.file(...), zoid.dir(...), zoid.uri(...), zoid.config(), zoid.jobs, zoid.browser.automate(...), zoid.import(...), zoid.json.decode/encode, zoid.crypto.base64url_encode/sign_rs256, zoid.time, zoid.date, and zoid.eprint(...) are tool APIs.
+    // Remove standard escape hatches; zoid.file(...), zoid.dir(...), zoid.uri(...), zoid.config(), zoid.jobs, zoid.browser.automate(...), zoid.require(...), zoid.json.decode/encode, zoid.crypto.base64url_encode/sign_rs256, zoid.time, zoid.date, and zoid.eprint(...) are tool APIs.
     setGlobalNil(lua_state, "workspace");
     setGlobalNil(lua_state, "os");
     setGlobalNil(lua_state, "package");
@@ -3219,11 +3355,12 @@ test "executeLuaFileCaptureOutputTool supports zoid config list/get/set/unset" {
     try std.testing.expect(zeta == null);
 }
 
-test "executeLuaFileCaptureOutputTool supports zoid import with relative paths and module cache" {
+test "executeLuaFileCaptureOutputTool supports zoid require search paths with module cache" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.makePath("lib/nested");
+    try tmp.dir.makePath("scripts");
     {
         const util = try tmp.dir.createFile("lib/util.lua", .{});
         defer util.close();
@@ -3236,23 +3373,33 @@ test "executeLuaFileCaptureOutputTool supports zoid import with relative paths a
         const math = try tmp.dir.createFile("lib/nested/math.lua", .{});
         defer math.close();
         try math.writeAll(
-            \\local util = zoid.import("../util.lua")
+            \\local util = zoid.require("../util")
             \\return { value = util.base + 2 }
             \\
         );
     }
     {
-        const script = try tmp.dir.createFile("import.lua", .{});
+        const helper = try tmp.dir.createFile("scripts/helper.lua", .{});
+        defer helper.close();
+        try helper.writeAll(
+            \\return { kind = "script" }
+            \\
+        );
+    }
+    {
+        const script = try tmp.dir.createFile("require.lua", .{});
         defer script.close();
         try script.writeAll(
-            \\local first = zoid.import("lib/nested/math.lua")
-            \\local second = zoid.import("lib/nested/math.lua")
+            \\local first = zoid.require("nested/math")
+            \\local second = zoid.require("nested/math.lua")
+            \\local helper = zoid.require("helper")
             \\print("value", first.value, second.value, first == second)
+            \\print("helper", helper.kind)
             \\
         );
     }
 
-    const script_path = try tmp.dir.realpathAlloc(std.testing.allocator, "import.lua");
+    const script_path = try tmp.dir.realpathAlloc(std.testing.allocator, "require.lua");
     defer std.testing.allocator.free(script_path);
     const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace_root);
@@ -3263,11 +3410,11 @@ test "executeLuaFileCaptureOutputTool supports zoid import with relative paths a
     defer output.deinit(std.testing.allocator);
 
     try std.testing.expect(output.status == .ok);
-    try std.testing.expectEqualStrings("value\t42\t42\ttrue\n", output.stdout);
+    try std.testing.expectEqualStrings("value\t42\t42\ttrue\nhelper\tscript\n", output.stdout);
     try std.testing.expectEqualStrings("", output.stderr);
 }
 
-test "executeLuaFileCaptureOutputTool reports cyclic zoid import" {
+test "executeLuaFileCaptureOutputTool reports cyclic zoid require" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -3275,7 +3422,7 @@ test "executeLuaFileCaptureOutputTool reports cyclic zoid import" {
         const module_a = try tmp.dir.createFile("a.lua", .{});
         defer module_a.close();
         try module_a.writeAll(
-            \\return zoid.import("b.lua")
+            \\return zoid.require("b")
             \\
         );
     }
@@ -3283,7 +3430,7 @@ test "executeLuaFileCaptureOutputTool reports cyclic zoid import" {
         const module_b = try tmp.dir.createFile("b.lua", .{});
         defer module_b.close();
         try module_b.writeAll(
-            \\return zoid.import("a.lua")
+            \\return zoid.require("a")
             \\
         );
     }
@@ -3291,7 +3438,7 @@ test "executeLuaFileCaptureOutputTool reports cyclic zoid import" {
         const script = try tmp.dir.createFile("cyclic.lua", .{});
         defer script.close();
         try script.writeAll(
-            \\zoid.import("a.lua")
+            \\zoid.require("a")
             \\
         );
     }
@@ -3310,7 +3457,7 @@ test "executeLuaFileCaptureOutputTool reports cyclic zoid import" {
     try std.testing.expect(std.mem.indexOf(u8, output.stderr, "cyclic import detected") != null);
 }
 
-test "executeLuaFileCaptureOutputTool rejects non-lua zoid import paths" {
+test "executeLuaFileCaptureOutputTool reports module-not-found for non-lua zoid require names" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -3320,15 +3467,15 @@ test "executeLuaFileCaptureOutputTool rejects non-lua zoid import paths" {
         try non_lua.writeAll("hello\n");
     }
     {
-        const script = try tmp.dir.createFile("non_lua_import.lua", .{});
+        const script = try tmp.dir.createFile("non_lua_require.lua", .{});
         defer script.close();
         try script.writeAll(
-            \\zoid.import("module.txt")
+            \\zoid.require("module.txt")
             \\
         );
     }
 
-    const script_path = try tmp.dir.realpathAlloc(std.testing.allocator, "non_lua_import.lua");
+    const script_path = try tmp.dir.realpathAlloc(std.testing.allocator, "non_lua_require.lua");
     defer std.testing.allocator.free(script_path);
     const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace_root);
@@ -3339,10 +3486,10 @@ test "executeLuaFileCaptureOutputTool rejects non-lua zoid import paths" {
     defer output.deinit(std.testing.allocator);
 
     try std.testing.expect(output.status == .runtime_failed);
-    try std.testing.expect(std.mem.indexOf(u8, output.stderr, ".lua module path") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "module not found") != null);
 }
 
-test "executeLuaFileCaptureOutputTool enforces workspace policy for zoid import" {
+test "executeLuaFileCaptureOutputTool enforces workspace policy for zoid require" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -3353,15 +3500,15 @@ test "executeLuaFileCaptureOutputTool enforces workspace policy for zoid import"
         try outside.writeAll("return 7\n");
     }
     {
-        const script = try tmp.dir.createFile("workspace/import_outside.lua", .{});
+        const script = try tmp.dir.createFile("workspace/require_outside.lua", .{});
         defer script.close();
         try script.writeAll(
-            \\zoid.import("../outside.lua")
+            \\zoid.require("../outside")
             \\
         );
     }
 
-    const script_path = try tmp.dir.realpathAlloc(std.testing.allocator, "workspace/import_outside.lua");
+    const script_path = try tmp.dir.realpathAlloc(std.testing.allocator, "workspace/require_outside.lua");
     defer std.testing.allocator.free(script_path);
     const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, "workspace");
     defer std.testing.allocator.free(workspace_root);

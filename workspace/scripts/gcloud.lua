@@ -10,7 +10,7 @@
 --   -n, --limit <count>          Max instances to print (1-2000, default: 200)
 --   -h, --help                   Show usage
 
-local gcloud = zoid.import("/lib/gcloud.lua")
+local gcloud = zoid.require("gcloud")
 
 local function usage()
   print("Usage:")
