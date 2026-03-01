@@ -1728,7 +1728,7 @@ fn sendMessageInChunks(
             telegram_message_parse_mode,
         ) catch |err| switch (err) {
             error.TelegramApiRequestFailed => {
-                const plain_chunk = try plainTelegramFallbackChunk(allocator, markdown_chunk);
+                const plain_chunk = try plainTelegramFallbackChunk(allocator, chunk);
                 defer allocator.free(plain_chunk);
                 try sendMessage(allocator, bot_token, chat_id, thread_id, plain_chunk, null);
             },
@@ -2228,23 +2228,32 @@ fn shouldEscapeTelegramMarkdownV2Byte(byte: u8) bool {
 
 fn plainTelegramFallbackChunk(
     allocator: std.mem.Allocator,
-    markdown_chunk: []const u8,
+    text: []const u8,
 ) ![]u8 {
     var plain = std.ArrayList(u8).empty;
     errdefer plain.deinit(allocator);
 
     var index: usize = 0;
-    while (index < markdown_chunk.len) {
-        if (markdown_chunk[index] == '\\' and index + 1 < markdown_chunk.len) {
-            const next = markdown_chunk[index + 1];
-            if (shouldEscapeTelegramMarkdownV2Byte(next)) {
-                try plain.append(allocator, next);
-                index += 2;
-                continue;
+    while (index < text.len) {
+        if (text[index] == '\\') {
+            var run_end = index + 1;
+            while (run_end < text.len and text[run_end] == '\\') : (run_end += 1) {}
+
+            if (run_end < text.len) {
+                const next = text[run_end];
+                if (shouldEscapeTelegramMarkdownV2Byte(next)) {
+                    try plain.append(allocator, next);
+                    index = run_end + 1;
+                    continue;
+                }
             }
+
+            try plain.appendSlice(allocator, text[index..run_end]);
+            index = run_end;
+            continue;
         }
 
-        try plain.append(allocator, markdown_chunk[index]);
+        try plain.append(allocator, text[index]);
         index += 1;
     }
 
@@ -2812,6 +2821,19 @@ test "plainTelegramFallbackChunk removes markdown-v2 escapes" {
 
     try std.testing.expectEqualStrings(
         "- item\n(paren) [label] and \\",
+        plain,
+    );
+}
+
+test "plainTelegramFallbackChunk collapses repeated escapes before reserved punctuation" {
+    const plain = try plainTelegramFallbackChunk(
+        std.testing.allocator,
+        "\\\\\\. \\\\\\- \\\\\\(",
+    );
+    defer std.testing.allocator.free(plain);
+
+    try std.testing.expectEqualStrings(
+        ". - (",
         plain,
     );
 }
