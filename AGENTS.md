@@ -83,6 +83,7 @@ If you change command behavior, error handling, config format, or Lua execution 
   - Telegram delivery should upload generated attachments from browser outputs before text (both direct `browser_automate` tool calls and `lua_execute` runs that call `zoid.browser.automate(...)`): screenshots via `sendPhoto` (with fallback to `sendDocument` when photo upload fails), and downloaded files via `sendDocument`.
   - For Telegram chat requests, system instructions should tell the agent that browser screenshot/download artifacts are host-delivered automatically, so the agent should not read files for base64 media transport.
   - Service mode processes due scheduled jobs before polling updates; scheduler output is sent to the assistant and assistant replies are delivered to Telegram DM when a DM chat id is available.
+  - Scheduled-job prompts sent to the assistant are execution-first: when Lua stdout contains imperative instructions, the assistant should use tools to perform those steps before sending the final Telegram DM (not return a plan/TODO list).
   - Service mode persists the latest private-chat `chat_id` to app-data (`telegram_dm_chat_id.txt`), which is used as runtime DM fallback when scheduled jobs execute.
   - Scheduler metadata files (`scheduler_jobs.json` + lock/tmp) must live under `getAppDataDir("zoid")`, not inside the workspace tree; only user-authored Lua job payload files and documents should live in workspace.
 

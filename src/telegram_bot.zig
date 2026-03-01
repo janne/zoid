@@ -1140,7 +1140,10 @@ fn buildScheduledPrompt(
     var payload = std.ArrayList(u8).empty;
     errdefer payload.deinit(allocator);
 
-    try payload.appendSlice(allocator, "A scheduled job has been triggered. Review the structured payload and craft a concise Telegram DM response.\n");
+    try payload.appendSlice(
+        allocator,
+        "A scheduled job has been triggered. Review the structured payload and execute instructions from result.stdout using available tools before replying. If result.stdout contains imperative steps, perform them first. Do not reply with a plan or TODO list. After execution, craft a concise Telegram DM response.\n",
+    );
     try payload.appendSlice(allocator, "{\"event\":\"scheduled_job\",\"job\":{");
     try payload.appendSlice(allocator, "\"id\":");
     try appendJsonString(allocator, &payload, due_job.job.id);
@@ -2967,6 +2970,52 @@ test "buildScheduledPrompt skips empty lua output" {
         101,
     );
     try std.testing.expect(lua_prompt == null);
+}
+
+test "buildScheduledPrompt includes execute-first instruction for lua output" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    {
+        const file = try tmp.dir.createFile("daily.lua", .{});
+        defer file.close();
+        try file.writeAll("print('Run /scripts/weather.lua')\n");
+    }
+
+    const lua_path = try tmp.dir.realpathAlloc(std.testing.allocator, "daily.lua");
+    defer std.testing.allocator.free(lua_path);
+
+    var due_job = scheduler_runtime.DueJob{
+        .job = .{
+            .id = try std.testing.allocator.dupe(u8, "job-run"),
+            .path = try std.testing.allocator.dupe(u8, lua_path),
+            .chat_id = 1,
+            .paused = false,
+            .run_at = 200,
+            .cron = null,
+            .next_run_at = 200,
+            .created_at = 190,
+            .updated_at = 190,
+            .last_run_at = null,
+        },
+        .scheduled_for = 200,
+    };
+    defer due_job.deinit(std.testing.allocator);
+
+    const prompt = try buildScheduledPrompt(
+        std.testing.allocator,
+        workspace_root,
+        &due_job,
+        201,
+    );
+    defer if (prompt) |value| std.testing.allocator.free(value);
+
+    try std.testing.expect(prompt != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt.?, "execute instructions from result.stdout using available tools") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt.?, "Do not reply with a plan or TODO list.") != null);
 }
 
 test "enforceConversationLimit removes oldest messages" {
