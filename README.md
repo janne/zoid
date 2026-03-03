@@ -1,26 +1,66 @@
 Zoid
 ====
 
-A simple, lightweight, secure alternative to OpenClaw. Built on Zig and Lua.
+A simple, lightweight, secure agent runtime built on Zig + embedded Lua.
+
+Zoid is designed for low footprint operation: no Node.js/JVM runtime is required for core chat, tools, Lua execution, jobs, or Telegram service mode.
 
 ## Simple
-- One small binary, including [Lua support](workspace/API.md), and integration with AI agents and Telegram.
-- No external dependencies, all built into one binary.
-- One friendly CLI command for maintaining the service - zoid.
+- One small binary with [Lua support](workspace/API.md), OpenAI integration, scheduler, and Telegram service mode.
+- One CLI command for all operations: `zoid`.
+- Optional browser automation is available as an add-on (`zoid browser ...`).
 
 ## Lightweight
-- Built to be able to run on a limited RAM and CPU. OpenClaw idles on 200-400 MB RAM, Zoid on < 10 MB.
-- Able to be hosted on small cloud services such as the [forever free](https://docs.cloud.google.com/free/docs/free-cloud-features?gclsrc=aw.ds#compute) GCP E2-micro, or a [Raspberry Pi](https://www.raspberrypi.com/products/raspberry-pi-5/?variant=raspberry-pi-5-1gb).
+- Built to run on limited RAM and CPU.
+- Suitable for small cloud instances such as [GCP E2-micro](https://docs.cloud.google.com/free/docs/free-cloud-features?gclsrc=aw.ds#compute) and small hosts like [Raspberry Pi](https://www.raspberrypi.com/products/raspberry-pi-5/?variant=raspberry-pi-5-1gb).
 
 ## Powerful
 - A Lua interpreter is built in, and the agent can write and execute scripts.
-- The same sandboxed Lua can be accessed through CLI, scheduled jobs and agent tools
+- The same sandboxed Lua is available from CLI, scheduled jobs, and agent tools.
+- Built-in tools include workspace file operations, HTTP requests, image analysis, scheduler APIs, and optional browser automation.
 
 ## Secure
-- The agents can only read and write files in the workspace directory (the same directory as it's started from).
-- No code execution is allowed by agents, apart from the Lua scripts.
-- The Lua interpreter is sandboxed and limited, it can only acces the workspace and  these commands and packages are removed: `os`, `package`, `debug`, `dofile`, `loadfile`, `require`.
-- All keys are stored in an vault, not under version control (`~/Library/Application Support/zoid/config.json` on Mac and `~/.local/share/zoid/config.json` on Linux).
+- Agent filesystem access is restricted to the workspace root (current working directory when Zoid starts).
+- Agent code execution is restricted to sandboxed Lua (`lua_execute` / `zoid execute`).
+- Lua removes dangerous globals (`os`, `package`, `debug`, `dofile`, `loadfile`, global `require`) and exposes safe `zoid.*` APIs instead.
+- Outbound HTTP/browser destinations are policy-restricted (private/local destinations are blocked by default).
+- Config keys are stored in user app-data (`config.json`), outside version control by default.
+
+## CLI quick start
+
+Bootstrap a workspace with bundled templates:
+
+```sh
+zoid init
+zoid init /path/to/workspace
+zoid init /path/to/workspace --force
+```
+
+Run Lua scripts locally:
+
+```sh
+zoid execute scripts/cleanup.lua
+zoid execute --timeout 30 scripts/cleanup.lua
+zoid execute scripts/cleanup.lua 2026-02-23 extra-arg
+```
+
+Chat:
+
+```sh
+zoid chat
+zoid run "Summarize today's TODOs from /notes/today.md"
+```
+
+Service mode:
+
+```sh
+zoid serve
+```
+
+Notes:
+- `zoid` with no arguments defaults to `chat`.
+- `chat` is TTY-only. Use `run` for non-interactive one-shot usage.
+- If `ZOID.md` exists in the workspace root, `chat` and `serve` include it as extra system instructions.
 
 ## Scheduler
 
@@ -39,21 +79,6 @@ zoid jobs list
 zoid jobs pause <job_id>
 zoid jobs resume <job_id>
 zoid jobs delete <job_id>
-```
-
-Bootstrap a workspace with bundled templates:
-
-```sh
-zoid init
-zoid init /path/to/workspace
-zoid init /path/to/workspace --force
-```
-
-Run a Lua script locally:
-
-```sh
-zoid execute scripts/cleanup.lua
-zoid execute scripts/cleanup.lua 2026-02-23
 ```
 
 Telegram routing for scheduled output:
@@ -99,7 +124,7 @@ apt install zig
 ```sh
 git clone git@github.com:janne/zoid.git
 cd zoid
-zig build -Doptimize=
+zig build -Doptimize=ReleaseSafe
 ```
 
 ## Cross compile
@@ -129,7 +154,9 @@ sudo install -m 0755 /path/to/zoid /usr/local/bin/zoid
 ```sh
 sudo zoid config set OPENAI_API_KEY "<...>"
 sudo zoid config set TELEGRAM_BOT_TOKEN "<...>"
-sudo zoid config set OPENAI_MODEL "gpt-5-mini"
+
+# Optional model override. If omitted, Zoid uses its built-in default model.
+# sudo zoid config set OPENAI_MODEL "gpt-4o-mini"
 
 # Optional runtime limits
 sudo zoid config set OPENAI_MAX_INPUT_TOKENS "180000"
@@ -139,6 +166,7 @@ sudo zoid config set OPENAI_MAX_TOOL_RESULT_CHARS "12000"
 sudo zoid config set OPENAI_MAX_WORKSPACE_INSTRUCTION_CHARS "262144"
 sudo zoid config set TELEGRAM_MAX_CONVERSATION_MESSAGES "20"
 sudo zoid config set TELEGRAM_USER_INACTIVITY_RESET_SECONDS "28800"
+sudo zoid config set TELEGRAM_INBOUND_WORKER_COUNT "4"
 ```
 
 ## Create `/etc/systemd/system/zoid.service`

@@ -116,7 +116,7 @@ If you change command behavior, error handling, config format, or Lua execution 
 ### Tool runtime changes:
   - `src/tool_runtime.zig` enforces `workspace-write` policy rooted at current working directory and exposes `filesystem_read`, `image_analyze`, `filesystem_list`, `filesystem_grep`, `filesystem_write`, `filesystem_mkdir`, `filesystem_rmdir`, `filesystem_delete`, `lua_execute`, `config`, `jobs`, `http_get`, `http_post`, `http_put`, `http_delete`, `datetime_now`, and `browser_automate`.
   - Shared filesystem sandbox/path enforcement and metadata/listing logic lives in `src/workspace_fs.zig`; both `lua_execute` (`zoid.file(...)` / `zoid.dir(...)`) and direct filesystem tools must use this module.
-  - In workspace path APIs, absolute inputs are treated as workspace-relative paths: a leading `/` means workspace root (not filesystem root), and host filesystem absolute semantics are not used.
+  - In workspace path APIs, absolute inputs are treated as workspace-relative paths: a leading `/` means workspace root (not filesystem root). Canonical filesystem-absolute paths are also accepted only when they already resolve inside workspace root.
   - Shared outbound HTTP request behavior lives in `src/http_client.zig`; both `lua_execute` (`zoid.uri(...)`) and direct HTTP tools must use this module to avoid divergence.
   - Shared config mutation/read behavior lives in `src/config_runtime.zig`; both `lua_execute` (`zoid.config():list/get/set/unset`) and direct `config` tool calls must use this module to avoid divergence.
   - `filesystem_mkdir` creates one directory whose canonical path resolves inside workspace root and fails if it already exists.

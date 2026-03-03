@@ -485,6 +485,10 @@ fn toCandidatePath(
 ) ![]u8 {
     if (requested_path.len == 0) return error.InvalidToolArguments;
     if (std.fs.path.isAbsolute(requested_path)) {
+        // Accept canonical filesystem-absolute paths that already live inside workspace root.
+        if (isPathInsideWorkspace(workspace_root, requested_path)) {
+            return allocator.dupe(u8, requested_path);
+        }
         const trimmed_path = std.mem.trimLeft(u8, requested_path, "/\\");
         if (trimmed_path.len == 0) return allocator.dupe(u8, workspace_root);
         return std.fs.path.join(allocator, &.{ workspace_root, trimmed_path });
@@ -895,4 +899,38 @@ test "filesystem absolute path input is treated as workspace-relative" {
 
     try std.testing.expect(std.mem.startsWith(u8, resolved, workspace_root));
     try std.testing.expect(std.mem.endsWith(u8, resolved, "Users/example/note.txt"));
+}
+
+test "canonical filesystem absolute input inside workspace root is accepted" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_root);
+
+    try tmp.dir.makePath("scripts");
+    {
+        const file = try tmp.dir.createFile("scripts/task.lua", .{});
+        defer file.close();
+        try file.writeAll("print('ok')");
+    }
+
+    const filesystem_absolute_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ workspace_root, "scripts/task.lua" },
+    );
+    defer std.testing.allocator.free(filesystem_absolute_path);
+
+    const resolved = try resolveAllowedReadPath(
+        std.testing.allocator,
+        workspace_root,
+        filesystem_absolute_path,
+    );
+    defer std.testing.allocator.free(resolved);
+
+    try std.testing.expectEqualStrings(filesystem_absolute_path, resolved);
+
+    const workspace_absolute = try toWorkspaceAbsolutePath(std.testing.allocator, workspace_root, resolved);
+    defer std.testing.allocator.free(workspace_absolute);
+    try std.testing.expectEqualStrings("/scripts/task.lua", workspace_absolute);
 }

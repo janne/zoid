@@ -2138,6 +2138,49 @@ test "lua execute runs script inside workspace root" {
     try std.testing.expect(root_object.get("error") == null);
 }
 
+test "lua execute accepts canonical filesystem absolute path inside workspace root" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("abs.lua", .{});
+    defer file.close();
+    try file.writeAll("print('ok')\n");
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const script_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "abs.lua" });
+    defer std.testing.allocator.free(script_path);
+
+    var policy = try Policy.initForWorkspaceRoot(std.testing.allocator, tmp_path);
+    defer policy.deinit(std.testing.allocator);
+
+    const escaped_script_path = try std.json.Stringify.valueAlloc(std.testing.allocator, script_path, .{});
+    defer std.testing.allocator.free(escaped_script_path);
+    const arguments = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"path\":{s}}}",
+        .{escaped_script_path},
+    );
+    defer std.testing.allocator.free(arguments);
+
+    const result = try executeToolCall(
+        std.testing.allocator,
+        &policy,
+        "lua_execute",
+        arguments,
+    );
+    defer std.testing.allocator.free(result);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+
+    const root_object = parsed.value.object;
+    try std.testing.expect(root_object.get("ok").?.bool);
+    try std.testing.expectEqualStrings("ok\n", root_object.get("stdout").?.string);
+    try std.testing.expectEqualStrings("/abs.lua", root_object.get("path").?.string);
+}
+
 test "lua execute forwards args to Lua arg table" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
